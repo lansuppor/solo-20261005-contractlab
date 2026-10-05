@@ -1,0 +1,20 @@
+{
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/hello",
+      "responses": [
+        { "status": 200, "headers": { "content-type": "text/plain" }, "body": "first\n", "delayMs": 0 },
+        { "status": 200, "body": "second\n", "delayMs": 100 },
+        { "status": 500, "body": "third\n", "delayMs": 0 }
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/orders",
+      "responses": [
+        { "status": 201, "headers": { "content-type": "application/json" }, "body": "{\"id\": 1}\n", "delayMs": 0 }
+      ]
+    }
+  ]
+}
