@@ -14,6 +14,11 @@
 // - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
 //   媒体类型与 JSON 结构，不符时返回 400 差异报告，不发送场景响应、不消费序列；
 //   校验通过才按“完整接收”顺序预留响应项。
+// - 本地请求记录（仅进程内存，不写文件）：管理范围外的请求在完整接收且未超过
+//   正文上限后记录一次（场景响应 / 400 / 404 都在内），含原始目标、请求头、
+//   原始正文字节、选用的配置版本、校验结论、消费位置与计划响应；
+//   GET /__contractlab/requests 查询快照，POST /__contractlab/requests/clear 清空；
+//   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）内的请求不记录、不消费序列。
 // - compare 子命令：离线比较旧、新两份场景文件，判断沿用旧接口约定的客户端
 //   是否仍能调用新版；报告写 stdout，不启动监听、不修改文件。
 
@@ -24,9 +29,12 @@ import path from 'node:path';
 const APP_NAME = 'contractlab';
 
 // 管理入口（保留前缀，业务接口不得使用）
+const ADMIN_ROOT = '/__contractlab';
 const ADMIN_PREFIX = '/__contractlab/';
 const HEALTH_PATH = '/__contractlab/health';
 const RELOAD_PATH = '/__contractlab/reload';
+const REQUESTS_PATH = '/__contractlab/requests';
+const REQUESTS_CLEAR_PATH = '/__contractlab/requests/clear';
 
 // 每个业务响应都携带当前配置版本
 const VERSION_HEADER = 'X-Contractlab-Version';
@@ -315,7 +323,7 @@ function validateEndpoint(
     throw new ConfigError(`${where}.path 必须是字符串`);
   }
   validatePath(routePath, where);
-  if (routePath === '/__contractlab' || routePath.startsWith(ADMIN_PREFIX)) {
+  if (routePath === ADMIN_ROOT || routePath.startsWith(ADMIN_PREFIX)) {
     throw new ConfigError(
       `${where}.path "${routePath}" 与管理入口冲突：前缀 "${ADMIN_PREFIX}" 为管理接口保留`,
     );
@@ -379,15 +387,21 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
   return { version, endpoints };
 }
 
+interface Reservation {
+  readonly item: ResponseSpec;
+  // 消费位置：响应序列中的下标；末项复用时持续为末项下标
+  readonly position: number;
+}
+
 // 同步预留下一项；同一事件循环内按“完整接收”事件的先后串行调用，天然保序。
 // 末项之后持续返回末项，不跳项、不复用未到位置的项。
-function reserveNext(endpoint: LiveEndpoint): ResponseSpec {
+function reserveNext(endpoint: LiveEndpoint): Reservation {
   const last = endpoint.responses.length - 1;
   const position = endpoint.cursor < last ? endpoint.cursor : last;
   if (endpoint.cursor < last) {
     endpoint.cursor += 1;
   }
-  return endpoint.responses[position];
+  return { item: endpoint.responses[position], position };
 }
 
 // ---------------------------------------------------------------------------
@@ -953,6 +967,98 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
 
 
 // ---------------------------------------------------------------------------
+// 本地请求记录（仅本次服务进程内存，不写文件）
+// ---------------------------------------------------------------------------
+//
+// 管理范围（/__contractlab 本身及 /__contractlab/ 前缀）外的请求，在完整接收
+// 且未超过正文上限后记录一次：场景响应、正文拒绝 400、未匹配 404 都在内；
+// 未收完整即断开或超出上限不创建记录、不消费序列。
+// 编号进程内唯一递增，按完成接收顺序分配，与接口消费位置无关，清空或重载后
+// 不复用。重载（无论成败）保留全部记录；在途记录的版本、校验结论与计划响应
+// 是接收完成时的快照，不随重载改变。清空只替换记录容器：在途响应不被取消，
+// 其后续状态更新落在已游离的旧记录对象上，不会重新出现在查询结果中。
+
+// 发送状态：pending = 已记录、尚未完成写出（含延迟等待中）；
+// sent = 服务器完成写出（不代表客户端已收到，之后连接正常关闭不再改变）；
+// interrupted = 写出完成前连接断开或发送失败
+type RecordState = 'pending' | 'sent' | 'interrupted';
+
+// 原始正文字节的无损表示：合法 UTF-8 直接给文本，否则 base64 并说明编码；
+// 绝不以解析后的 JSON 代替原始字节
+type RecordedBody =
+  | { readonly encoding: 'utf-8'; readonly text: string }
+  | { readonly encoding: 'base64'; readonly base64: string };
+
+// 场景或框架“计划”的响应：状态、应用层响应头（含准确版本头）与正文
+interface RecordedPlan {
+  readonly status: number;
+  readonly headers: { readonly [name: string]: string };
+  readonly body: string;
+}
+
+type RecordBodyCheck =
+  | { readonly result: 'none' } // 未匹配或接口未声明正文规则
+  | { readonly result: 'passed' }
+  | { readonly result: 'rejected'; readonly report: BodyReport }; // 400 保留实际返回的差异报告
+
+interface RequestRecord {
+  readonly id: number;
+  readonly method: string;
+  // 含查询串的原始请求目标（查询串仍不参与匹配）
+  readonly target: string;
+  // 收到的请求头：按到达顺序的原始 [名称, 值] 对（保留大小写与重复项）
+  readonly headers: readonly (readonly [string, string])[];
+  readonly body: RecordedBody;
+  // 完整接收时选用的配置版本
+  readonly version: number;
+  matched: boolean;
+  endpoint: string | null;
+  bodyCheck: RecordBodyCheck;
+  // 预留的消费位置；拒绝与 404 没有消费位置（null）
+  position: number | null;
+  response: RecordedPlan;
+  state: RecordState;
+}
+
+let records = new Map<number, RequestRecord>();
+let nextRecordId = 1;
+
+function encodeRecordedBody(body: Buffer): RecordedBody {
+  try {
+    return { encoding: 'utf-8', text: new TextDecoder('utf-8', { fatal: true }).decode(body) };
+  } catch {
+    return { encoding: 'base64', base64: body.toString('base64') };
+  }
+}
+
+// 在完整接收的同步流程内创建记录；response 占位值会在同一同步流程内被真实
+// 计划覆盖，查询不可能看到中间态
+function createRecord(req: http.IncomingMessage, body: Buffer, version: number): RequestRecord {
+  const raw = req.rawHeaders;
+  const headers: [string, string][] = [];
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    headers.push([String(raw[i]), String(raw[i + 1])]);
+  }
+  const record: RequestRecord = {
+    id: nextRecordId,
+    method: String(req.method),
+    target: String(req.url ?? '/'),
+    headers,
+    body: encodeRecordedBody(body),
+    version,
+    matched: false,
+    endpoint: null,
+    bodyCheck: { result: 'none' },
+    position: null,
+    response: { status: 0, headers: {}, body: '' },
+    state: 'pending',
+  };
+  nextRecordId += 1;
+  records.set(record.id, record);
+  return record;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 服务
 // ---------------------------------------------------------------------------
 
@@ -993,12 +1099,33 @@ function writeResponse(
   status: number,
   headers: { readonly [name: string]: string },
   body: string,
+  record?: RequestRecord,
 ): void {
+  if (record) {
+    // finish 先于 close 到达；settled 保证“发送完成”不被其后的正常关闭覆盖。
+    // 写出完成前连接断开或发送失败 → interrupted。
+    let settled = false;
+    const mark = (state: RecordState): void => {
+      if (!settled) {
+        settled = true;
+        record.state = state;
+      }
+    };
+    res.once('finish', () => mark('sent'));
+    res.once('close', () => mark('interrupted'));
+    if (res.destroyed) {
+      // 延迟期间客户端已断开：close 已经发过，不会再触发
+      mark('interrupted');
+    }
+  }
   try {
     res.writeHead(status, headers);
     res.end(body === '' ? undefined : body);
   } catch {
     // 预留之后客户端可能已断开：响应仍计为已消费，发送失败仅静默忽略
+    if (record) {
+      record.state = 'interrupted';
+    }
   }
 }
 
@@ -1017,31 +1144,37 @@ function versionHeaders(
   return headers;
 }
 
-function sendJson(res: http.ServerResponse, status: number, value: unknown, version: number): void {
-  writeResponse(
-    res,
+function jsonPlan(status: number, value: unknown, version: number): RecordedPlan {
+  return {
     status,
-    versionHeaders(version, { 'Content-Type': 'application/json; charset=utf-8' }),
-    `${JSON.stringify(value)}\n`,
-  );
+    headers: versionHeaders(version, { 'Content-Type': 'application/json; charset=utf-8' }),
+    body: `${JSON.stringify(value)}\n`,
+  };
 }
 
-function sendNotFound(res: http.ServerResponse): void {
-  writeResponse(
-    res,
-    404,
-    versionHeaders(activeState.version, {
+function sendJson(res: http.ServerResponse, status: number, value: unknown, version: number): void {
+  const plan = jsonPlan(status, value, version);
+  writeResponse(res, plan.status, plan.headers, plan.body);
+}
+
+function notFoundPlan(version: number): RecordedPlan {
+  return {
+    status: 404,
+    headers: versionHeaders(version, {
       'Content-Type': 'text/plain; charset=utf-8',
     }),
-    'not found\n',
-  );
+    body: 'not found\n',
+  };
 }
 
-function sendBusinessResponse(
-  res: http.ServerResponse,
-  item: ResponseSpec,
-  version: number,
-): void {
+function sendNotFound(res: http.ServerResponse, version: number): void {
+  const plan = notFoundPlan(version);
+  writeResponse(res, plan.status, plan.headers, plan.body);
+}
+
+// 场景响应的计划：状态、应用层响应头（含准确版本头）与正文。
+// 记录与发送共用同一份计划，保证记录中的就是将要写出的。
+function businessResponsePlan(item: ResponseSpec, version: number): RecordedPlan {
   const headers = versionHeaders(version);
   let contentTypeSet = false;
   for (const [name, value] of Object.entries(item.headers)) {
@@ -1059,19 +1192,21 @@ function sendBusinessResponse(
   if (!contentTypeSet && item.body !== '') {
     headers['Content-Type'] = 'text/plain; charset=utf-8';
   }
-  writeResponse(res, item.status, headers, item.body);
+  return { status: item.status, headers, body: item.body };
 }
 
-// 延迟结束才发送；即便客户端提前断开也继续计时（消费在预留时已经成立）
+// 延迟结束才发送；即便客户端提前断开也继续计时（消费在预留时已经成立）。
+// 延迟期间记录即可被查：状态 pending，计划响应已确定。
 function scheduleBusinessResponse(
   res: http.ServerResponse,
-  item: ResponseSpec,
-  version: number,
+  plan: RecordedPlan,
+  delay: number,
+  record: RequestRecord,
 ): void {
   const timer = setTimeout(() => {
     pendingTimers.delete(timer);
-    sendBusinessResponse(res, item, version);
-  }, item.delay);
+    writeResponse(res, plan.status, plan.headers, plan.body, record);
+  }, delay);
   pendingTimers.add(timer);
 }
 
@@ -1120,6 +1255,47 @@ function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promi
   });
 }
 
+// 管理入口：/__contractlab 本身及 /__contractlab/ 前缀下的所有请求
+// 都不记录、不消费任何业务序列
+async function handleAdmin(
+  method: string,
+  pathname: string,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (pathname === HEALTH_PATH && method === 'GET') {
+    sendJson(res, 200, { status: 'ok', version: activeState.version }, activeState.version);
+    return;
+  }
+
+  if (pathname === RELOAD_PATH && method === 'POST') {
+    const result = await triggerReload();
+    sendJson(res, 200, result, result.version);
+    return;
+  }
+
+  if (pathname === REQUESTS_PATH && method === 'GET') {
+    // 调用时的一致快照（同步序列化）；只读，不推进任何序列
+    sendJson(
+      res,
+      200,
+      { version: activeState.version, records: [...records.values()] },
+      activeState.version,
+    );
+    return;
+  }
+
+  if (pathname === REQUESTS_CLEAR_PATH && method === 'POST') {
+    // 移除当时全部记录（含待发送项）；不取消响应、不改变配置、版本或序列。
+    // 已移除记录的在途更新只作用于游离对象，不会重新出现；编号不复用。
+    const cleared = records.size;
+    records = new Map();
+    sendJson(res, 200, { ok: true, cleared }, activeState.version);
+    return;
+  }
+
+  sendNotFound(res, activeState.version);
+}
+
 async function dispatch(
   req: http.IncomingMessage,
   res: http.ServerResponse,
@@ -1130,58 +1306,55 @@ async function dispatch(
 
   const { outcome, body } = await receiveBody(req, res);
   if (outcome !== 'received') {
-    // aborted：未完整接收，不匹配、不预留、不推进任何序列
-    // too-large：已回复 413
+    // aborted：未完整接收，不匹配、不预留、不推进任何序列、不记录
+    // too-large：已回复 413，同样不记录
     return;
   }
 
   const method = String(req.method);
   const pathname = String(req.url ?? '/').split('?')[0]; // 查询串不参与匹配
 
-  // 管理入口（不消费任何业务序列）
-  if (pathname === HEALTH_PATH) {
-    if (method === 'GET') {
-      sendJson(res, 200, { status: 'ok', version: activeState.version }, activeState.version);
-    } else {
-      sendNotFound(res);
-    }
+  if (pathname === ADMIN_ROOT || pathname.startsWith(ADMIN_PREFIX)) {
+    await handleAdmin(method, pathname, res);
     return;
   }
 
-  if (pathname === RELOAD_PATH) {
-    if (method === 'POST') {
-      const result = await triggerReload();
-      sendJson(res, 200, result, result.version);
-    } else {
-      sendNotFound(res);
-    }
-    return;
-  }
-
-  // 业务匹配：在本次同步执行内抓取状态快照，预留后与后续 reload 互不影响
+  // 管理范围外、完整接收且未超上限的请求：记录一次。
+  // 在本次同步执行内抓取状态快照，预留后与后续 reload 互不影响。
   const state = activeState;
+  const record = createRecord(req, body, state.version);
+
   const endpoint =
     method === 'GET' || method === 'POST'
       ? state.endpoints.get(`${method} ${pathname}`)
       : undefined;
 
   if (!endpoint) {
-    sendNotFound(res); // 未匹配请求：404，不消费
+    record.response = notFoundPlan(state.version); // 未匹配请求：404，不消费
+    writeResponse(res, record.response.status, record.response.headers, record.response.body, record);
     return;
   }
+
+  record.matched = true;
+  record.endpoint = endpoint.key;
 
   // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
   // 规则、序列与版本均取自上面同一快照 state。
   if (endpoint.bodyRule) {
     const report = validateRequestBody(req, body, endpoint.bodyRule);
     if (report) {
-      sendJson(res, 400, report, state.version);
+      record.bodyCheck = { result: 'rejected', report };
+      record.response = jsonPlan(400, report, state.version);
+      writeResponse(res, record.response.status, record.response.headers, record.response.body, record);
       return;
     }
+    record.bodyCheck = { result: 'passed' };
   }
 
-  const item = reserveNext(endpoint); // 校验通过后立即预留
-  scheduleBusinessResponse(res, item, state.version);
+  const { item, position } = reserveNext(endpoint); // 校验通过后立即预留
+  record.position = position;
+  record.response = businessResponsePlan(item, state.version);
+  scheduleBusinessResponse(res, record.response, item.delay, record);
 }
 
 // ---------------------------------------------------------------------------
@@ -1272,9 +1445,12 @@ function helpText(): string {
     '                        兼容退出 0，不兼容退出 1，',
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr）',
     '',
-    '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
-    '  GET  /__contractlab/health   健康查询，返回当前配置版本',
-    '  POST /__contractlab/reload   重新读取并热更新同一配置文件',
+    '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀；',
+    '管理范围内的请求不记录、不消费业务序列）：',
+    '  GET  /__contractlab/health           健康查询，返回当前配置版本',
+    '  POST /__contractlab/reload           重新读取并热更新同一配置文件',
+    '  GET  /__contractlab/requests         查询本进程内的请求记录（JSON 快照）',
+    '  POST /__contractlab/requests/clear   清空当前全部请求记录（不取消在途响应）',
     '',
     '配置格式见 README.md。',
   ].join('\n');
