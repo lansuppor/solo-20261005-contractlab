@@ -14,6 +14,8 @@
 // - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
 //   媒体类型与 JSON 结构，不符时返回 400 差异报告，不发送场景响应、不消费序列；
 //   校验通过才按“完整接收”顺序预留响应项。
+// - compare 子命令：离线比较旧、新两份场景文件，判断沿用旧接口约定的客户端
+//   是否仍能调用新版；报告写 stdout，不启动监听、不修改文件。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -160,7 +162,8 @@ function validateResponse(raw: unknown, where: string): ResponseSpec {
   if (!isPlainObject(headers)) {
     throw new ConfigError(`${where}.headers 必须是字符串键值对象`);
   }
-  const cleanHeaders: { [name: string]: string } = {};
+  // 无原型对象：名为 "__proto__" 的头也按自有字段保留，不被原型 setter 吞掉
+  const cleanHeaders: { [name: string]: string } = Object.create(null);
   const seenNames = new Set<string>();
   for (const [name, value] of Object.entries(headers)) {
     const whereHeader = `${where}.headers["${name}"]`;
@@ -271,7 +274,9 @@ function validateFieldRule(raw: unknown, where: string): FieldRule {
     throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
   }
   let required = false;
-  const rest: Record<string, unknown> = {};
+  // 无原型对象：未知规则键 "__proto__" 必须作为自有字段保留下来，
+  // 交由 validateBodyRule 拒绝；普通对象字面量会在复制时被原型 setter 吞掉
+  const rest: Record<string, unknown> = Object.create(null);
   for (const [key, value] of Object.entries(raw)) {
     if (key === 'required') {
       if (typeof value !== 'boolean') {
@@ -552,7 +557,8 @@ function describeError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-async function loadStateFromFile(configPath: string, version: number): Promise<LiveState> {
+// 读取 -> 解析 -> 严格校验；任何一步失败都抛出含文件路径与可定位原因的错误
+async function loadSpecsFromFile(configPath: string): Promise<EndpointSpec[]> {
   let text: string;
   try {
     text = await readFile(configPath, 'utf8');
@@ -568,12 +574,383 @@ async function loadStateFromFile(configPath: string, version: number): Promise<L
   }
 
   try {
-    const specs = validateConfig(raw);
-    return buildState(version, specs);
+    return validateConfig(raw);
   } catch (e) {
     throw new Error(`配置文件 ${configPath} 校验失败：${describeError(e)}`);
   }
 }
+
+async function loadStateFromFile(configPath: string, version: number): Promise<LiveState> {
+  return buildState(version, await loadSpecsFromFile(configPath));
+}
+
+// ---------------------------------------------------------------------------
+// 离线兼容报告（compare 子命令）
+// ---------------------------------------------------------------------------
+//
+// 兼容方向固定为 旧 -> 新：旧配置能按“方法 + 字面路径”匹配且通过正文检查的
+// 每一种请求，在新配置中仍须匹配并通过。只比较接口存在性与请求接受条件；
+// 响应状态/头/正文/延迟与序列差异不影响结论。
+//
+// 双方都配置 requestBody 时，比较的是“规则所接受 JSON 值的集合包含关系”
+// L(旧规则) ⊆ L(新规则)，而不是文本比较或抽样请求；每个不兼容点都附一份
+// 具体反例（旧规则接受、新规则拒绝的完整 JSON 值）。
+
+interface ReportReason {
+  // 正文差异：RFC 6901 指针（根为 ""）；接口级原因（如接口删除）无此字段
+  readonly pointer?: string;
+  readonly message: string;
+}
+
+interface ReportExample {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly headers: { readonly [name: string]: string };
+  readonly body: string;
+}
+
+interface EndpointReport {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly compatible: boolean;
+  readonly reasons: readonly ReportReason[];
+  readonly example?: ReportExample;
+}
+
+interface CompareReport {
+  readonly compatible: boolean;
+  readonly oldFile: string;
+  readonly newFile: string;
+  readonly endpoints: readonly EndpointReport[];
+}
+
+interface BodyViolation {
+  readonly pointer: string;
+  readonly message: string;
+  // 完整请求正文反例：被旧规则接受、被新规则拒绝
+  readonly value: unknown;
+}
+
+// 生成被规则接受的最小 JSON 值：object 只含必填字段，array 取空数组。
+// 字段名可能是 "" 或 "__proto__"，一律用无原型对象按自有字段构造。
+function sampleValue(rule: BodyRule): unknown {
+  switch (rule.kind) {
+    case 'string':
+      return 'contractlab';
+    case 'number':
+    case 'integer':
+      return 0;
+    case 'boolean':
+      return false;
+    case 'null':
+      return null;
+    case 'array':
+      return [];
+    case 'object': {
+      const obj: Record<string, unknown> = Object.create(null);
+      for (const [name, field] of rule.fields) {
+        if (field.required) {
+          obj[name] = sampleValue(field.rule);
+        }
+      }
+      return obj;
+    }
+  }
+}
+
+// 在 object 规则的最小样本上补一个字段（字段值本身须被该字段规则接受）
+function sampleObjectWith(
+  rule: Extract<BodyRule, { kind: 'object' }>,
+  name: string,
+  value: unknown,
+): Record<string, unknown> {
+  const obj = sampleValue(rule) as Record<string, unknown>;
+  obj[name] = value;
+  return obj;
+}
+
+// 生成被规则拒绝的 JSON 值（顶层类型即不符；任何规则都存在这样的值）
+function violateValue(rule: BodyRule): unknown {
+  switch (rule.kind) {
+    case 'number':
+      return 'contractlab'; // 非数字
+    case 'integer':
+      return 0.5; // 非整数
+    default:
+      return 0; // 非 string / boolean / null / object / array
+  }
+}
+
+function kindLabel(rule: BodyRule): string {
+  if (rule.kind === 'object') {
+    return rule.additionalProperties ? 'object（允许未声明字段）' : 'object（拒绝未声明字段）';
+  }
+  return rule.kind;
+}
+
+// 选一个两个规则都未声明的字段名，用于构造“额外字段”反例
+function freshFieldName(
+  oldFields: ReadonlyMap<string, FieldRule>,
+  newFields: ReadonlyMap<string, FieldRule>,
+): string {
+  for (let i = 0; ; i += 1) {
+    const name = i === 0 ? 'extra' : `extra_${i}`;
+    if (!oldFields.has(name) && !newFields.has(name)) {
+      return name;
+    }
+  }
+}
+
+// 递归判定 L(oldRule) ⊆ L(newRule)；把发现的每个反例（连同完整正文样本）推入 out。
+// 不变式：value 必被 oldRule 接受、被 newRule 拒绝；pointer 用 RFC 6901 定位差异。
+function collectViolations(
+  oldRule: BodyRule,
+  newRule: BodyRule,
+  pointer: string,
+  out: BodyViolation[],
+): void {
+  if (newRule.kind !== 'object' && newRule.kind !== 'array') {
+    // 标量：仅同名兼容，外加 integer 放宽为 number；其余组合两集合相交为空或有差异
+    const compatible =
+      oldRule.kind === newRule.kind || (oldRule.kind === 'integer' && newRule.kind === 'number');
+    if (!compatible) {
+      // number -> integer 时样本必须是非整数，否则 0 会被新规则接受
+      const value =
+        oldRule.kind === 'number' && newRule.kind === 'integer' ? 0.5 : sampleValue(oldRule);
+      out.push({
+        pointer,
+        value,
+        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${newRule.kind}`,
+      });
+    }
+    return;
+  }
+
+  if (newRule.kind === 'array') {
+    if (oldRule.kind !== 'array') {
+      out.push({
+        pointer,
+        value: sampleValue(oldRule),
+        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 array`,
+      });
+      return;
+    }
+    // 元素规则收紧：用非空数组 [反例] 体现（空数组双方都会接受）
+    const sub: BodyViolation[] = [];
+    collectViolations(oldRule.items, newRule.items, `${pointer}/0`, sub);
+    for (const s of sub) {
+      out.push({ pointer: s.pointer, message: s.message, value: [s.value] });
+    }
+    return;
+  }
+
+  // newRule.kind === 'object'
+  if (oldRule.kind !== 'object') {
+    out.push({
+      pointer,
+      value: sampleValue(oldRule),
+      message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 object`,
+    });
+    return;
+  }
+
+  // (a) 新规则的必填字段必须被旧规则保证存在（旧规则未声明或仅可选即存在反例）
+  for (const [name, newField] of newRule.fields) {
+    if (!newField.required) {
+      continue;
+    }
+    const oldField = oldRule.fields.get(name);
+    if (!oldField || !oldField.required) {
+      out.push({
+        pointer: `${pointer}/${escapePointerSegment(name)}`,
+        // 旧规则的最小样本不含可缺省/未声明字段，恰为反例
+        value: sampleValue(oldRule),
+        message: `新规则要求必填字段 ${JSON.stringify(name)}，旧规则允许缺省该字段`,
+      });
+    }
+  }
+
+  // (b) 旧规则声明的字段，在新规则下仍须被接受
+  for (const [name, oldField] of oldRule.fields) {
+    const childPointer = `${pointer}/${escapePointerSegment(name)}`;
+    const newField = newRule.fields.get(name);
+    if (!newField) {
+      if (!newRule.additionalProperties) {
+        out.push({
+          pointer: childPointer,
+          value: sampleObjectWith(oldRule, name, sampleValue(oldField.rule)),
+          message: `新规则拒绝旧规则允许的字段 ${JSON.stringify(name)}（新规则未声明且 additionalProperties 为 false）`,
+        });
+      }
+      continue;
+    }
+    const sub: BodyViolation[] = [];
+    collectViolations(oldField.rule, newField.rule, childPointer, sub);
+    for (const s of sub) {
+      out.push({
+        pointer: s.pointer,
+        message: s.message,
+        value: sampleObjectWith(oldRule, name, s.value),
+      });
+    }
+  }
+
+  // (c) 旧规则允许未声明的额外字段时，新规则必须同样放行这些字段
+  if (oldRule.additionalProperties) {
+    if (!newRule.additionalProperties) {
+      const name = freshFieldName(oldRule.fields, newRule.fields);
+      out.push({
+        pointer: `${pointer}/${escapePointerSegment(name)}`,
+        value: sampleObjectWith(oldRule, name, 0),
+        message: '旧规则允许未声明的额外字段，新规则拒绝（additionalProperties 为 false）',
+      });
+    } else {
+      // 新规则虽放行额外字段，但其新声明的字段会约束旧版原本自由的取值
+      for (const [name, newField] of newRule.fields) {
+        if (oldRule.fields.has(name)) {
+          continue;
+        }
+        out.push({
+          pointer: `${pointer}/${escapePointerSegment(name)}`,
+          value: sampleObjectWith(oldRule, name, violateValue(newField.rule)),
+          message: `旧规则对额外字段 ${JSON.stringify(name)} 不限制取值，新规则要求其为 ${kindLabel(newField.rule)}`,
+        });
+      }
+    }
+  }
+}
+
+// 旧接口被旧配置接受的一个请求样本（用于“接口已删除”反例）
+function acceptedRequestExample(endpoint: EndpointSpec): ReportExample {
+  if (endpoint.bodyRule) {
+    return {
+      method: endpoint.method,
+      path: endpoint.path,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sampleValue(endpoint.bodyRule)),
+    };
+  }
+  return { method: endpoint.method, path: endpoint.path, headers: {}, body: '' };
+}
+
+function compareEndpoint(oldEp: EndpointSpec, newEp: EndpointSpec | undefined): EndpointReport {
+  const base = { method: oldEp.method, path: oldEp.path };
+
+  if (!newEp) {
+    return {
+      ...base,
+      compatible: false,
+      reasons: [
+        { message: '新配置中不存在该接口：按 方法 + 字面路径 匹配不到，旧客户端的调用将得到 404' },
+      ],
+      example: acceptedRequestExample(oldEp),
+    };
+  }
+
+  if (!oldEp.bodyRule && !newEp.bodyRule) {
+    return { ...base, compatible: true, reasons: [] };
+  }
+
+  if (!oldEp.bodyRule && newEp.bodyRule) {
+    // 旧版允许任意媒体类型与正文；新版启用校验即存在被拒绝的旧请求
+    return {
+      ...base,
+      compatible: false,
+      reasons: [
+        {
+          pointer: '',
+          message: '旧接口不校验请求正文（任意媒体类型与正文均可），新接口启用了 requestBody 正文校验',
+        },
+      ],
+      example: {
+        ...base,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(violateValue(newEp.bodyRule)),
+      },
+    };
+  }
+
+  if (oldEp.bodyRule && !newEp.bodyRule) {
+    return { ...base, compatible: true, reasons: [] }; // 移除规则更宽松
+  }
+
+  const violations: BodyViolation[] = [];
+  collectViolations(oldEp.bodyRule as BodyRule, newEp.bodyRule as BodyRule, '', violations);
+  if (violations.length === 0) {
+    return { ...base, compatible: true, reasons: [] };
+  }
+  return {
+    ...base,
+    compatible: false,
+    reasons: violations.map((v) => ({ pointer: v.pointer, message: v.message })),
+    example: {
+      ...base,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(violations[0].value),
+    },
+  };
+}
+
+function compareConfigs(
+  oldSpecs: readonly EndpointSpec[],
+  newSpecs: readonly EndpointSpec[],
+  oldFile: string,
+  newFile: string,
+): CompareReport {
+  const newByKey = new Map<string, EndpointSpec>();
+  for (const spec of newSpecs) {
+    newByKey.set(`${spec.method} ${spec.path}`, spec);
+  }
+  const endpoints = oldSpecs.map((spec) =>
+    compareEndpoint(spec, newByKey.get(`${spec.method} ${spec.path}`)),
+  );
+  return {
+    compatible: endpoints.every((ep) => ep.compatible),
+    oldFile,
+    newFile,
+    endpoints,
+  };
+}
+
+async function runCompare(oldArg: string, newArg: string): Promise<never> {
+  const oldFile = path.resolve(oldArg);
+  const newFile = path.resolve(newArg);
+
+  const attempt = async (
+    file: string,
+  ): Promise<{ specs?: EndpointSpec[]; error?: string }> => {
+    try {
+      return { specs: await loadSpecsFromFile(file) };
+    } catch (e) {
+      return { error: describeError(e) };
+    }
+  };
+
+  // 两份文件都完整经历 读取 -> 解析 -> 严格校验；任一失败则不输出任何报告
+  const [oldResult, newResult] = await Promise.all([attempt(oldFile), attempt(newFile)]);
+  let failed = false;
+  if (oldResult.error !== undefined) {
+    process.stderr.write(`${APP_NAME}: compare 旧文件：${oldResult.error}\n`);
+    failed = true;
+  }
+  if (newResult.error !== undefined) {
+    process.stderr.write(`${APP_NAME}: compare 新文件：${newResult.error}\n`);
+    failed = true;
+  }
+  if (failed) {
+    process.exit(2);
+  }
+
+  const report = compareConfigs(
+    oldResult.specs as EndpointSpec[],
+    newResult.specs as EndpointSpec[],
+    oldFile,
+    newFile,
+  );
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  process.exit(report.compatible ? 0 : 1);
+}
+
 
 // ---------------------------------------------------------------------------
 // HTTP 服务
@@ -629,9 +1006,9 @@ function versionHeaders(
   version: number,
   extra?: { readonly [name: string]: string },
 ): { [name: string]: string } {
-  const headers: { [name: string]: string } = {
-    [VERSION_HEADER]: String(version),
-  };
+  // 无原型对象：配置中名为 "__proto__" 的响应头在合并时不丢失
+  const headers: { [name: string]: string } = Object.create(null);
+  headers[VERSION_HEADER] = String(version);
   if (extra) {
     for (const [name, value] of Object.entries(extra)) {
       headers[name] = value;
@@ -879,12 +1256,21 @@ function helpText(): string {
     'Usage:',
     '  node app.ts [--help]',
     '  node app.ts serve --config <file> --port <port>',
+    '  node app.ts compare --old <file> --new <file>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
     '  -p, --port <number>   监听端口，0 表示由操作系统分配（必填）',
     '                        服务仅监听 127.0.0.1',
     '  -h, --help            显示本帮助',
+    '',
+    'Options (compare):',
+    '  -o, --old <file>      旧版场景配置文件（必填）',
+    '  -n, --new <file>      新版场景配置文件（必填）',
+    '                        离线比较“沿用旧接口约定的客户端能否调用新版”，',
+    '                        不启动监听；报告以 JSON 写往 stdout：',
+    '                        兼容退出 0，不兼容退出 1，',
+    '                        参数/读取/解析/校验失败退出 2（错误写 stderr）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
     '  GET  /__contractlab/health   健康查询，返回当前配置版本',
@@ -961,6 +1347,59 @@ function parseServeArgv(argv: readonly string[]): ServeOptions {
   return { config, port };
 }
 
+interface CompareOptions {
+  oldFile: string;
+  newFile: string;
+}
+
+function parseCompareArgv(argv: readonly string[]): CompareOptions {
+  let oldFile: string | undefined;
+  let newFile: string | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`compare: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--old' || flag === '-o') {
+      [oldFile, i] = readValue(flag, inline, i);
+    } else if (flag === '--new' || flag === '-n') {
+      [newFile, i] = readValue(flag, inline, i);
+    } else {
+      cliFail(`compare: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (oldFile === undefined) {
+    cliFail('compare: 缺少必填参数 --old <file>');
+  }
+  if (newFile === undefined) {
+    cliFail('compare: 缺少必填参数 --new <file>');
+  }
+  return { oldFile, newFile };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -978,6 +1417,15 @@ function main(): void {
     startServer(options.config, options.port).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: 启动失败：${describeError(e)}\n`);
       process.exit(1);
+    });
+    return;
+  }
+
+  if (argv[0] === 'compare') {
+    const options = parseCompareArgv(argv.slice(1));
+    runCompare(options.oldFile, options.newFile).catch((e: unknown) => {
+      process.stderr.write(`${APP_NAME}: compare 失败：${describeError(e)}\n`);
+      process.exit(2);
     });
     return;
   }
