@@ -14,6 +14,9 @@
 // - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
 //   媒体类型与 JSON 结构，不符时返回 400 差异报告，不发送场景响应、不消费序列；
 //   校验通过才按“完整接收”顺序预留响应项。
+// - 管理入口 GET /__contractlab/requests 查询本次进程内的请求记录（一致快照、
+//   不推进序列），POST /__contractlab/requests/clear 清空记录；记录只存在内存中，
+//   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）的请求一律不记录。
 // - compare 子命令：离线比较旧、新两份场景文件，判断沿用旧接口约定的客户端
 //   是否仍能调用新版；报告写 stdout，不启动监听、不修改文件。
 
@@ -25,8 +28,11 @@ const APP_NAME = 'contractlab';
 
 // 管理入口（保留前缀，业务接口不得使用）
 const ADMIN_PREFIX = '/__contractlab/';
+const ADMIN_BASE = '/__contractlab';
 const HEALTH_PATH = '/__contractlab/health';
 const RELOAD_PATH = '/__contractlab/reload';
+const REQUESTS_PATH = '/__contractlab/requests';
+const REQUESTS_CLEAR_PATH = '/__contractlab/requests/clear';
 
 // 每个业务响应都携带当前配置版本
 const VERSION_HEADER = 'X-Contractlab-Version';
@@ -381,13 +387,151 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
 
 // 同步预留下一项；同一事件循环内按“完整接收”事件的先后串行调用，天然保序。
 // 末项之后持续返回末项，不跳项、不复用未到位置的项。
-function reserveNext(endpoint: LiveEndpoint): ResponseSpec {
+// 返回本次消费位置（0 起）与该项；末项复用时位置停在 length-1。
+function reserveNext(endpoint: LiveEndpoint): { position: number; item: ResponseSpec } {
   const last = endpoint.responses.length - 1;
   const position = endpoint.cursor < last ? endpoint.cursor : last;
   if (endpoint.cursor < last) {
     endpoint.cursor += 1;
   }
-  return endpoint.responses[position];
+  return { position, item: endpoint.responses[position] };
+}
+
+// ---------------------------------------------------------------------------
+// 进程内请求记录
+// ---------------------------------------------------------------------------
+//
+// 仅记录管理范围之外、完整接收且未超过正文上限的请求（场景响应、400、404）。
+// 未收完整即断开或超出上限不创建记录、不消费序列。
+// 编号按“完整接收”顺序在进程内单调递增，与接口消费位置是两回事；
+// 清空与成功/失败重载都保留编号序列，编号不复用。记录只存在内存中，不写文件。
+
+// 写出生命周期（仅指服务器侧写出，不表示客户端已收到）：
+//   pending     —— 已完整接收、计划响应待发送（延迟期间即可查到）
+//   sent        —— 服务器已完成响应写出；此后连接正常关闭不再改变状态
+//   interrupted —— 写出完成前连接断开或写入/发送失败
+type DeliveryStatus = 'pending' | 'sent' | 'interrupted';
+
+// 计划响应：场景响应为 'scene'，400/404 等框架响应为 'framework'
+interface PlannedResponseSnapshot {
+  readonly kind: 'scene' | 'framework';
+  readonly status: number;
+  // 应用层响应头：配置头/框架头 + 服务器填写的准确版本头，不含传输层自动头
+  readonly headers: { readonly [name: string]: string };
+  // 配置/框架给出的响应正文文本（不含 HTTP 层按 Content-Length 等补出的字节）
+  readonly body: string;
+}
+
+interface RequestRecord {
+  readonly id: number;
+  readonly receivedAt: string;
+  readonly request: {
+    readonly method: string;
+    // 含查询串的原始请求目标
+    readonly target: string;
+    readonly path: string;
+    // 原始请求头：按在线顺序成对保留，名称大小写与重复头均不折叠
+    readonly rawHeaders: readonly string[];
+    readonly bodyBytes: number;
+    // 正文原始字节的无损表示：合法 UTF-8 时以文本给出，否则以 base64 给出
+    readonly body: { readonly encoding: 'utf-8' | 'base64'; readonly content: string };
+  };
+  // 完整接收那一刻选用的配置版本；在途请求的结论不随之后的 reload 改变
+  configVersion: number;
+  // matched=false：未匹配（404），不消费任何序列
+  matched: boolean;
+  endpoint: string | null;
+  // null 表示未做正文校验（GET/未声明规则）；true=通过，false=拒绝并返回 400
+  bodyValidationPassed: boolean | null;
+  // 400 时实际返回的差异报告（与响应正文中的 JSON 同一份数据）
+  bodyRejection: BodyReport | null;
+  // 场景请求在序列中的消费位置（0 起）；400/404 没有消费位置，记为 null
+  sequencePosition: number | null;
+  sequenceLength: number | null;
+  plannedResponse: PlannedResponseSnapshot | null;
+  delivery: DeliveryStatus;
+}
+
+// 已清空记录的投递回调落到空集合上：不取消响应，旧请求之后完成也不得重新出现。
+class RequestLog {
+  private records: RequestRecord[] = [];
+  // 仍可能被投递事件更新的记录 id 集合（清空后旧 id 不在其中）
+  private readonly live = new Map<number, RequestRecord>();
+  private nextId = 1;
+
+  create(entry: {
+    method: string;
+    target: string;
+    path: string;
+    rawHeaders: readonly string[];
+    body: Buffer;
+    configVersion: number;
+  }): RequestRecord {
+    const id = this.nextId;
+    this.nextId += 1;
+    const record: RequestRecord = {
+      id,
+      receivedAt: new Date().toISOString(),
+      request: {
+        method: entry.method,
+        target: entry.target,
+        path: entry.path,
+        rawHeaders: entry.rawHeaders,
+        bodyBytes: entry.body.byteLength,
+        body: encodeBodyLosslessly(entry.body),
+      },
+      configVersion: entry.configVersion,
+      matched: false,
+      endpoint: null,
+      bodyValidationPassed: null,
+      bodyRejection: null,
+      sequencePosition: null,
+      sequenceLength: null,
+      plannedResponse: null,
+      delivery: 'pending',
+    };
+    this.records.push(record);
+    this.live.set(id, record);
+    return record;
+  }
+
+  // 写出完成；对已清空（不再存活）的记录是 no-op
+  markDelivered(id: number, status: DeliveryStatus): void {
+    const record = this.live.get(id);
+    if (!record) {
+      return;
+    }
+    // 一旦完成写出即为终态：之后的连接正常关闭不得回退为 interrupted
+    if (record.delivery === 'sent') {
+      return;
+    }
+    record.delivery = status;
+  }
+
+  // 调用时一致快照：拷贝当前存活记录，不推进任何序列
+  snapshot(): readonly RequestRecord[] {
+    return [...this.records];
+  }
+
+  // 清空一次移除当时全部记录（含待发送项）；不取消响应、不改配置/版本/序列。
+  // 清空前已完整接收的请求随后完成或失败都不再出现。
+  clear(): number {
+    const removed = this.records.length;
+    this.records = [];
+    this.live.clear();
+    return removed;
+  }
+}
+
+// 原始正文字节的无损文本表示：先尝试严格 UTF-8；失败则用 base64 承载任意字节。
+// 记录的是原始字节而非解析后的 JSON，避免任何信息损失。
+function encodeBodyLosslessly(body: Buffer): { encoding: 'utf-8' | 'base64'; content: string } {
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(body);
+    return { encoding: 'utf-8', content: text };
+  } catch {
+    return { encoding: 'base64', content: body.toString('base64') };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -962,6 +1106,9 @@ let server: http.Server;
 let configFile = '';
 let shuttingDown = false;
 
+// 进程内请求记录：与配置版本、序列相互独立，reload 与清空都不影响编号单调
+const requestLog = new RequestLog();
+
 // 尚未发出的延迟响应定时器，关闭时统一取消
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
@@ -1037,11 +1184,24 @@ function sendNotFound(res: http.ServerResponse): void {
   );
 }
 
-function sendBusinessResponse(
-  res: http.ServerResponse,
+// ---------------------------------------------------------------------------
+// 计划响应快照与写出跟踪
+// ---------------------------------------------------------------------------
+//
+// 业务/框架响应在“请求完整接收”那一刻就构造为一份计划快照：
+// 记录中保存的状态/应用层头/正文与随后真正写上线的字节共用同一份数据，
+// reload 不影响在途请求（它持有的是快照而非当前配置）。
+
+function freezeHeaders(headers: { [name: string]: string }): { readonly [name: string]: string } {
+  return Object.freeze(headers);
+}
+
+// 场景响应的应用层头：配置头 + 服务器填写的准确版本头（+ 必要时的默认 Content-Type）。
+// 不含 Content-Length/Connection/Date/Transfer-Encoding 等传输层自动头。
+function buildSceneHeaders(
   item: ResponseSpec,
   version: number,
-): void {
+): { readonly [name: string]: string } {
   const headers = versionHeaders(version);
   let contentTypeSet = false;
   for (const [name, value] of Object.entries(item.headers)) {
@@ -1059,19 +1219,73 @@ function sendBusinessResponse(
   if (!contentTypeSet && item.body !== '') {
     headers['Content-Type'] = 'text/plain; charset=utf-8';
   }
-  writeResponse(res, item.status, headers, item.body);
+  return freezeHeaders(headers);
 }
 
-// 延迟结束才发送；即便客户端提前断开也继续计时（消费在预留时已经成立）
-function scheduleBusinessResponse(
-  res: http.ServerResponse,
-  item: ResponseSpec,
+function buildScenePlanned(item: ResponseSpec, version: number): PlannedResponseSnapshot {
+  return {
+    kind: 'scene',
+    status: item.status,
+    headers: buildSceneHeaders(item, version),
+    body: item.body,
+  };
+}
+
+function buildFrameworkPlanned(
+  status: number,
   version: number,
+  body: string,
+  contentType: string,
+): PlannedResponseSnapshot {
+  return {
+    kind: 'framework',
+    status,
+    headers: freezeHeaders(versionHeaders(version, { 'Content-Type': contentType })),
+    body,
+  };
+}
+
+// 按计划快照写出；writeHead/end 在已断开套接字上抛错时标记为中断（消费已成立）。
+function writePlanned(
+  res: http.ServerResponse,
+  planned: PlannedResponseSnapshot,
+  recordId: number,
+): void {
+  try {
+    res.writeHead(planned.status, { ...planned.headers });
+    res.end(planned.body === '' ? undefined : planned.body);
+  } catch {
+    requestLog.markDelivered(recordId, 'interrupted');
+  }
+}
+
+// 挂载一次写出生命周期跟踪。每个被记录的请求恰好回复一次，故在接收完成后立即挂载：
+// 延迟期间断开也能标为中断；'sent' 为终态，随后连接正常关闭不回退。
+function attachDeliveryTracking(res: http.ServerResponse, recordId: number): void {
+  let settled = false;
+  const settle = (status: DeliveryStatus): void => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    requestLog.markDelivered(recordId, status);
+  };
+  res.once('finish', () => settle('sent'));
+  res.once('close', () => settle(res.writableFinished ? 'sent' : 'interrupted'));
+  res.once('error', () => settle('interrupted'));
+}
+
+// 延迟结束才按接收时的计划快照发送；即便客户端提前断开也继续计时（消费在预留时已成立）
+function schedulePlannedResponse(
+  res: http.ServerResponse,
+  planned: PlannedResponseSnapshot,
+  delay: number,
+  recordId: number,
 ): void {
   const timer = setTimeout(() => {
     pendingTimers.delete(timer);
-    sendBusinessResponse(res, item, version);
-  }, item.delay);
+    writePlanned(res, planned, recordId);
+  }, delay);
   pendingTimers.add(timer);
 }
 
@@ -1128,17 +1342,104 @@ async function dispatch(
     // 写已销毁套接字等错误无需让进程崩溃
   });
 
+  const method = String(req.method);
+  const target = String(req.url ?? '/'); // 含查询串的原始请求目标
+  const pathname = target.split('?')[0]; // 查询串不参与匹配
+
   const { outcome, body } = await receiveBody(req, res);
   if (outcome !== 'received') {
-    // aborted：未完整接收，不匹配、不预留、不推进任何序列
-    // too-large：已回复 413
+    // aborted：未完整接收，不匹配、不预留、不推进任何序列，也不创建记录
+    // too-large：已回复 413，不创建记录、不消费序列
     return;
   }
 
-  const method = String(req.method);
-  const pathname = String(req.url ?? '/').split('?')[0]; // 查询串不参与匹配
+  // 管理范围：/__contractlab 本身及 /__contractlab/ 前缀。
+  // 其中所有请求都不记录、不消费业务序列（含未知子路径的 404）。
+  if (pathname === ADMIN_BASE || pathname.startsWith(ADMIN_PREFIX)) {
+    await handleAdmin(method, pathname, res);
+    return;
+  }
 
-  // 管理入口（不消费任何业务序列）
+  // 完整接收且不在管理范围：此刻创建记录并取得进程内递增编号。
+  // 编号只取决于完整接收顺序，与接口序列的消费位置互不相关。
+  const state = activeState;
+  const record = requestLog.create({
+    method,
+    target,
+    path: pathname,
+    rawHeaders: req.rawHeaders,
+    body,
+    configVersion: state.version,
+  });
+  attachDeliveryTracking(res, record.id);
+
+  // 业务匹配：在本次同步执行内抓取状态快照，预留后与后续 reload 互不影响
+  const endpoint =
+    method === 'GET' || method === 'POST'
+      ? state.endpoints.get(`${method} ${pathname}`)
+      : undefined;
+
+  if (!endpoint) {
+    // 未匹配请求：404，不消费、无消费位置
+    record.matched = false;
+    record.endpoint = `${method} ${pathname}`;
+    const planned = buildFrameworkPlanned(
+      404,
+      state.version,
+      'not found\n',
+      'text/plain; charset=utf-8',
+    );
+    record.plannedResponse = planned;
+    writePlanned(res, planned, record.id);
+    return;
+  }
+  record.matched = true;
+  record.endpoint = endpoint.key;
+
+  // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
+  // 规则、序列与版本均取自上面同一快照 state。
+  if (endpoint.bodyRule) {
+    const report = validateRequestBody(req, body, endpoint.bodyRule);
+    if (report) {
+      record.bodyValidationPassed = false;
+      record.bodyRejection = report;
+      const planned = buildFrameworkPlanned(
+        400,
+        state.version,
+        `${JSON.stringify(report)}\n`,
+        'application/json; charset=utf-8',
+      );
+      record.plannedResponse = planned;
+      writePlanned(res, planned, record.id);
+      return;
+    }
+    record.bodyValidationPassed = true;
+  }
+
+  // 校验通过（或无规则）：立即预留，并把消费位置与场景计划响应记入同一条记录
+  const { position, item } = reserveNext(endpoint);
+  record.sequencePosition = position;
+  record.sequenceLength = endpoint.responses.length;
+  const planned = buildScenePlanned(item, state.version);
+  record.plannedResponse = planned;
+  schedulePlannedResponse(res, planned, item.delay, record.id);
+}
+
+// ---------------------------------------------------------------------------
+// 管理入口：健康查询、热更新、请求记录查询/清空
+// ---------------------------------------------------------------------------
+
+function requestsUsageNote(): string {
+  return (
+    'contractlab 请求记录（仅保存在本次服务进程内存中，不写文件）：' +
+    'GET /__contractlab/requests 查询一致快照（不推进序列）；' +
+    'POST /__contractlab/requests/clear 清空当时全部记录（不取消响应、不改配置/版本/序列）。' +
+    'delivery=pending 表示计划响应待发送，sent 表示服务器已完成写出（不代表客户端已收到），' +
+    'interrupted 表示写出完成前连接断开或发送失败。'
+  );
+}
+
+async function handleAdmin(method: string, pathname: string, res: http.ServerResponse): Promise<void> {
   if (pathname === HEALTH_PATH) {
     if (method === 'GET') {
       sendJson(res, 200, { status: 'ok', version: activeState.version }, activeState.version);
@@ -1158,30 +1459,38 @@ async function dispatch(
     return;
   }
 
-  // 业务匹配：在本次同步执行内抓取状态快照，预留后与后续 reload 互不影响
-  const state = activeState;
-  const endpoint =
-    method === 'GET' || method === 'POST'
-      ? state.endpoints.get(`${method} ${pathname}`)
-      : undefined;
-
-  if (!endpoint) {
-    sendNotFound(res); // 未匹配请求：404，不消费
+  if (pathname === REQUESTS_PATH) {
+    if (method === 'GET') {
+      const records = requestLog.snapshot();
+      sendJson(
+        res,
+        200,
+        { note: requestsUsageNote(), count: records.length, records },
+        activeState.version,
+      );
+    } else {
+      sendNotFound(res);
+    }
     return;
   }
 
-  // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
-  // 规则、序列与版本均取自上面同一快照 state。
-  if (endpoint.bodyRule) {
-    const report = validateRequestBody(req, body, endpoint.bodyRule);
-    if (report) {
-      sendJson(res, 400, report, state.version);
-      return;
+  if (pathname === REQUESTS_CLEAR_PATH) {
+    if (method === 'POST') {
+      const removed = requestLog.clear();
+      sendJson(
+        res,
+        200,
+        { ok: true, removed, note: requestsUsageNote() },
+        activeState.version,
+      );
+    } else {
+      sendNotFound(res);
     }
+    return;
   }
 
-  const item = reserveNext(endpoint); // 校验通过后立即预留
-  scheduleBusinessResponse(res, item, state.version);
+  // 管理范围内的未知路径：仍是管理请求，不记录、不消费
+  sendNotFound(res);
 }
 
 // ---------------------------------------------------------------------------
@@ -1273,8 +1582,10 @@ function helpText(): string {
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
-    '  GET  /__contractlab/health   健康查询，返回当前配置版本',
-    '  POST /__contractlab/reload   重新读取并热更新同一配置文件',
+    '  GET  /__contractlab/health          健康查询，返回当前配置版本',
+    '  POST /__contractlab/reload          重新读取并热更新同一配置文件',
+    '  GET  /__contractlab/requests        查询本次进程内的请求记录（一致快照）',
+    '  POST /__contractlab/requests/clear  清空请求记录（不取消响应、不改配置）',
     '',
     '配置格式见 README.md。',
   ].join('\n');

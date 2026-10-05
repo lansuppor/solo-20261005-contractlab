@@ -219,6 +219,10 @@ node app.ts compare --old ./v1.json --new ./v2.json
 | --- | --- |
 | `GET /__contractlab/health` | 健康查询，返回 `{"status":"ok","version":N}` |
 | `POST /__contractlab/reload` | 重新读取启动时指定的**同一文件** |
+| `GET /__contractlab/requests` | 查询本次进程内的请求记录（一致快照，不推进序列） |
+| `POST /__contractlab/requests/clear` | 清空当时全部请求记录（不取消响应、不改配置/版本/序列） |
+
+管理范围为 `/__contractlab` 本身及 `/__contractlab/` 前缀：其中所有请求（含未知子路径、错误方法）都**不记录、不消费业务序列**。
 
 `reload` 的返回：
 
@@ -228,6 +232,101 @@ node app.ts compare --old ./v1.json --new ./v2.json
 并发 reload 按 HTTP 请求的接收顺序依次处理；请求要么看到旧配置、要么看到新配置，不会看到混合状态。
 
 版本切换的在途语义：请求预留响应时持有当时那一项的完整快照（状态码、响应头、正文、延迟、版本）。即使预留之后、延迟结束之前发生了成功 reload，该请求仍按**旧版本**响应（头中版本号也是旧的），且完成时不会推进新版本的序列；reload 成功后新进入的请求才使用新版本并从各自序列第 1 项开始。
+
+## 本地请求记录
+
+接口联调时用于查明请求**为何被拒绝、使用了哪版配置、计划与实际发送的是哪项响应**。记录只保存在本次服务进程内存中，不写文件，进程退出即消失。
+
+- `GET /__contractlab/requests` 返回机器可读 JSON：`{"note":"…调用说明…","count":N,"records":[…]}`。返回的是调用时刻的**一致快照**，查询本身不记录、不推进任何序列。
+- `POST /__contractlab/requests/clear` 清空**当时**全部记录（含待发送项），返回 `{"ok":true,"removed":N}`；不取消任何在途响应，不改变配置、版本或序列。清空前已完整接收的请求随后完成或失败都**不得重新出现**；清空后才完整接收的请求正常记录。
+
+### 何时创建、何时不创建
+
+对管理范围**之外**、**完整接收**且**未超过正文上限**（100 MiB）的每个请求记录一次，涵盖：场景响应、正文拒绝 **400**、未匹配 **404**。
+
+- 请求未收完整即断开（如只发了半个 POST body）：**不创建记录、不消费序列**。
+- 正文超过上限：回复 **413**，**不创建记录、不消费序列**。
+- 编号按“完整接收”顺序分配进程内唯一递增整数，与接口的序列消费位置**互不相关**；清空与 reload（成功或失败）后编号都**不复用、不重置**，记录也都保留。
+
+### 记录的内容
+
+每条记录可还原请求、接收时的判定与计划响应：
+
+| 字段 | 含义 |
+| --- | --- |
+| `id` | 进程内单调递增编号（清空/重载不复用） |
+| `receivedAt` | 完整接收时刻（ISO 8601，UTC） |
+| `request.method` | 请求方法 |
+| `request.target` | **含查询串**的原始请求目标（如 `/api/order?a=1&b=%E4%B8%AD`）；查询串仍不参与匹配 |
+| `request.path` | 不含查询串的路径（匹配所用） |
+| `request.rawHeaders` | 收到的请求头，按在线顺序成对保留（名称大小写、重复头均不折叠） |
+| `request.bodyBytes` | 请求正文原始字节数 |
+| `request.body` | 正文原始字节的无损表示（见下），**不是**解析后的 JSON |
+| `configVersion` | 完整接收时选用的配置版本；在途请求不随之后的 reload 改变 |
+| `matched` / `endpoint` | 是否命中接口；命中时为 `方法 路径`，未命中也记录请求的目标键 |
+| `bodyValidationPassed` | `true` 通过 / `false` 拒绝（400）/ `null` 未校验（GET 或未声明规则） |
+| `bodyRejection` | 400 时**实际返回**的差异报告（`error/stage/message/problems`）；其余为 `null` |
+| `sequencePosition` | 场景请求消费的位置（0 起）；末项复用记同一位置；**400 与 404 为 `null`** |
+| `sequenceLength` | 该接口响应序列长度；400/404 为 `null` |
+| `plannedResponse` | 接收完成时定下的计划响应（见下） |
+| `delivery` | 写出状态：`pending` / `sent` / `interrupted`（见下） |
+
+正文原始字节 `request.body`：
+
+- `{"encoding":"utf-8","content":"…"}`：正文是合法 UTF-8，`content` 为原文（空正文为 `""`）；
+- `{"encoding":"base64","content":"…"}`：正文不是合法 UTF-8，`content` 为原始字节的 base64，可无损还原。字段同时说明所用编码，记录从不以解析后的 JSON 代替原始字节。
+
+`plannedResponse` 是接收完成那一刻定下、且与真正写上线的字节共用同一份数据的不可变快照（reload 不影响在途请求）：
+
+- `kind`：`scene`（场景响应）或 `framework`（400/404 等框架响应）；
+- `status`：状态码；
+- `headers`：**应用层响应头**——配置头/框架头加上服务器填写的准确 `X-Contractlab-Version`（以及默认 `Content-Type`），不含 `Content-Length`、`Connection`、`Date`、`Transfer-Encoding` 等传输层自动头；
+- `body`：配置/框架给出的响应正文文本（400 即实际差异报告 JSON）。
+
+### 写出状态 `delivery`
+
+- `pending`：已完整接收、计划响应待发送。延迟期间查询即可看到请求及其计划响应。
+- `sent`：服务器已**完成写出**响应头与正文（`finish`）。仅表示服务器侧写出完成，**不表示客户端已收到**；此后连接正常关闭不会把状态改回中断。
+- `interrupted`：写出完成前连接断开，或写入/发送失败。已预留（消费成立）后断开仍标中断，但**消费保留**：下一次请求取得序列的下一项，末项复用规则不变。400/404 这类无延迟响应在写出前断开同样记为中断。
+
+### 示例
+
+```json
+{
+  "id": 3,
+  "receivedAt": "2026-10-06T08:30:00.123Z",
+  "request": {
+    "method": "POST",
+    "target": "/api/order?source=curl",
+    "path": "/api/order",
+    "rawHeaders": ["Host", "127.0.0.1:8080", "Content-Type", "application/json", "Content-Length", "20"],
+    "bodyBytes": 20,
+    "body": { "encoding": "utf-8", "content": "{\"id\":\"x\",\"extra\":1}" }
+  },
+  "configVersion": 2,
+  "matched": true,
+  "endpoint": "POST /api/order",
+  "bodyValidationPassed": false,
+  "bodyRejection": {
+    "error": "invalid_request_body",
+    "stage": "structure",
+    "message": "请求正文与接口约定存在 2 处差异",
+    "problems": [
+      { "pointer": "/extra", "expected": "未声明的字段（不允许）", "actual": "number" },
+      { "pointer": "/id", "expected": "integer", "actual": "string" }
+    ]
+  },
+  "sequencePosition": null,
+  "sequenceLength": null,
+  "plannedResponse": {
+    "kind": "framework",
+    "status": 400,
+    "headers": { "X-Contractlab-Version": "2", "Content-Type": "application/json; charset=utf-8" },
+    "body": "{\"error\":\"invalid_request_body\",…}\n"
+  },
+  "delivery": "sent"
+}
+```
 
 ## 本机观察示例
 
@@ -280,6 +379,31 @@ curl -sS -i -X POST http://127.0.0.1:8080/api/order \
   -H 'Content-Type: application/json' -d '{"id":"still-old-rule"}'
 ```
 
+## 本机观察：请求记录
+
+```sh
+# 1) 场景请求（含带查询串）、一次 400 拒绝、一次 404（查询串保留在 target 中）
+curl -sS http://127.0.0.1:8080/api/order
+curl -sS -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: application/json' -d '{"id":"x"}'
+curl -sS http://127.0.0.1:8080/api/order?ignored=yes -o /dev/null
+curl -sS http://127.0.0.1:8080/no/such -o /dev/null
+
+# 2) 查看记录：一致快照 JSON（查询不消费、不记录）
+curl -sS http://127.0.0.1:8080/__contractlab/requests
+
+# 3) 延迟响应在发出前即为 pending：先发起延迟请求，再立即查询
+curl -sS http://127.0.0.1:8080/api/order -o /tmp/resp.out &
+curl -sS http://127.0.0.1:8080/__contractlab/requests   # delivery 为 pending
+
+# 4) reload（成功或失败）后记录仍在；在途请求钉住旧版本，新请求用新版本
+curl -sS -X POST http://127.0.0.1:8080/__contractlab/reload
+curl -sS http://127.0.0.1:8080/__contractlab/requests
+
+# 5) 清空：移除当时全部记录（含 pending），不取消响应、不改配置/版本/序列
+curl -sS -X POST http://127.0.0.1:8080/__contractlab/requests/clear
+```
+
 ## 启动失败与进程信号
 
 - 配置无效：不创建监听，进程以状态码 1 退出，stderr 给出可定位的原因（含 JSON 指针式位置，如 `endpoints[0].responses[1].status ...`）。
@@ -296,6 +420,7 @@ npm test        # 等价于 node --test "test/*.test.ts"
 
 - `test/rule-matrix.test.ts` —— 规则包含关系矩阵：对一组确定性的小型递归规则对（交叉覆盖全部标量类型、integer/number 双向变化、必填/可选字段、additionalProperties 两种策略、对象与数组嵌套），用**独立**参考实现（`test/helpers.ts` 中的 `accepts()`，仅依据本文档语义编写，不调用产品的校验、比较或反例构造函数）在有限代表值域上穷举被旧规则接受的值，据此判断旧→新包含关系，再核对真实 compare 命令的逐接口结论、整体结论与退出码。代表值域区分整数与非整数、字段缺失与 null、空与非空数组、已声明字段与未声明额外字段，足以见证本矩阵每对规则的接受差异；这只是针对所测规则对的充分见证域，**不声称有限检查能证明任意递归规则的包含关系**。
 - `test/scenarios.test.ts` —— 典型变更场景（双方允许额外字段但新版新增可选字段限制取值、必填字段嵌套收紧、删除带正文规则的 POST 接口、启用/移除正文规则、新增接口、仅修改响应，以及空字段名、`__proto__`、含斜杠/波浪号的字段名）：断言结论与原因的 JSON Pointer 转义和定位（不固定自然语言措辞、原因排序或反例正文取值），并把报告给出的完整请求反例**原样重放**到分别加载旧、新配置的真实本机服务——旧服务必须返回场景成功响应，新服务必须返回与变更相符的 400（正文校验）或 404（接口不存在）。
+- `test/request-log.test.ts` —— 进程内请求记录：真实本机服务 + 真实 HTTP/原始套接字请求，覆盖记录字段（方法、含查询串 target、保序保大小写含重复头的 rawHeaders、UTF-8/非法 UTF-8 的 base64 无损正文、接收时版本、匹配与校验结论、400 实际差异报告、消费位置与末项复用、场景/框架计划响应含准确版本头），写出生命周期（延迟期间 pending、完成 sent 且不随后续关连接回退、写出前断开 interrupted 且消费保留），清空（移除含 pending 的全部记录、不取消响应、不改配置/版本/序列、旧记录不再出现、编号不复用），reload（成功/失败均保留记录、在途请求钉住旧版本与旧计划、新请求用新版本、编号不重置），管理范围不记录、查询不推进序列，以及未收完整断开与超出上限（413）均不创建记录、不消费序列。
 - `test/compare-errors.test.ts` —— 任一输入文件读取、JSON 解析或递归配置校验失败时退出码 2、stderr 可定位、stdout 无部分报告。
 
 测试使用独立临时文件与端口 0（以实际监听地址继续请求），不依赖固定端口、外网或固定等待时间；子进程卡住会在有限时间内使测试失败，成功与失败均关闭子进程并清理临时文件。
