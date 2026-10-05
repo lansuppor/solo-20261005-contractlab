@@ -7,6 +7,7 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "start": "node app.ts"
+    "start": "node app.ts",
+    "test": "node --test"
   }
 }
