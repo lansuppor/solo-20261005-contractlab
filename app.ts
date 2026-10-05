@@ -10,7 +10,10 @@
 // - POST /__contractlab/reload 重新读取同一配置文件：新配置全部有效时才
 //   原子替换全部接口、重置全部序列并递增版本号；失败时现状不变；
 // - 在途请求持有预留时的旧响应快照（状态码/响应头/正文/延迟/版本），
-//   完成时不会推进新序列。
+//   完成时不会推进新序列；
+// - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
+//   媒体类型与 JSON 结构，不符时返回 400 差异报告，不发送场景响应、不消费序列；
+//   校验通过才按“完整接收”顺序预留响应项。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -42,6 +45,34 @@ const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 type HttpMethod = 'GET' | 'POST';
 
+// ---------------------------------------------------------------------------
+// 请求正文结构规则（endpoints[].requestBody，仅 POST）
+// ---------------------------------------------------------------------------
+//
+// 规则格式（JSON 对象，未知字段一律拒绝）：
+//   { "type": "object", "fields": { "<名>": <字段规则>, ... }, "additionalProperties": false }
+//   { "type": "array", "items": <规则> }
+//   { "type": "string" | "number" | "integer" | "boolean" | "null" }
+// 字段规则 = 任意规则 + 可选 "required": true（缺省为可缺省）；
+// object 的 fields / additionalProperties 可省略（默认无字段声明、拒绝未声明字段）；
+// array 必须声明 items。
+
+type ScalarKind = 'string' | 'number' | 'integer' | 'boolean' | 'null';
+
+type BodyRule =
+  | {
+      readonly kind: 'object';
+      readonly fields: ReadonlyMap<string, FieldRule>;
+      readonly additionalProperties: boolean;
+    }
+  | { readonly kind: 'array'; readonly items: BodyRule }
+  | { readonly kind: ScalarKind };
+
+interface FieldRule {
+  readonly rule: BodyRule;
+  readonly required: boolean;
+}
+
 interface ResponseSpec {
   readonly status: number;
   readonly headers: { readonly [name: string]: string };
@@ -53,11 +84,13 @@ interface EndpointSpec {
   readonly method: HttpMethod;
   readonly path: string;
   readonly responses: readonly ResponseSpec[];
+  readonly bodyRule: BodyRule | undefined;
 }
 
 interface LiveEndpoint {
   readonly key: string;
   readonly responses: readonly ResponseSpec[];
+  readonly bodyRule: BodyRule | undefined;
   // 下一个待预留位置；到达末项后停在末项（持续复用）
   cursor: number;
 }
@@ -172,6 +205,86 @@ function validateResponse(raw: unknown, where: string): ResponseSpec {
   return { status, headers: cleanHeaders, body, delay };
 }
 
+const SCALAR_KINDS: ReadonlySet<string> = new Set([
+  'string',
+  'number',
+  'integer',
+  'boolean',
+  'null',
+]);
+
+function validateBodyRule(raw: unknown, where: string): BodyRule {
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
+  }
+
+  const type = raw.type;
+  const allowed = new Set(['type']);
+  if (type === 'object') {
+    allowed.add('fields');
+    allowed.add('additionalProperties');
+  } else if (type === 'array') {
+    allowed.add('items');
+  } else if (!SCALAR_KINDS.has(type as string)) {
+    throw new ConfigError(
+      `${where}.type 必须是 "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"，收到 ${JSON.stringify(type)}`,
+    );
+  }
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) {
+      throw new ConfigError(`${where} 含未知字段 "${key}"`);
+    }
+  }
+
+  if (type === 'object') {
+    const fieldsRaw = raw.fields;
+    const fields = new Map<string, FieldRule>();
+    if (fieldsRaw !== undefined) {
+      if (!isPlainObject(fieldsRaw)) {
+        throw new ConfigError(`${where}.fields 必须是对象（字段名 → 字段规则）`);
+      }
+      for (const [name, fieldRaw] of Object.entries(fieldsRaw)) {
+        fields.set(name, validateFieldRule(fieldRaw, `${where}.fields[${JSON.stringify(name)}]`));
+      }
+    }
+    const additional = raw.additionalProperties;
+    if (additional !== undefined && typeof additional !== 'boolean') {
+      throw new ConfigError(`${where}.additionalProperties 必须是布尔值`);
+    }
+    // 未声明字段默认拒绝
+    return { kind: 'object', fields, additionalProperties: additional === true };
+  }
+
+  if (type === 'array') {
+    if (raw.items === undefined) {
+      throw new ConfigError(`${where}.items 数组规则必须声明元素规则`);
+    }
+    return { kind: 'array', items: validateBodyRule(raw.items, `${where}.items`) };
+  }
+
+  return { kind: type as ScalarKind };
+}
+
+// 字段规则 = 任意规则 + 可选 "required"（仅允许出现在 object 的 fields 条目中）
+function validateFieldRule(raw: unknown, where: string): FieldRule {
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
+  }
+  let required = false;
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key === 'required') {
+      if (typeof value !== 'boolean') {
+        throw new ConfigError(`${where}.required 必须是布尔值`);
+      }
+      required = value;
+    } else {
+      rest[key] = value;
+    }
+  }
+  return { rule: validateBodyRule(rest, where), required };
+}
+
 function validateEndpoint(
   raw: unknown,
   index: number,
@@ -182,12 +295,12 @@ function validateEndpoint(
     throw new ConfigError(`${where} 必须是对象`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== 'method' && key !== 'path' && key !== 'responses') {
+    if (key !== 'method' && key !== 'path' && key !== 'responses' && key !== 'requestBody') {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
 
-  const { method, path: routePath, responses } = raw;
+  const { method, path: routePath, responses, requestBody } = raw;
 
   if (method !== 'GET' && method !== 'POST') {
     throw new ConfigError(`${where}.method 必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`);
@@ -216,7 +329,15 @@ function validateEndpoint(
     validateResponse(item, `${where}.responses[${j}]`),
   );
 
-  return { method, path: routePath, responses: cleanResponses };
+  let bodyRule: BodyRule | undefined;
+  if (requestBody !== undefined) {
+    if (method !== 'POST') {
+      throw new ConfigError(`${where}.requestBody 仅允许在 POST 接口上声明（GET 接口不允许携带此规则）`);
+    }
+    bodyRule = validateBodyRule(requestBody, `${where}.requestBody`);
+  }
+
+  return { method, path: routePath, responses: cleanResponses, bodyRule };
 }
 
 function validateConfig(raw: unknown): EndpointSpec[] {
@@ -246,6 +367,7 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
     endpoints.set(`${spec.method} ${spec.path}`, {
       key: `${spec.method} ${spec.path}`,
       responses: spec.responses,
+      bodyRule: spec.bodyRule,
       cursor: 0,
     });
   }
@@ -261,6 +383,165 @@ function reserveNext(endpoint: LiveEndpoint): ResponseSpec {
     endpoint.cursor += 1;
   }
   return endpoint.responses[position];
+}
+
+// ---------------------------------------------------------------------------
+// 请求正文校验：媒体类型 → UTF-8 JSON 解析 → 结构比对
+// ---------------------------------------------------------------------------
+
+interface StructureProblem {
+  readonly pointer: string;
+  readonly expected: string;
+  readonly actual: string;
+}
+
+interface BodyReport {
+  readonly error: 'invalid_request_body';
+  readonly stage: 'parse' | 'structure';
+  readonly message: string;
+  readonly problems: readonly StructureProblem[];
+}
+
+function parseFailure(message: string): BodyReport {
+  return { error: 'invalid_request_body', stage: 'parse', message, problems: [] };
+}
+
+function jsonTypeOf(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
+// RFC 6901 JSON Pointer 段转义：~ -> ~0，/ -> ~1
+function escapePointerSegment(segment: string): string {
+  return segment.replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+// 结构比对：父节点类型不符时只报告该节点，不再深入制造子节点错误；
+// 字段缺失（hasOwnProperty 为假）与合法的 JSON null 分开判断。
+function checkRule(
+  rule: BodyRule,
+  value: unknown,
+  pointer: string,
+  problems: StructureProblem[],
+): void {
+  switch (rule.kind) {
+    case 'string':
+    case 'boolean':
+      if (typeof value !== rule.kind) {
+        problems.push({ pointer, expected: rule.kind, actual: jsonTypeOf(value) });
+      }
+      return;
+    case 'null':
+      if (value !== null) {
+        problems.push({ pointer, expected: 'null', actual: jsonTypeOf(value) });
+      }
+      return;
+    case 'number':
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        problems.push({ pointer, expected: 'number', actual: jsonTypeOf(value) });
+      }
+      return;
+    case 'integer':
+      if (!Number.isInteger(value)) {
+        problems.push({ pointer, expected: 'integer', actual: jsonTypeOf(value) });
+      }
+      return;
+    case 'array': {
+      if (!Array.isArray(value)) {
+        problems.push({ pointer, expected: 'array', actual: jsonTypeOf(value) });
+        return;
+      }
+      for (let i = 0; i < value.length; i += 1) {
+        checkRule(rule.items, value[i], `${pointer}/${i}`, problems);
+      }
+      return;
+    }
+    case 'object': {
+      if (!isPlainObject(value)) {
+        problems.push({ pointer, expected: 'object', actual: jsonTypeOf(value) });
+        return;
+      }
+      for (const [name, field] of rule.fields) {
+        const childPointer = `${pointer}/${escapePointerSegment(name)}`;
+        if (!Object.prototype.hasOwnProperty.call(value, name)) {
+          if (field.required) {
+            problems.push({
+              pointer: childPointer,
+              expected: `${field.rule.kind}（必填字段）`,
+              actual: 'missing',
+            });
+          }
+        } else {
+          checkRule(field.rule, value[name], childPointer, problems);
+        }
+      }
+      if (!rule.additionalProperties) {
+        for (const key of Object.keys(value)) {
+          if (!rule.fields.has(key)) {
+            problems.push({
+              pointer: `${pointer}/${escapePointerSegment(key)}`,
+              expected: '未声明的字段（不允许）',
+              actual: jsonTypeOf(value[key]),
+            });
+          }
+        }
+      }
+      return;
+    }
+  }
+}
+
+// 返回 null 表示校验通过；否则为可直接序列化的 400 差异报告
+function validateRequestBody(
+  req: http.IncomingMessage,
+  body: Buffer,
+  rule: BodyRule,
+): BodyReport | null {
+  const contentType = req.headers['content-type'];
+  const mediaType =
+    typeof contentType === 'string' ? contentType.split(';', 1)[0].trim().toLowerCase() : '';
+  if (mediaType !== 'application/json') {
+    return parseFailure(
+      typeof contentType === 'string'
+        ? `媒体类型不符：期望 application/json（可带参数、忽略大小写），收到 "${contentType}"`
+        : '缺少 Content-Type 头：期望 application/json（可带参数、忽略大小写）',
+    );
+  }
+
+  if (body.length === 0) {
+    return parseFailure('请求正文为空，无法解析为 JSON');
+  }
+
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(body);
+  } catch {
+    return parseFailure('请求正文不是合法的 UTF-8 编码');
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return parseFailure(`请求正文不是合法 JSON：${describeError(e)}`);
+  }
+
+  const problems: StructureProblem[] = [];
+  checkRule(rule, parsed, '', problems);
+  if (problems.length > 0) {
+    return {
+      error: 'invalid_request_body',
+      stage: 'structure',
+      message: `请求正文与接口约定存在 ${problems.length} 处差异`,
+      problems,
+    };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +668,12 @@ function sendBusinessResponse(
   const headers = versionHeaders(version);
   let contentTypeSet = false;
   for (const [name, value] of Object.entries(item.headers)) {
-    if (name.toLowerCase() === 'content-type') {
+    const lower = name.toLowerCase();
+    // 版本头由服务器填写且必须唯一准确：配置中的同名头（含大小写变体）可加载，发送时忽略其值
+    if (lower === VERSION_HEADER.toLowerCase()) {
+      continue;
+    }
+    if (lower === 'content-type') {
       contentTypeSet = true;
     }
     headers[name] = value;
@@ -414,15 +700,22 @@ function scheduleBusinessResponse(
 
 type BodyOutcome = 'received' | 'aborted' | 'too-large';
 
+interface ReceivedBody {
+  readonly outcome: BodyOutcome;
+  // 仅在 outcome 为 'received' 时有意义（完整请求体）
+  readonly body: Buffer;
+}
+
 // 完整接收请求体；未完整接收即断开返回 'aborted'（调用方不得推进序列）
-function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<BodyOutcome> {
+function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<ReceivedBody> {
   return new Promise((resolve) => {
     let settled = false;
     let size = 0;
+    const chunks: Buffer[] = [];
     const finish = (outcome: BodyOutcome): void => {
       if (!settled) {
         settled = true;
-        resolve(outcome);
+        resolve({ outcome, body: outcome === 'received' ? Buffer.concat(chunks) : Buffer.alloc(0) });
       }
     };
     req.on('data', (chunk: Buffer) => {
@@ -439,7 +732,9 @@ function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promi
         );
         // 等 413 刷出后再断开，避免客户端收不到响应
         res.once('finish', () => req.socket.destroy());
+        return;
       }
+      chunks.push(chunk);
     });
     req.on('end', () => finish('received'));
     req.on('error', () => finish('aborted'));
@@ -456,7 +751,7 @@ async function dispatch(
     // 写已销毁套接字等错误无需让进程崩溃
   });
 
-  const outcome = await receiveBody(req, res);
+  const { outcome, body } = await receiveBody(req, res);
   if (outcome !== 'received') {
     // aborted：未完整接收，不匹配、不预留、不推进任何序列
     // too-large：已回复 413
@@ -498,7 +793,17 @@ async function dispatch(
     return;
   }
 
-  const item = reserveNext(endpoint); // 完整接收后立即预留
+  // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
+  // 规则、序列与版本均取自上面同一快照 state。
+  if (endpoint.bodyRule) {
+    const report = validateRequestBody(req, body, endpoint.bodyRule);
+    if (report) {
+      sendJson(res, 400, report, state.version);
+      return;
+    }
+  }
+
+  const item = reserveNext(endpoint); // 校验通过后立即预留
   scheduleBusinessResponse(res, item, state.version);
 }
 

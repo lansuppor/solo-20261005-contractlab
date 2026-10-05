@@ -69,17 +69,94 @@ node app.ts serve -c ./scenes.json -p 0     # 端口 0：由操作系统分配�
 | `method` | `"GET"` 或 `"POST"` |
 | `path` | 以 `/` 开头的绝对路径（字面值）；不含 `?`、`#`、`{`、`}`、空白与控制字符 |
 | `responses` | **非空**响应序列数组 |
+| `requestBody` | 可选，**仅 POST**；请求正文结构规则（见下节）。不配置时保持原有正文处理方式（不校验） |
 
 序列每项字段：
 
 | 字段 | 校验规则 |
 | --- | --- |
 | `status` | 整数，200–599 |
-| `headers` | 字符串键值对象（必填，无自定义头时写 `{}`）；头名称须合法；值不得含换行/控制字符，只能使用 Latin-1 字符；不得设置 `Connection`、`Keep-Alive`、`Content-Length`、`Transfer-Encoding` |
+| `headers` | 字符串键值对象（必填，无自定义头时写 `{}`）；头名称须合法；值不得含换行/控制字符，只能使用 Latin-1 字符；不得设置 `Connection`、`Keep-Alive`、`Content-Length`、`Transfer-Encoding`。可声明 `X-Contractlab-Version`（含大小写变体），发送时其值被忽略，版本头始终由服务器填写 |
 | `body` | 文本字符串；状态码为 **204 / 304** 时必须为空字符串 |
 | `delay` | 整数毫秒，0–60000 |
 
 未知字段（任何层级）、重复接口（方法+路径相同）、类型错误等都会导致整份配置被拒绝。
+
+## 请求正文结构规则（`requestBody`）
+
+POST 接口可附加 `requestBody`，在请求**完整接收后**先校验正文，再决定是否预留响应。规则是递归的 JSON 对象，`type` 必填，未知字段一律拒绝（GET 接口声明此规则同样拒绝）：
+
+```json
+{ "type": "object",
+  "fields": { "<字段名>": { "type": "...", "required": true } },
+  "additionalProperties": false }
+{ "type": "array", "items": { "type": "..." } }
+{ "type": "string" }   { "type": "number" }   { "type": "integer" }
+{ "type": "boolean" }  { "type": "null" }
+```
+
+- `object`：`fields` 声明字段（可省略，默认无声明字段）；字段规则 = 任意规则 + 可选 `"required": true`，未标记必填的字段可缺省；`additionalProperties` 可省略，**默认 `false`（拒绝未声明字段）**。
+- `array`：**必须**声明 `items` 元素规则。
+- `number` 只接受有限数字；`integer` 只接受整数。除此之外不引入其他约束种类（无长度、范围、格式等）。
+- 非法规则（含未知字段、GET 上声明、数组缺 `items` 等）在启动或 reload 时整份拒绝，错误信息给出配置位置，如 `endpoints[0].requestBody.fields["a"] 含未知字段 "minLength"`。
+
+示例：
+
+```json
+{
+  "method": "POST",
+  "path": "/api/order",
+  "requestBody": {
+    "type": "object",
+    "fields": {
+      "id":    { "type": "integer", "required": true },
+      "note":  { "type": "string" },
+      "tags":  { "type": "array", "items": { "type": "string" } },
+      "buyer": { "type": "object", "required": true,
+                 "fields": { "name": { "type": "string", "required": true } } }
+    }
+  },
+  "responses": [ { "status": 200, "headers": {}, "body": "ok", "delay": 0 } ]
+}
+```
+
+### 校验流程与 400 差异报告
+
+对声明了规则的接口，请求完整接收后依次检查：
+
+1. **媒体类型**：`Content-Type` 忽略大小写须为 `application/json`（可带参数，如 `; charset=utf-8`）；缺失或不符 → 400；
+2. **解析**：正文非空、合法 UTF-8、合法 JSON，否则 → 400；
+3. **结构**：按规则递归比对，有任何差异 → 400。
+
+任一失败都返回 **HTTP 400** 与 JSON 差异报告，**不发送场景响应、不消费响应序列**（下一次合格请求仍取得本应取到的项）。报告区分解析与结构问题：
+
+```json
+{
+  "error": "invalid_request_body",
+  "stage": "parse",
+  "message": "请求正文不是合法 JSON：...",
+  "problems": []
+}
+```
+
+```json
+{
+  "error": "invalid_request_body",
+  "stage": "structure",
+  "message": "请求正文与接口约定存在 2 处差异",
+  "problems": [
+    { "pointer": "/tags/1",  "expected": "string",           "actual": "number"  },
+    { "pointer": "/a~1b~0c", "expected": "string（必填字段）", "actual": "missing" }
+  ]
+}
+```
+
+- `problems` 列出**全部**独立差异；`pointer` 是 RFC 6901 JSON Pointer（字段名中的 `~`、`/` 分别转义为 `~0`、`~1`，根为 `""`），数组错误含元素下标。
+- 缺失字段指向该字段本身；未声明的额外字段指向其自身；父节点类型不符只报告该节点，不再产生子节点错误。
+- 合法的 JSON `null` 与字段缺失分开判断（`"paid": null` 不是缺失）。
+- 400 报告与场景响应一样携带准确的 `X-Contractlab-Version`。
+
+校验规则、响应序列与版本号取自请求完整接收时的**同一配置快照**；校验通过才预留响应项，合格请求仍按完整接收顺序取项、耗尽后复用末项。reload 成功一次性替换规则与响应（版本 +1、序列重置）；reload 失败保留旧规则、旧版本与消费位置；已预留的延迟响应继续使用旧快照。
 
 ## 响应序列语义
 
@@ -127,6 +204,35 @@ curl -sS -X POST http://127.0.0.1:8080/__contractlab/reload
 # 5) 改成非法 JSON 再 reload：ok=false、version 不变，旧接口仍可请求
 curl -sS -X POST http://127.0.0.1:8080/__contractlab/reload
 curl -sS -i http://127.0.0.1:8080/api/order
+```
+
+## 本机观察：正文校验
+
+```sh
+# 1) 合格请求按序取项（媒体类型忽略大小写、可带参数）
+curl -sS -i -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: Application/JSON; charset=utf-8' \
+  -d '{"id":1,"buyer":{"name":"ann"}}'
+
+# 2) 结构差异：400 + 全部差异的 JSON Pointer 报告，不消费序列
+curl -sS -i -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"oops","tags":["a",2],"extra":1}'
+
+# 3) 解析问题：缺/错媒体类型、空正文、非法 JSON 都是 400 + "stage":"parse"
+curl -sS -i -X POST http://127.0.0.1:8080/api/order -H 'Content-Type: application/json' -d '{bad'
+
+# 4) 拒绝不消费：下一条合格请求仍取得它本应取到的响应项
+curl -sS -i -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: application/json' -d '{"id":2,"buyer":{"name":"bob"}}'
+
+# 5) 修改 scenes.json 中的 requestBody 后 reload：新规则立即生效、版本 +1
+curl -sS -X POST http://127.0.0.1:8080/__contractlab/reload
+
+# 6) 把规则改非法（如数组缺 items）再 reload：ok=false，旧规则继续拦截
+curl -sS -X POST http://127.0.0.1:8080/__contractlab/reload
+curl -sS -i -X POST http://127.0.0.1:8080/api/order \
+  -H 'Content-Type: application/json' -d '{"id":"still-old-rule"}'
 ```
 
 ## 启动失败与进程信号
