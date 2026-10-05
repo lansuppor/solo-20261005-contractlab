@@ -16,6 +16,10 @@ node app.ts -h
 # 启动场景服务
 node app.ts serve --config ./scenes.json --port 8080
 node app.ts serve -c ./scenes.json -p 0     # 端口 0：由操作系统分配，启动日志输出实际地址
+
+# 离线兼容报告（旧 -> 新，不启动监听、不修改文件）
+node app.ts compat --old ./old.json --new ./new.json
+node app.ts compat -o ./old.json -n ./new.json
 ```
 
 不支持的命令行参数会报错并以状态码 **2** 退出。
@@ -157,6 +161,54 @@ POST 接口可附加 `requestBody`，在请求**完整接收后**先校验正文
 - 400 报告与场景响应一样携带准确的 `X-Contractlab-Version`。
 
 校验规则、响应序列与版本号取自请求完整接收时的**同一配置快照**；校验通过才预留响应项，合格请求仍按完整接收顺序取项、耗尽后复用末项。reload 成功一次性替换规则与响应（版本 +1、序列重置）；reload 失败保留旧规则、旧版本与消费位置；已预留的延迟响应继续使用旧快照。
+
+## 离线兼容报告（`compat`）
+
+```sh
+node app.ts compat --old ./old.json --new ./new.json
+```
+
+比较**旧、新两个本地场景 JSON 文件**，判断“沿用旧接口约定的客户端，是否仍能调用新版”。两份文件都使用上文相同的 `endpoints` / `requestBody` / `responses` 格式，先被**全部读取、解析并严格校验**，任一文件失败都只在 stderr 给出文件与可定位原因，**不输出部分报告、不启动监听、不修改文件**（退出码 2）。
+
+兼容方向固定为**旧到新**：
+
+- 接口由 **方法 + 字面路径** 匹配（查询串不参与）。新版**新增**接口不破坏兼容；旧接口在新版中不存在（**删除/改路径**）判为不兼容。
+- 只比较**接口存在性与请求接受条件**；响应状态、响应头、正文、延迟及响应序列差异都**不影响结论**。
+- 旧接口**未配置** `requestBody`（原先允许任意正文与媒体类型）而新版**启用**规则 → 不兼容；新版**移除**规则 → 兼容。
+- 双方都配置规则时，判定的是递归规则所接受 **JSON 值集合的包含关系**（不是文本比较，也不是抽样请求）：
+  - 对象：新版新增**必填**字段（旧版可缺省）、可选改必填、同名字段规则收紧均不兼容；**新增可选字段**也可能因收紧“未声明字段”而不兼容；**删除字段**是否兼容取决于新版是否仍允许该键（`additionalProperties`）。
+  - 数组：元素规则收紧会用**非空数组**（元素指针 `/0`）体现。
+  - 类型：`integer` 放宽为 `number` 兼容，反向（`number` → `integer`）不兼容；其余根类型互不相交。覆盖对象必填/可选字段、未声明字段策略、嵌套数组/对象及全部现有类型。
+
+stdout 输出可机器读取的 JSON，含整体结论、计数与每个旧接口的结论。每个不兼容接口给出至少一处原因与一份**可复用的完整请求反例**（方法、路径、必要请求头、原始正文字符串）：该请求被旧配置匹配并通过检查，却在新版中找不到接口或被正文检查拒绝。正文差异用 RFC 6901 指针定位（根为 `""`），接口删除以方法与路径定位（`pointer` 为 `null`）。
+
+```json
+{
+  "direction": "old-to-new",
+  "compatible": false,
+  "summary": { "total": 2, "compatible": 1, "incompatible": 1 },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/api/order",
+      "compatible": false,
+      "reason": {
+        "code": "body_rejected",
+        "pointer": "/id",
+        "message": "字段 ...（指针 /id）... 新规则 ... 旧规则 ..."
+      },
+      "counterexample": {
+        "method": "POST",
+        "path": "/api/order",
+        "headers": { "Content-Type": "application/json" },
+        "body": "{\"id\":0.5}"
+      }
+    }
+  ]
+}
+```
+
+退出码：**兼容 0**；存在不兼容接口 **1**；参数、读取、解析或配置校验失败 **2**（错误写 stderr，stdout 无报告）。`reason.code` 取值：`endpoint_not_found`（接口删除，`pointer` 为 `null`）或 `body_rejected`（正文检查拒绝，`pointer` 为差异位置）。
 
 ## 响应序列语义
 

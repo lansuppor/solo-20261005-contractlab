@@ -213,13 +213,19 @@ const SCALAR_KINDS: ReadonlySet<string> = new Set([
   'null',
 ]);
 
-function validateBodyRule(raw: unknown, where: string): BodyRule {
+// inField 为真时，该规则是 object.fields 的条目：额外允许 "required"。
+// 直接在原始对象上校验，绝不逐键复制到普通对象——未知键 "__proto__"
+// 经 JSON.parse 是自有数据属性，一旦用赋值复制就会被当成原型设置而丢失。
+function validateBodyRule(raw: unknown, where: string, inField = false): BodyRule {
   if (!isPlainObject(raw)) {
     throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
   }
 
   const type = raw.type;
   const allowed = new Set(['type']);
+  if (inField) {
+    allowed.add('required');
+  }
   if (type === 'object') {
     allowed.add('fields');
     allowed.add('additionalProperties');
@@ -271,18 +277,13 @@ function validateFieldRule(raw: unknown, where: string): FieldRule {
     throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
   }
   let required = false;
-  const rest: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(raw)) {
-    if (key === 'required') {
-      if (typeof value !== 'boolean') {
-        throw new ConfigError(`${where}.required 必须是布尔值`);
-      }
-      required = value;
-    } else {
-      rest[key] = value;
+  if (Object.prototype.hasOwnProperty.call(raw, 'required')) {
+    if (typeof raw.required !== 'boolean') {
+      throw new ConfigError(`${where}.required 必须是布尔值`);
     }
+    required = raw.required;
   }
-  return { rule: validateBodyRule(rest, where), required };
+  return { rule: validateBodyRule(raw, where, true), required };
 }
 
 function validateEndpoint(
@@ -573,6 +574,438 @@ async function loadStateFromFile(configPath: string, version: number): Promise<L
   } catch (e) {
     throw new Error(`配置文件 ${configPath} 校验失败：${describeError(e)}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// 离线兼容报告（compat 子命令）：旧配置 -> 新配置的请求接受集合包含判定
+// ---------------------------------------------------------------------------
+//
+// 判定的是“递归规则接受的 JSON 值集合”的包含关系，而非文本比较或抽样：
+// - 结构类型在根处即互不相交（object/array/各标量）；
+// - integer 接受集合 ⊊ number；
+// - object：新增必填（旧版可缺省）、同名字段规则收紧、旧允许的键新版拒绝；
+// - array：用非空数组把 items 的收紧体现在元素 /0 上。
+// 每处不兼容都构造一个“旧规则接受、新规则拒绝”的具体 JSON 值作为反例。
+
+interface CompatReason {
+  readonly code: 'endpoint_not_found' | 'body_rejected';
+  // RFC 6901 指针；接口删除时为 null
+  readonly pointer: string | null;
+  readonly message: string;
+}
+
+interface CounterexampleRequest {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly headers: { readonly [name: string]: string };
+  // 原始请求正文（字符串原样发送）
+  readonly body: string;
+}
+
+interface EndpointVerdict {
+  readonly method: HttpMethod;
+  readonly path: string;
+  readonly compatible: boolean;
+  readonly reason?: CompatReason;
+  readonly counterexample?: CounterexampleRequest;
+}
+
+interface CompatReport {
+  readonly direction: 'old-to-new';
+  readonly compatible: boolean;
+  readonly summary: {
+    readonly total: number;
+    readonly compatible: number;
+    readonly incompatible: number;
+  };
+  readonly endpoints: readonly EndpointVerdict[];
+}
+
+// 一次值集合层面的不兼容：指针、原因、旧规则接受而新规则拒绝的 JSON 值
+interface RuleWitness {
+  readonly pointer: string;
+  readonly message: string;
+  readonly value: unknown;
+}
+
+// 规则在根处可能接受的 JSON 类型标签（integer 与 number 分开列出）
+type JsonKind = 'string' | 'number' | 'integer' | 'boolean' | 'null' | 'object' | 'array';
+
+function scalarAcceptsKind(kind: ScalarKind, accepted: JsonKind): boolean {
+  if (kind === 'number') {
+    return accepted === 'number' || accepted === 'integer';
+  }
+  return kind === accepted;
+}
+
+function ruleAcceptsKind(rule: BodyRule, kind: JsonKind): boolean {
+  switch (rule.kind) {
+    case 'object':
+      return kind === 'object';
+    case 'array':
+      return kind === 'array';
+    default:
+      return scalarAcceptsKind(rule.kind, kind);
+  }
+}
+
+function acceptedKinds(rule: BodyRule): JsonKind[] {
+  const all: JsonKind[] = ['string', 'number', 'integer', 'boolean', 'null', 'object', 'array'];
+  return all.filter((k) => ruleAcceptsKind(rule, k));
+}
+
+// 构造用于反例的 JSON 对象：必须以 null 为原型，否则键名为 "__proto__"
+// （合法业务字段名）时，赋值会被解释为设置原型，JSON.stringify 也会漏掉它。
+function makeJsonObject(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
+// 规则一定接受的最小 JSON 值
+function minimalAcceptedValue(rule: BodyRule): unknown {
+  switch (rule.kind) {
+    case 'string':
+      return '';
+    case 'number':
+    case 'integer':
+      return 0;
+    case 'boolean':
+      return false;
+    case 'null':
+      return null;
+    case 'array':
+      return [];
+    case 'object': {
+      const value = makeJsonObject();
+      for (const [name, field] of rule.fields) {
+        if (field.required) {
+          value[name] = minimalAcceptedValue(field.rule);
+        }
+      }
+      return value;
+    }
+  }
+}
+
+function kindSample(kind: JsonKind): unknown {
+  switch (kind) {
+    case 'string':
+      return '';
+    case 'number':
+    case 'integer':
+      return 0;
+    case 'boolean':
+      return false;
+    case 'null':
+      return null;
+    case 'object':
+      return {};
+    case 'array':
+      return [];
+  }
+}
+
+function kindLabel(kind: JsonKind): string {
+  return kind;
+}
+
+function pointerChild(pointer: string, segment: string): string {
+  return `${pointer}/${escapePointerSegment(segment)}`;
+}
+
+// 旧规则缺失（any：旧接口未配置 requestBody 或旧 object 允许额外键）时，
+// 构造一个必被新规则拒绝的值：优先用根处类型不符。
+function witnessAgainstAny(rule: BodyRule, pointer: string): RuleWitness {
+  if (rule.kind === 'object') {
+    return {
+      pointer,
+      message: `新规则在 ${pointer || '""'} 要求 object，旧规则允许任意类型的值（array 即不被接受）`,
+      value: [],
+    };
+  }
+  if (rule.kind === 'array') {
+    return {
+      pointer,
+      message: `新规则在 ${pointer || '""'} 要求 array，旧规则允许任意类型的值（object 即不被接受）`,
+      value: {},
+    };
+  }
+  const rejected: JsonKind =
+    rule.kind === 'null'
+      ? 'string'
+      : rule.kind === 'string'
+        ? 'number'
+        : 'null'; // number / integer / boolean 都不接受 null
+  return {
+    pointer,
+    message: `新规则在 ${pointer || '""'} 要求 ${rule.kind}，旧规则允许 ${kindLabel(rejected)} 类型的值`,
+    value: kindSample(rejected),
+  };
+}
+
+// 在根类型层面寻找“旧接受、新拒绝”的类型；integer 对 number 的收紧不在此处理
+function typeLevelWitness(newRule: BodyRule, oldKinds: readonly JsonKind[], pointer: string): RuleWitness | null {
+  for (const kind of oldKinds) {
+    if (!ruleAcceptsKind(newRule, kind)) {
+      return {
+        pointer,
+        message: `新规则在 ${pointer || '""'} 要求 ${newRule.kind}，旧规则允许 ${kindLabel(kind)} 类型的值`,
+        value: kindSample(kind),
+      };
+    }
+  }
+  return null;
+}
+
+// 为 oldObject 构造一个通过其校验的对象底版：填齐旧规则的全部必填字段，
+// 跳过 skip 中的键（该处将放入专门的反例值或刻意缺省）。
+function seedOldRequired(
+  oldObject: Extract<BodyRule, { kind: 'object' }>,
+  skip: ReadonlySet<string>,
+): Record<string, unknown> {
+  const value = makeJsonObject();
+  for (const [name, field] of oldObject.fields) {
+    if (field.required && !skip.has(name)) {
+      value[name] = minimalAcceptedValue(field.rule);
+    }
+  }
+  return value;
+}
+
+// 核心递归：返回 null 表示新规则接受集合覆盖旧规则；否则给出反例。
+// oldRule 为 undefined 表示旧侧在该位置接受任意 JSON（any）。
+function deriveWitness(
+  newRule: BodyRule,
+  oldRule: BodyRule | undefined,
+  pointer: string,
+): RuleWitness | null {
+  if (oldRule === undefined) {
+    return witnessAgainstAny(newRule, pointer);
+  }
+
+  // number -> integer 是唯一“同根类型内的收紧”：0 这类整数会被接受，
+  // 必须用非整数才能构成反例，故先于类型层面判断处理。
+  if (newRule.kind === 'integer' && oldRule.kind === 'number') {
+    return {
+      pointer,
+      message: `新规则在 ${pointer || '""'} 要求 integer，旧 number 规则允许非整数（如 0.5）`,
+      value: 0.5,
+    };
+  }
+
+  const oldKinds = acceptedKinds(oldRule);
+  const typed = typeLevelWitness(newRule, oldKinds, pointer);
+  if (typed) {
+    return typed;
+  }
+
+  if (newRule.kind === 'array') {
+    // 旧规则必为 array（只有 array 接受 array 类型）；用非空数组体现元素收紧
+    const child = deriveWitness(newRule.items, oldRule.kind === 'array' ? oldRule.items : undefined, `${pointer}/0`);
+    if (child) {
+      // 元素位置的反例包进单元素数组，根值才是旧数组规则接受的 JSON
+      return { ...child, value: [child.value] };
+    }
+    return null;
+  }
+
+  if (newRule.kind === 'object') {
+    // 旧规则必为 object
+    const oldObject = oldRule.kind === 'object' ? oldRule : undefined;
+
+    // 1) 新版必填而旧版允许缺省（旧版无此字段声明，或声明为可选）
+    for (const [name, newField] of newRule.fields) {
+      const oldField = oldObject ? oldObject.fields.get(name) : undefined;
+      if (newField.required && (!oldField || !oldField.required)) {
+        const value = oldObject ? seedOldRequired(oldObject, new Set([name])) : {};
+        return {
+          pointer: pointerChild(pointer, name),
+          message: `新规则将字段 ${JSON.stringify(name)} 列为必填（指针 ${pointerChild(pointer, name)}），旧规则允许请求缺省该字段`,
+          value,
+        };
+      }
+    }
+
+    // 2) 同名字段：递归比较值集合
+    if (oldObject) {
+      for (const [name, oldField] of oldObject.fields) {
+        const newField = newRule.fields.get(name);
+        if (!newField) {
+          continue; // 字段删除在第 3 步统一判断
+        }
+        const child = deriveWitness(newField.rule, oldField.rule, pointerChild(pointer, name));
+        if (child) {
+          // 包上一层：填齐旧侧其他必填字段，目标字段放入子反例
+          const value = seedOldRequired(oldObject, new Set([name]));
+          value[name] = child.value;
+          return { ...child, value };
+        }
+      }
+    }
+
+    // 3) 旧版允许、新版拒绝的键
+    if (!newRule.additionalProperties) {
+      if (oldObject) {
+        for (const [name, oldField] of oldObject.fields) {
+          if (!newRule.fields.has(name)) {
+            const value = seedOldRequired(oldObject, new Set([name]));
+            value[name] = minimalAcceptedValue(oldField.rule);
+            return {
+              pointer: pointerChild(pointer, name),
+              message: `字段 ${JSON.stringify(name)}（指针 ${pointerChild(pointer, name)}）在旧规则中声明且允许发送，新规则未声明该字段且 additionalProperties 为 false，请求被拒绝`,
+              value,
+            };
+          }
+        }
+        // 旧规则无字段边界：任意额外键都合法
+        if (oldObject.additionalProperties) {
+          const value = seedOldRequired(oldObject, new Set());
+          let extraName = 'x';
+          while (newRule.fields.has(extraName) || Object.prototype.hasOwnProperty.call(value, extraName)) {
+            extraName = `x${extraName.length}`;
+          }
+          value[extraName] = 1;
+          return {
+            pointer: pointerChild(pointer, extraName),
+            message: `旧规则允许未声明的额外字段（additionalProperties 为 true），新规则拒绝；如字段 ${JSON.stringify(extraName)}（指针 ${pointerChild(pointer, extraName)}）`,
+            value,
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  // 新规则为标量（number/string/boolean/null）：能走到这里说明旧接受的
+  // 全部根类型都被覆盖（number 已覆盖 integer），无收紧
+  return null;
+}
+
+function bodyCounterexample(
+  method: HttpMethod,
+  routePath: string,
+  witness: RuleWitness,
+): { reason: CompatReason; counterexample: CounterexampleRequest } {
+  return {
+    reason: {
+      code: 'body_rejected',
+      pointer: witness.pointer,
+      message: witness.message,
+    },
+    counterexample: {
+      method,
+      path: routePath,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(witness.value),
+    },
+  };
+}
+
+// 旧接口启用了规则、新接口未启用：移除规则是兼容；
+// 旧接口无规则、新接口启用：旧版允许任意正文与媒体类型，判不兼容。
+function compareEndpoint(old: EndpointSpec, next: EndpointSpec | undefined): EndpointVerdict {
+  if (!next) {
+    return {
+      method: old.method,
+      path: old.path,
+      compatible: false,
+      reason: {
+        code: 'endpoint_not_found',
+        pointer: null,
+        message: `新版配置中不存在接口 ${old.method} ${old.path}（接口已删除）`,
+      },
+      counterexample: {
+        method: old.method,
+        path: old.path,
+        headers: {},
+        body: '',
+      },
+    };
+  }
+
+  if (!old.bodyRule && next.bodyRule) {
+    const witness = witnessAgainstAny(next.bodyRule, '');
+    const built = bodyCounterexample(old.method, old.path, witness);
+    return {
+      method: old.method,
+      path: old.path,
+      compatible: false,
+      reason: {
+        code: 'body_rejected',
+        pointer: '',
+        message:
+          '旧接口未配置 requestBody，旧版允许任意正文与媒体类型；新版启用正文规则后，原本可发送的请求被正文检查拒绝。' +
+          witness.message,
+      },
+      counterexample: built.counterexample,
+    };
+  }
+
+  if (old.bodyRule && next.bodyRule) {
+    const witness = deriveWitness(next.bodyRule, old.bodyRule, '');
+    if (witness) {
+      const built = bodyCounterexample(old.method, old.path, witness);
+      return {
+        method: old.method,
+        path: old.path,
+        compatible: false,
+        reason: built.reason,
+        counterexample: built.counterexample,
+      };
+    }
+  }
+
+  // 双方均无规则，或新版移除了规则：接口存在且接受条件未收紧
+  return { method: old.method, path: old.path, compatible: true };
+}
+
+function buildCompatReport(oldSpecs: readonly EndpointSpec[], newSpecs: readonly EndpointSpec[]): CompatReport {
+  const newIndex = new Map<string, EndpointSpec>();
+  for (const spec of newSpecs) {
+    newIndex.set(`${spec.method} ${spec.path}`, spec);
+  }
+
+  const endpoints = oldSpecs.map((old) => compareEndpoint(old, newIndex.get(`${old.method} ${old.path}`)));
+  const incompatible = endpoints.filter((v) => !v.compatible).length;
+  return {
+    direction: 'old-to-new',
+    compatible: incompatible === 0,
+    summary: {
+      total: endpoints.length,
+      compatible: endpoints.length - incompatible,
+      incompatible,
+    },
+    endpoints,
+  };
+}
+
+async function loadSpecsForCompat(file: string, role: string): Promise<readonly EndpointSpec[]> {
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (e) {
+    throw new Error(`读取${role}配置文件 ${file} 失败：${describeError(e)}`);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${role}配置文件 ${file} 不是合法 JSON：${describeError(e)}`);
+  }
+  try {
+    return validateConfig(raw);
+  } catch (e) {
+    throw new Error(`${role}配置文件 ${file} 校验失败：${describeError(e)}`);
+  }
+}
+
+async function runCompat(oldFile: string, newFile: string): Promise<number> {
+  // 两份文件全部读取、解析、严格校验通过后才输出报告；任一失败不输出部分报告
+  const oldSpecs = await loadSpecsForCompat(oldFile, '旧');
+  const newSpecs = await loadSpecsForCompat(newFile, '新');
+  const report = buildCompatReport(oldSpecs, newSpecs);
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  return report.compatible ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -879,12 +1312,24 @@ function helpText(): string {
     'Usage:',
     '  node app.ts [--help]',
     '  node app.ts serve --config <file> --port <port>',
+    '  node app.ts compat --old <old-file> --new <new-file>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
     '  -p, --port <number>   监听端口，0 表示由操作系统分配（必填）',
     '                        服务仅监听 127.0.0.1',
+    '',
+    'Options (compat):',
+    '  -o, --old <file>      旧版本地场景 JSON 文件（必填）',
+    '  -n, --new <file>      新版本地场景 JSON 文件（必填）',
+    '                        两份文件均读取、解析并严格校验通过后才输出报告；',
+    '                        不启动监听、不修改任何文件。',
+    '',
     '  -h, --help            显示本帮助',
+    '',
+    'compat 报告（stdout，JSON）：固定按旧到新方向，比较接口存在性与请求接受',
+    '条件（查询串、响应状态/头/正文/延迟、序列差异均不参与）。兼容退出 0，',
+    '存在不兼容接口退出 1，参数/读取/解析/校验失败退出 2（原因写 stderr）。',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
     '  GET  /__contractlab/health   健康查询，返回当前配置版本',
@@ -961,6 +1406,59 @@ function parseServeArgv(argv: readonly string[]): ServeOptions {
   return { config, port };
 }
 
+interface CompatOptions {
+  oldFile: string;
+  newFile: string;
+}
+
+function parseCompatArgv(argv: readonly string[]): CompatOptions {
+  let oldFile: string | undefined;
+  let newFile: string | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`compat: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--old' || flag === '-o') {
+      [oldFile, i] = readValue(flag, inline, i);
+    } else if (flag === '--new' || flag === '-n') {
+      [newFile, i] = readValue(flag, inline, i);
+    } else {
+      cliFail(`compat: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (oldFile === undefined) {
+    cliFail('compat: 缺少必填参数 --old <file>');
+  }
+  if (newFile === undefined) {
+    cliFail('compat: 缺少必填参数 --new <file>');
+  }
+  return { oldFile, newFile };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -979,6 +1477,19 @@ function main(): void {
       process.stderr.write(`${APP_NAME}: 启动失败：${describeError(e)}\n`);
       process.exit(1);
     });
+    return;
+  }
+
+  if (argv[0] === 'compat') {
+    const options = parseCompatArgv(argv.slice(1));
+    runCompat(options.oldFile, options.newFile)
+      .then((code) => {
+        process.exitCode = code;
+      })
+      .catch((e: unknown) => {
+        process.stderr.write(`${APP_NAME}: compat: ${describeError(e)}\n`);
+        process.exit(2);
+      });
     return;
   }
 
