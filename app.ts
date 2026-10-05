@@ -11,6 +11,9 @@
 //   原子替换全部接口、重置全部序列并递增版本号；失败时现状不变；
 // - 在途请求持有预留时的旧响应快照（状态码/响应头/正文/延迟/版本），
 //   完成时不会推进新序列。
+// - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
+//   媒体类型（application/json，忽略大小写、可带参数）、JSON 解析与结构；
+//   失败返回 400 差异报告，不发送场景响应、不消费响应序列；校验通过才预留。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -42,6 +45,24 @@ const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 
 type HttpMethod = 'GET' | 'POST';
 
+// 请求正文结构规则（仅 POST 接口可声明；递归声明）
+type PrimitiveKind = 'string' | 'number' | 'integer' | 'boolean' | 'null';
+
+type BodyRule =
+  | {
+      readonly kind: 'object';
+      readonly fields: ReadonlyMap<string, FieldRule>;
+      // 是否允许未声明字段（默认拒绝）
+      readonly additional: boolean;
+    }
+  | { readonly kind: 'array'; readonly items: BodyRule }
+  | { readonly kind: PrimitiveKind };
+
+interface FieldRule {
+  readonly rule: BodyRule;
+  readonly required: boolean;
+}
+
 interface ResponseSpec {
   readonly status: number;
   readonly headers: { readonly [name: string]: string };
@@ -53,11 +74,13 @@ interface EndpointSpec {
   readonly method: HttpMethod;
   readonly path: string;
   readonly responses: readonly ResponseSpec[];
+  readonly requestBody?: BodyRule;
 }
 
 interface LiveEndpoint {
   readonly key: string;
   readonly responses: readonly ResponseSpec[];
+  readonly requestBody?: BodyRule;
   // 下一个待预留位置；到达末项后停在末项（持续复用）
   cursor: number;
 }
@@ -104,6 +127,89 @@ function validatePath(p: string, where: string): void {
     }
     if (code <= 0x1f || code === 0x7f || code === 0x20) {
       throw new ConfigError(`${where}.path "${p}" 不得包含空白或控制字符`);
+    }
+  }
+}
+
+const RULE_KINDS = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null']);
+
+// 解析一条正文规则；allowRequired 仅在对象字段声明位置为 true
+function parseBodyRule(raw: unknown, where: string, allowRequired: boolean): FieldRule {
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`${where} 必须是对象（正文规则声明）`);
+  }
+  for (const key of Object.keys(raw)) {
+    const known =
+      key === 'type' ||
+      key === 'fields' ||
+      key === 'additionalFields' ||
+      key === 'items' ||
+      (key === 'required' && allowRequired);
+    if (!known) {
+      throw new ConfigError(
+        key === 'required'
+          ? `${where}.required 仅对象字段声明中可用`
+          : `${where} 含未知字段 "${key}"`,
+      );
+    }
+  }
+
+  const t = raw.type;
+  if (typeof t !== 'string' || !RULE_KINDS.has(t)) {
+    throw new ConfigError(
+      `${where}.type 必须是 "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"，` +
+        `收到 ${JSON.stringify(t)}`,
+    );
+  }
+
+  let required = false;
+  if (allowRequired && 'required' in raw) {
+    if (typeof raw.required !== 'boolean') {
+      throw new ConfigError(`${where}.required 必须是布尔值`);
+    }
+    required = raw.required;
+  }
+
+  const rejectMisplaced = (key: string): void => {
+    if (key in raw) {
+      throw new ConfigError(`${where}.${key} 与 type "${t}" 不匹配`);
+    }
+  };
+
+  switch (t) {
+    case 'object': {
+      rejectMisplaced('items');
+      const rawFields = raw.fields;
+      if (rawFields !== undefined && !isPlainObject(rawFields)) {
+        throw new ConfigError(`${where}.fields 必须是对象（字段名 -> 规则）`);
+      }
+      const additional = raw.additionalFields;
+      if (additional !== undefined && typeof additional !== 'boolean') {
+        throw new ConfigError(`${where}.additionalFields 必须是布尔值`);
+      }
+      const fields = new Map<string, FieldRule>();
+      for (const [name, sub] of Object.entries(rawFields ?? {})) {
+        if (name === '') {
+          throw new ConfigError(`${where}.fields 含空字段名`);
+        }
+        fields.set(name, parseBodyRule(sub, `${where}.fields[${JSON.stringify(name)}]`, true));
+      }
+      return { rule: { kind: 'object', fields, additional: additional ?? false }, required };
+    }
+    case 'array': {
+      rejectMisplaced('fields');
+      rejectMisplaced('additionalFields');
+      if (!('items' in raw)) {
+        throw new ConfigError(`${where}.items 缺失：数组规则必须声明元素规则`);
+      }
+      const items = parseBodyRule(raw.items, `${where}.items`, false);
+      return { rule: { kind: 'array', items: items.rule }, required };
+    }
+    default: {
+      rejectMisplaced('fields');
+      rejectMisplaced('additionalFields');
+      rejectMisplaced('items');
+      return { rule: { kind: t as PrimitiveKind }, required };
     }
   }
 }
@@ -182,7 +288,7 @@ function validateEndpoint(
     throw new ConfigError(`${where} 必须是对象`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== 'method' && key !== 'path' && key !== 'responses') {
+    if (key !== 'method' && key !== 'path' && key !== 'responses' && key !== 'requestBody') {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
@@ -191,6 +297,14 @@ function validateEndpoint(
 
   if (method !== 'GET' && method !== 'POST') {
     throw new ConfigError(`${where}.method 必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`);
+  }
+
+  let requestBody: BodyRule | undefined;
+  if ('requestBody' in raw) {
+    if (method !== 'POST') {
+      throw new ConfigError(`${where}.requestBody 仅 POST 接口可声明请求正文规则`);
+    }
+    requestBody = parseBodyRule(raw.requestBody, `${where}.requestBody`, false).rule;
   }
 
   if (typeof routePath !== 'string') {
@@ -216,7 +330,7 @@ function validateEndpoint(
     validateResponse(item, `${where}.responses[${j}]`),
   );
 
-  return { method, path: routePath, responses: cleanResponses };
+  return { method, path: routePath, responses: cleanResponses, requestBody };
 }
 
 function validateConfig(raw: unknown): EndpointSpec[] {
@@ -246,6 +360,7 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
     endpoints.set(`${spec.method} ${spec.path}`, {
       key: `${spec.method} ${spec.path}`,
       responses: spec.responses,
+      requestBody: spec.requestBody,
       cursor: 0,
     });
   }
@@ -261,6 +376,164 @@ function reserveNext(endpoint: LiveEndpoint): ResponseSpec {
     endpoint.cursor += 1;
   }
   return endpoint.responses[position];
+}
+
+// ---------------------------------------------------------------------------
+// 请求正文校验：媒体类型 -> UTF-8 JSON 解析 -> 结构比对
+// ---------------------------------------------------------------------------
+
+interface BodyProblem {
+  readonly pointer: string;
+  readonly expected: string;
+  readonly actual: string;
+}
+
+interface BodyRejection {
+  readonly error: string;
+  readonly phase: 'content-type' | 'parse' | 'structure';
+  readonly problems: readonly BodyProblem[];
+}
+
+function jsonTypeName(value: unknown): string {
+  if (value === null) {
+    return 'null';
+  }
+  if (Array.isArray(value)) {
+    return 'array';
+  }
+  return typeof value;
+}
+
+// JSON Pointer（RFC 6901）段转义：~ -> ~0，/ -> ~1
+function escapePointerSegment(segment: string): string {
+  return segment.replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+// 结构比对：父节点类型不符时只报告该节点，不再深入制造子节点错误；
+// 合法 JSON null 是“存在的值”，与字段缺失分开判断。
+function validateBodyValue(
+  rule: BodyRule,
+  value: unknown,
+  pointer: string,
+  problems: BodyProblem[],
+): void {
+  switch (rule.kind) {
+    case 'object': {
+      if (!isPlainObject(value)) {
+        problems.push({ pointer, expected: 'object', actual: jsonTypeName(value) });
+        return;
+      }
+      for (const [name, field] of rule.fields) {
+        const childPointer = `${pointer}/${escapePointerSegment(name)}`;
+        if (Object.prototype.hasOwnProperty.call(value, name)) {
+          validateBodyValue(field.rule, value[name], childPointer, problems);
+        } else if (field.required) {
+          // 缺失字段：指针指向该字段本身
+          problems.push({ pointer: childPointer, expected: field.rule.kind, actual: 'missing' });
+        }
+      }
+      if (!rule.additional) {
+        for (const key of Object.keys(value)) {
+          if (!rule.fields.has(key)) {
+            // 额外字段：指针指向其自身
+            problems.push({
+              pointer: `${pointer}/${escapePointerSegment(key)}`,
+              expected: 'undeclared field (absent)',
+              actual: jsonTypeName(value[key]),
+            });
+          }
+        }
+      }
+      return;
+    }
+    case 'array': {
+      if (!Array.isArray(value)) {
+        problems.push({ pointer, expected: 'array', actual: jsonTypeName(value) });
+        return;
+      }
+      for (let i = 0; i < value.length; i += 1) {
+        validateBodyValue(rule.items, value[i], `${pointer}/${i}`, problems);
+      }
+      return;
+    }
+    case 'string':
+      if (typeof value !== 'string') {
+        problems.push({ pointer, expected: 'string', actual: jsonTypeName(value) });
+      }
+      return;
+    case 'number':
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        problems.push({ pointer, expected: 'number', actual: jsonTypeName(value) });
+      }
+      return;
+    case 'integer':
+      if (!Number.isInteger(value)) {
+        problems.push({ pointer, expected: 'integer', actual: jsonTypeName(value) });
+      }
+      return;
+    case 'boolean':
+      if (typeof value !== 'boolean') {
+        problems.push({ pointer, expected: 'boolean', actual: jsonTypeName(value) });
+      }
+      return;
+    case 'null':
+      if (value !== null) {
+        problems.push({ pointer, expected: 'null', actual: jsonTypeName(value) });
+      }
+      return;
+  }
+}
+
+// 返回 null 表示通过；否则为可直接序列化的 400 差异报告
+function checkRequestBody(
+  req: http.IncomingMessage,
+  body: Buffer,
+  rule: BodyRule,
+): BodyRejection | null {
+  const rawContentType = req.headers['content-type'];
+  const contentType = Array.isArray(rawContentType) ? rawContentType.join(', ') : rawContentType;
+  // 忽略大小写匹配 application/json，允许携带 ; 参数
+  const mediaType =
+    typeof contentType === 'string' ? contentType.split(';', 1)[0].trim().toLowerCase() : '';
+  if (mediaType !== 'application/json') {
+    return {
+      error: 'request body rejected',
+      phase: 'content-type',
+      problems: [
+        {
+          pointer: '',
+          expected: 'Content-Type: application/json（可带参数，大小写不敏感）',
+          actual: contentType === undefined ? '(未提供 Content-Type 头)' : contentType,
+        },
+      ],
+    };
+  }
+
+  if (body.length === 0) {
+    return {
+      error: 'request body rejected',
+      phase: 'parse',
+      problems: [{ pointer: '', expected: 'UTF-8 JSON 文档', actual: '空正文' }],
+    };
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(body.toString('utf8'));
+  } catch (e) {
+    return {
+      error: 'request body rejected',
+      phase: 'parse',
+      problems: [{ pointer: '', expected: '合法 JSON', actual: describeError(e) }],
+    };
+  }
+
+  const problems: BodyProblem[] = [];
+  validateBodyValue(rule, value, '', problems);
+  if (problems.length > 0) {
+    return { error: 'request body rejected', phase: 'structure', problems };
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +660,13 @@ function sendBusinessResponse(
   const headers = versionHeaders(version);
   let contentTypeSet = false;
   for (const [name, value] of Object.entries(item.headers)) {
-    if (name.toLowerCase() === 'content-type') {
+    const lower = name.toLowerCase();
+    // 配置中允许声明 X-Contractlab-Version（任意大小写），但发送时忽略其值，
+    // 保证响应只携带一个由服务器给出的准确版本头
+    if (lower === VERSION_HEADER.toLowerCase()) {
+      continue;
+    }
+    if (lower === 'content-type') {
       contentTypeSet = true;
     }
     headers[name] = value;
@@ -414,18 +693,27 @@ function scheduleBusinessResponse(
 
 type BodyOutcome = 'received' | 'aborted' | 'too-large';
 
+interface ReceiveResult {
+  readonly outcome: BodyOutcome;
+  readonly body: Buffer;
+}
+
 // 完整接收请求体；未完整接收即断开返回 'aborted'（调用方不得推进序列）
-function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<BodyOutcome> {
+function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promise<ReceiveResult> {
   return new Promise((resolve) => {
     let settled = false;
     let size = 0;
+    const chunks: Buffer[] = [];
     const finish = (outcome: BodyOutcome): void => {
       if (!settled) {
         settled = true;
-        resolve(outcome);
+        resolve({ outcome, body: outcome === 'received' ? Buffer.concat(chunks) : Buffer.alloc(0) });
       }
     };
     req.on('data', (chunk: Buffer) => {
+      if (settled) {
+        return;
+      }
       size += chunk.byteLength;
       if (size > MAX_BODY_BYTES) {
         finish('too-large');
@@ -439,7 +727,9 @@ function receiveBody(req: http.IncomingMessage, res: http.ServerResponse): Promi
         );
         // 等 413 刷出后再断开，避免客户端收不到响应
         res.once('finish', () => req.socket.destroy());
+        return;
       }
+      chunks.push(chunk);
     });
     req.on('end', () => finish('received'));
     req.on('error', () => finish('aborted'));
@@ -456,8 +746,8 @@ async function dispatch(
     // 写已销毁套接字等错误无需让进程崩溃
   });
 
-  const outcome = await receiveBody(req, res);
-  if (outcome !== 'received') {
+  const received = await receiveBody(req, res);
+  if (received.outcome !== 'received') {
     // aborted：未完整接收，不匹配、不预留、不推进任何序列
     // too-large：已回复 413
     return;
@@ -498,7 +788,17 @@ async function dispatch(
     return;
   }
 
-  const item = reserveNext(endpoint); // 完整接收后立即预留
+  // 启用了正文规则的接口：校验失败返回 400 差异报告，
+  // 不发送场景响应、不消费响应序列；规则与序列、版本取自同一快照 state
+  if (endpoint.requestBody) {
+    const rejection = checkRequestBody(req, received.body, endpoint.requestBody);
+    if (rejection) {
+      sendJson(res, 400, rejection, state.version);
+      return;
+    }
+  }
+
+  const item = reserveNext(endpoint); // 校验通过（或无需校验）后立即预留
   scheduleBusinessResponse(res, item, state.version);
 }
 
