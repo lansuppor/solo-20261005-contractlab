@@ -15,7 +15,9 @@
 //   双方 true 时新版新增可选字段限制取值、双方 false 时新增可选字段）；
 // - 对象嵌套对象（嵌套必填收紧、嵌套字段类型收紧）、数组嵌套标量、
 //   数组嵌套对象（元素字段收紧）；
-// - object/array/标量之间的类型替换。
+// - object/array/标量之间的类型替换；
+// - 可空（nullable）：根、字段、数组元素的可空放宽/收紧、type:"null" 与可空
+//   标量的互转、双方可空时非 null 约束变化仍被检出。
 //
 // 代表值域为何能区分这些规则对：域内含整数与非整数（区分 integer/number）、
 // 字段缺失与 null（区分“必填缺失”与 null 类型）、空与非空数组（元素收紧只在
@@ -294,7 +296,99 @@ const structuredPairs: RulePair[] = [
   },
 ];
 
-const ALL_PAIRS: readonly RulePair[] = [...scalarPairs, ...structuredPairs];
+// 可空（nullable）规则对：null 接受性的放宽/收紧，以及可空不掩盖非 null 约束变化
+const nullablePairs: RulePair[] = [
+  {
+    // 新增可空是放宽：兼容
+    name: 'nullable:string->nullable-string',
+    oldRule: { type: 'string' },
+    newRule: { type: 'string', nullable: true },
+  },
+  {
+    // 去掉可空是收紧：null 成为反例
+    name: 'nullable:nullable-string->string',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'string' },
+  },
+  {
+    name: 'nullable:nullable-integer->nullable-number',
+    oldRule: { type: 'integer', nullable: true },
+    newRule: { type: 'number', nullable: true },
+  },
+  {
+    // 双方可空也不掩盖 number -> integer 的收紧
+    name: 'nullable:nullable-number->nullable-integer',
+    oldRule: { type: 'number', nullable: true },
+    newRule: { type: 'integer', nullable: true },
+  },
+  {
+    // type:null 只接受 null；可空 string 是其超集
+    name: 'nullable:null->nullable-string',
+    oldRule: { type: 'null' },
+    newRule: { type: 'string', nullable: true },
+  },
+  {
+    name: 'nullable:nullable-string->null',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'null' },
+  },
+  {
+    // 可空不掩盖非 null 类型变化
+    name: 'nullable:nullable-string->nullable-integer',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'integer', nullable: true },
+  },
+  {
+    // 嵌套字段可空收紧：{a:null} 成为反例
+    name: 'nullable-field:optional-nullable->non-nullable',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'string', nullable: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'string' } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nullable-field:required-nullable->required-nullable',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'string', nullable: true, required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'string', nullable: true, required: true } },
+      additionalProperties: false,
+    },
+  },
+  {
+    // 数组元素可空收紧：[null] 成为反例
+    name: 'nullable-array-items:nullable->non-nullable',
+    oldRule: { type: 'array', items: { type: 'string', nullable: true } },
+    newRule: { type: 'array', items: { type: 'string' } },
+  },
+  {
+    // 根对象可空收紧：null 成为反例
+    name: 'nullable-root-object:nullable->non-nullable',
+    oldRule: {
+      type: 'object',
+      nullable: true,
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+  },
+];
+
+const ALL_PAIRS: readonly RulePair[] = [...scalarPairs, ...structuredPairs, ...nullablePairs];
 
 test('规则包含关系矩阵：逐接口、整体结论与退出码', { timeout: 120_000 }, async (t) => {
   const dir = await makeTempDir(t);

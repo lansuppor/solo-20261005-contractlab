@@ -73,6 +73,9 @@ type HttpMethod = 'GET' | 'POST';
 //   { "type": "object", "fields": { "<名>": <字段规则>, ... }, "additionalProperties": false }
 //   { "type": "array", "items": <规则> }
 //   { "type": "string" | "number" | "integer" | "boolean" | "null" }
+// 任意规则节点（根、字段、数组元素）可附布尔 "nullable"：省略或 false 不变；
+// true 表示在原接受集合上额外接受 JSON null（type:"null" 仍只接受 null）。
+// null 不产生子节点差异；非 null 值继续检查全部原约束；必填字段即使可空也不能缺失。
 // 字段规则 = 任意规则 + 可选 "required": true（缺省为可缺省）；
 // object 的 fields / additionalProperties 可省略（默认无字段声明、拒绝未声明字段）；
 // array 必须声明 items。
@@ -82,11 +85,12 @@ type ScalarKind = 'string' | 'number' | 'integer' | 'boolean' | 'null';
 type BodyRule =
   | {
       readonly kind: 'object';
+      readonly nullable: boolean;
       readonly fields: ReadonlyMap<string, FieldRule>;
       readonly additionalProperties: boolean;
     }
-  | { readonly kind: 'array'; readonly items: BodyRule }
-  | { readonly kind: ScalarKind };
+  | { readonly kind: 'array'; readonly nullable: boolean; readonly items: BodyRule }
+  | { readonly kind: ScalarKind; readonly nullable: boolean };
 
 interface FieldRule {
   readonly rule: BodyRule;
@@ -240,7 +244,7 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
   }
 
   const type = raw.type;
-  const allowed = new Set(['type']);
+  const allowed = new Set(['type', 'nullable']);
   if (type === 'object') {
     allowed.add('fields');
     allowed.add('additionalProperties');
@@ -256,6 +260,13 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
+
+  // 任意规则节点可附布尔 nullable：true 在原接受集合上加入 null
+  const nullableRaw = raw.nullable;
+  if (nullableRaw !== undefined && typeof nullableRaw !== 'boolean') {
+    throw new ConfigError(`${where}.nullable 必须是布尔值，收到 ${JSON.stringify(nullableRaw)}`);
+  }
+  const nullable = nullableRaw === true;
 
   if (type === 'object') {
     const fieldsRaw = raw.fields;
@@ -273,17 +284,17 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
       throw new ConfigError(`${where}.additionalProperties 必须是布尔值`);
     }
     // 未声明字段默认拒绝
-    return { kind: 'object', fields, additionalProperties: additional === true };
+    return { kind: 'object', nullable, fields, additionalProperties: additional === true };
   }
 
   if (type === 'array') {
     if (raw.items === undefined) {
       throw new ConfigError(`${where}.items 数组规则必须声明元素规则`);
     }
-    return { kind: 'array', items: validateBodyRule(raw.items, `${where}.items`) };
+    return { kind: 'array', nullable, items: validateBodyRule(raw.items, `${where}.items`) };
   }
 
-  return { kind: type as ScalarKind };
+  return { kind: type as ScalarKind, nullable };
 }
 
 // 字段规则 = 任意规则 + 可选 "required"（仅允许出现在 object 的 fields 条目中）
@@ -586,12 +597,16 @@ function escapePointerSegment(segment: string): string {
 
 // 结构比对：父节点类型不符时只报告该节点，不再深入制造子节点错误；
 // 字段缺失（hasOwnProperty 为假）与合法的 JSON null 分开判断。
+// 可空规则接受 null：null 不产生任何（含子节点）差异；非 null 继续检查全部原约束。
 function checkRule(
   rule: BodyRule,
   value: unknown,
   pointer: string,
   problems: StructureProblem[],
 ): void {
+  if (value === null && rule.nullable) {
+    return;
+  }
   switch (rule.kind) {
     case 'string':
     case 'boolean':
@@ -843,10 +858,18 @@ function violateValue(rule: BodyRule): unknown {
 }
 
 function kindLabel(rule: BodyRule): string {
-  if (rule.kind === 'object') {
-    return rule.additionalProperties ? 'object（允许未声明字段）' : 'object（拒绝未声明字段）';
-  }
-  return rule.kind;
+  const base =
+    rule.kind === 'object'
+      ? rule.additionalProperties
+        ? 'object（允许未声明字段）'
+        : 'object（拒绝未声明字段）'
+      : rule.kind;
+  return rule.nullable ? `${base}（可空）` : base;
+}
+
+// 规则是否接受 JSON null：type:"null" 只接受 null；nullable:true 在原集合上加入 null
+function acceptsNullValue(rule: BodyRule): boolean {
+  return rule.kind === 'null' || rule.nullable;
 }
 
 // 选一个两个规则都未声明的字段名，用于构造“额外字段”反例
@@ -864,12 +887,30 @@ function freshFieldName(
 
 // 递归判定 L(oldRule) ⊆ L(newRule)；把发现的每个反例（连同完整正文样本）推入 out。
 // 不变式：value 必被 oldRule 接受、被 newRule 拒绝；pointer 用 RFC 6901 定位差异。
+//
+// 接受集合分解为 null 部分与非 null 结构部分，分别判定包含关系：
+// - null 部分：旧规则接受 null（type:"null" 或 nullable:true）而新规则不接受时，
+//   null 即反例（嵌套位置由外层包上必要父对象与其他必填字段）；
+// - 非 null 部分：type:"null" 的基底只含 null，无需再比较结构；其余按原结构递归。
+// 可空只放宽 null 一项，不能掩盖非 null 约束的任何变化。
 function collectViolations(
   oldRule: BodyRule,
   newRule: BodyRule,
   pointer: string,
   out: BodyViolation[],
 ): void {
+  if (acceptsNullValue(oldRule) && !acceptsNullValue(newRule)) {
+    out.push({
+      pointer,
+      value: null,
+      message: `新规则不接受 null：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${kindLabel(newRule)}`,
+    });
+  }
+  if (oldRule.kind === 'null') {
+    // 旧规则的非 null 部分为空，null 部分已在上面判定
+    return;
+  }
+
   if (newRule.kind !== 'object' && newRule.kind !== 'array') {
     // 标量：仅同名兼容，外加 integer 放宽为 number；其余组合两集合相交为空或有差异
     const compatible =
@@ -881,7 +922,7 @@ function collectViolations(
       out.push({
         pointer,
         value,
-        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${newRule.kind}`,
+        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${kindLabel(newRule)}`,
       });
     }
     return;
@@ -892,7 +933,7 @@ function collectViolations(
       out.push({
         pointer,
         value: sampleValue(oldRule),
-        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 array`,
+        message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${kindLabel(newRule)}`,
       });
       return;
     }
@@ -910,7 +951,7 @@ function collectViolations(
     out.push({
       pointer,
       value: sampleValue(oldRule),
-      message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 object`,
+      message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${kindLabel(newRule)}`,
     });
     return;
   }
@@ -1128,16 +1169,19 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
 //   且带 schema，否则拒绝；
 // - schema 支持 object/array/string/number/integer/boolean、递归
 //   properties/required/items、布尔 additionalProperties（缺省按 OpenAPI
-//   语义为允许，并在输出中显式写出）；title/description/example 与
-//   nullable=false 忽略，其余关键字或非法值一律拒绝；
+//   语义为允许，并在输出中显式写出）与布尔 nullable（true 在原接受集合上
+//   加入 null，输出为场景规则的 nullable:true）；title/description/example
+//   忽略，其余关键字或非法值一律拒绝；
 // - 支持本文件内 $ref（按 JSON Pointer 转义解析）：共享引用允许，目标缺失、
 //   外部引用与循环引用拒绝并给出引用链；引用节点只含 $ref；
-// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或任意深度
-//   嵌套组合（嵌套 allOf 展平为全部对象叶分支）；按所选操作最终请求正文的
-//   整体接受集合求各分支交集，结论与分支顺序、嵌套分组、本文件内引用无关；
+// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释（nullable 在组合节点上
+//   仍只允许 false 或省略），分支可引用或任意深度嵌套组合（嵌套 allOf 展平
+//   为全部对象叶分支）；按所选操作最终请求正文的整体接受集合求各分支交集，
+//   结论与分支顺序、嵌套分组、本文件内引用无关；
 //   同名字段（对象内部与数组元素）递归相交、number∩integer 取 integer、
-//   必填合并、各分支额外字段限制同时生效；区分字段禁止出现、整体空交集与
-//   非空但无法表达，后两者定位原因并拒绝，不扩展规则种类；
+//   必填合并、各分支额外字段限制同时生效；交集含 null 当且仅当全部分支可空，
+//   非 null 部分按结构求交，仅剩 null 时输出 type:"null"；区分字段禁止出现、
+//   整体空交集与非空但无法表达，后两者定位原因并拒绝，不扩展规则种类；
 // - 未被场景选中的操作与不可达定义不参与转换（其中的错误不影响结果）；
 //   全部输入与所选可达定义有效后才输出，成功退出 0，失败退出 2
 //   （stderr 指明文件与操作或定义位置，stdout 为空）。
@@ -1171,15 +1215,22 @@ type Intersection =
 
 // 转换过程中的规范化规则：与 BodyRule 同构，但 object 的必填名集合单独保存，
 // 便于 allOf 交集计算；输出时再展开为场景规则 JSON。
+// nullable 对应 OpenAPI 的 nullable:true（在原接受集合上加入 null）；
+// kind:"null" 不由 schema 直接产生，仅用于表达“结构交集为空、但全部分支可空”
+// 的交集结果（仅剩 null）。
 type NormRule =
   | {
       readonly kind: 'object';
+      readonly nullable: boolean;
       readonly props: ReadonlyMap<string, NormRule>;
       readonly required: ReadonlySet<string>;
       readonly addl: boolean;
     }
-  | { readonly kind: 'array'; readonly items: NormRule }
-  | { readonly kind: 'string' | 'number' | 'integer' | 'boolean' };
+  | { readonly kind: 'array'; readonly nullable: boolean; readonly items: NormRule }
+  | {
+      readonly kind: 'string' | 'number' | 'integer' | 'boolean' | 'null';
+      readonly nullable: boolean;
+    };
 
 type NormObject = Extract<NormRule, { kind: 'object' }>;
 
@@ -1301,8 +1352,11 @@ function dereference(
   return { target, where: `${where} -> ${ref as string}`, refChain: [...refChain, ref as string] };
 }
 
-// 解析一层或多层 $ref 并做节点级基础校验（必须是对象、nullable 仅可 false），
+// 解析一层或多层 $ref 并做节点级基础校验（必须是对象），
 // 返回落定的 schema 节点与其（含引用链的）位置。
+// nullable 的取值校验由节点消费者分别完成：带 type 的基础 schema 允许布尔
+// nullable（buildSimpleNorm），无 type 的 allOf 组合节点仅允许 false 或省略
+// （comboList）；引用节点只含 $ref（dereference）。
 function resolveSchemaNode(
   rawNode: unknown,
   ctx: ImportCtx,
@@ -1326,14 +1380,12 @@ function resolveSchemaNode(
     chain = ref.refChain;
   }
   const n = node as Record<string, unknown>;
-  // nullable 仅允许 false（等同不声明，忽略）；true 属于非法值
-  if (hasOwnKey(n, 'nullable') && n.nullable !== false) {
-    importFail(ctx, `${nodeWhere}.nullable`, `仅支持 false（或不声明），收到 ${JSON.stringify(n.nullable)}`);
-  }
   return { n, nodeWhere, chain };
 }
 
-// 组合节点键校验（仅 allOf 与注释）并取出非空 allOf 数组
+// 组合节点键校验（仅 allOf 与注释）并取出非空 allOf 数组。
+// 无 type 的 allOf 组合节点不接受 nullable:true（仅允许 false 或省略）：
+// 可空只能声明在带 type 的基础 schema 上。
 function comboList(n: Record<string, unknown>, ctx: ImportCtx, nodeWhere: string): unknown[] {
   for (const key of Object.keys(n)) {
     if (key !== 'allOf' && !OPENAPI_ANNOTATION_KEYS.has(key)) {
@@ -1343,6 +1395,13 @@ function comboList(n: Record<string, unknown>, ctx: ImportCtx, nodeWhere: string
         `组合节点仅允许 allOf 及注释（title/description/example/nullable），含未支持的关键字 "${key}"`,
       );
     }
+  }
+  if (hasOwnKey(n, 'nullable') && n.nullable !== false) {
+    importFail(
+      ctx,
+      `${nodeWhere}.nullable`,
+      `无 type 的 allOf 组合节点仅允许 false（或不声明），收到 ${JSON.stringify(n.nullable)}`,
+    );
   }
   const list = n.allOf;
   if (!Array.isArray(list) || list.length === 0) {
@@ -1394,7 +1453,8 @@ function schemaToNorm(
 
   if (hasOwnKey(n, 'allOf')) {
     const leaves = collectObjectLeaves(comboList(n, ctx, nodeWhere), ctx, nodeWhere, chain);
-    const result = intersectObjects(
+    // 走带 null 营救的交集入口：结构交集为空但全部叶分支可空时，交集恰为 {null}
+    const result = intersectRules(
       leaves.map((l) => ({ rule: l.rule, loc: l.loc })),
       nodeWhere,
     );
@@ -1438,12 +1498,17 @@ function buildSimpleNorm(
       importFail(ctx, nodeWhere, `含未支持的关键字 "${key}"`);
     }
   }
+  // 基础 schema（带 type）可声明布尔 nullable：true 在原接受集合上加入 null
+  if (hasOwnKey(n, 'nullable') && typeof n.nullable !== 'boolean') {
+    importFail(ctx, `${nodeWhere}.nullable`, `必须是布尔值，收到 ${JSON.stringify(n.nullable)}`);
+  }
+  const nullable = n.nullable === true;
 
   if (type === 'array') {
     if (!hasOwnKey(n, 'items')) {
       importFail(ctx, `${nodeWhere}.items`, '数组 schema 必须声明元素规则 items');
     }
-    return { kind: 'array', items: schemaToNorm(n.items, ctx, `${nodeWhere}.items`, chain) };
+    return { kind: 'array', nullable, items: schemaToNorm(n.items, ctx, `${nodeWhere}.items`, chain) };
   }
 
   if (type === 'object') {
@@ -1491,26 +1556,26 @@ function buildSimpleNorm(
       );
     }
     // OpenAPI 缺省允许未声明字段；输出时显式写出
-    return { kind: 'object', props, required: new Set(requiredList), addl: addlRaw !== false };
+    return { kind: 'object', nullable, props, required: new Set(requiredList), addl: addlRaw !== false };
   }
 
-  return { kind: type as 'string' | 'number' | 'integer' | 'boolean' };
+  return { kind: type as 'string' | 'number' | 'integer' | 'boolean', nullable };
 }
 
-// 标量类型交集：相同类型取自身；number ∩ integer 取 integer；其余组合为空。
-// 结果与顺序无关。
+// 标量类型交集：相同类型取自身（含 null ∩ null）；number ∩ integer 取 integer；
+// 其余组合为空。结果与顺序无关。nullable 不在此合并，由调用方按全部分支合取。
 function scalarIntersection(
   a: NormRule,
   b: NormRule,
-): { kind: 'string' | 'number' | 'integer' | 'boolean' } | null {
+): { kind: 'string' | 'number' | 'integer' | 'boolean' | 'null'; nullable: boolean } | null {
   if (a.kind === b.kind) {
-    return a as { kind: 'string' | 'number' | 'integer' | 'boolean' };
+    return a as { kind: 'string' | 'number' | 'integer' | 'boolean' | 'null'; nullable: boolean };
   }
   if (
     (a.kind === 'number' && b.kind === 'integer') ||
     (a.kind === 'integer' && b.kind === 'number')
   ) {
-    return { kind: 'integer' };
+    return { kind: 'integer', nullable: false };
   }
   return null;
 }
@@ -1636,15 +1701,24 @@ function intersectObjects(flat: readonly RuleBranch[], where: string): Intersect
     }
   }
 
-  const merged: NormObject = { kind: 'object', props, required, addl };
+  const merged: NormObject = {
+    kind: 'object',
+    // 可空取各分支的合取：任一分支不接受 null，交集就不含 null
+    nullable: objs.every((o) => o.nullable),
+    props,
+    required,
+    addl,
+  };
   if (inex !== undefined) {
     return { tag: 'inexpressible', rule: merged, reason: inex.reason, loc: inex.loc };
   }
   return { tag: 'nonempty', rule: merged };
 }
 
-// 多个规则分支（标量/数组/对象）的交集，三态返回，结论与顺序、分组无关。
-function intersectRules(flat: readonly RuleBranch[], where: string): Intersection {
+// 多个规则分支（标量/数组/对象）非 null 部分的结构交集，三态返回，
+// 结论与顺序、分组无关。可空性的合取由本函数并入结果规则；
+// “结构交集为空但全部分支可空”的 null 营救在 intersectRules 包装层完成。
+function intersectStructural(flat: readonly RuleBranch[], where: string): Intersection {
   const first = flat[0].rule;
   const isComposite = (k: NormRule['kind']): boolean => k === 'object' || k === 'array';
 
@@ -1678,7 +1752,7 @@ function intersectRules(flat: readonly RuleBranch[], where: string): Intersectio
     if (itemRes.tag === 'empty') {
       return {
         tag: 'inexpressible',
-        rule: { kind: 'array', items: itemBranches[0].rule },
+        rule: { kind: 'array', nullable: false, items: itemBranches[0].rule },
         reason: `数组元素规则交集为空（${itemRes.reason}），交集仅含空数组，现有规则种类无法表达`,
         loc: itemRes.loc,
       };
@@ -1686,12 +1760,19 @@ function intersectRules(flat: readonly RuleBranch[], where: string): Intersectio
     if (itemRes.tag === 'inexpressible') {
       return {
         tag: 'inexpressible',
-        rule: { kind: 'array', items: itemRes.rule },
+        rule: { kind: 'array', nullable: false, items: itemRes.rule },
         reason: `数组元素规则交集非空但无法表达：${itemRes.reason}`,
         loc: itemRes.loc,
       };
     }
-    return { tag: 'nonempty', rule: { kind: 'array', items: itemRes.rule } };
+    return {
+      tag: 'nonempty',
+      rule: {
+        kind: 'array',
+        nullable: flat.every((b) => b.rule.nullable),
+        items: itemRes.rule,
+      },
+    };
   }
 
   // 全为标量（若混入对象/数组，首分支为标量而其后出现复合类型，交集为空）
@@ -1718,12 +1799,32 @@ function intersectRules(flat: readonly RuleBranch[], where: string): Intersectio
     }
     acc = hit;
   }
-  return { tag: 'nonempty', rule: acc };
+  // 可空取全部分支的合取：任一分支不接受 null，交集就不含 null
+  return { tag: 'nonempty', rule: { ...acc, nullable: flat.every((b) => b.rule.nullable) } };
+}
+
+// 规范化规则是否接受 null（kind:"null" 或 nullable:true）
+function normAcceptsNull(rule: NormRule): boolean {
+  return rule.kind === 'null' || rule.nullable;
+}
+
+// 多个规则分支接受集合的交集（对外入口，三态返回，结论与顺序、分组无关）：
+// 先做非 null 部分的结构求交；结构交集为空但全部分支都接受 null 时，
+// 交集恰为 {null}，用 type:"null" 精确表达（仅剩 null）。
+// 非空但无法表达不因可空而消失：null 的加入不能让不可表达的部分变得可表达。
+function intersectRules(flat: readonly RuleBranch[], where: string): Intersection {
+  const result = intersectStructural(flat, where);
+  if (result.tag === 'empty' && flat.every((b) => normAcceptsNull(b.rule))) {
+    return { tag: 'nonempty', rule: { kind: 'null', nullable: false } };
+  }
+  return result;
 }
 
 // 规范化规则 -> 场景规则 JSON（object 显式写出 fields 与 additionalProperties；
+// nullable 为 true 时显式写出，false 省略——两者在场景规则中等价；
 // 字段名可能是 ""/"__proto__"/含斜杠波浪号，一律用无原型对象按自有字段构造）
 function normToRuleJson(rule: NormRule): Record<string, unknown> {
+  const nullableJson: Record<string, unknown> = rule.nullable ? { nullable: true } : {};
   switch (rule.kind) {
     case 'object': {
       const fields: Record<string, unknown> = Object.create(null);
@@ -1731,12 +1832,13 @@ function normToRuleJson(rule: NormRule): Record<string, unknown> {
         const subJson = normToRuleJson(sub);
         fields[name] = rule.required.has(name) ? { ...subJson, required: true } : subJson;
       }
-      return { type: 'object', fields, additionalProperties: rule.addl };
+      return { type: 'object', ...nullableJson, fields, additionalProperties: rule.addl };
     }
     case 'array':
-      return { type: 'array', items: normToRuleJson(rule.items) };
+      return { type: 'array', ...nullableJson, items: normToRuleJson(rule.items) };
     default:
-      return { type: rule.kind };
+      // 含 kind:"null"（交集仅剩 null 时的精确表达）
+      return { type: rule.kind, ...nullableJson };
   }
 }
 
