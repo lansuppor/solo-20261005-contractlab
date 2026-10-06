@@ -17,7 +17,10 @@
 //   数组嵌套对象（元素字段收紧）；
 // - object/array/标量之间的类型替换；
 // - nullable 可空约定：根/字段/数组元素的可空增减、可空与 integer/number
-//   双向变化的组合、type:null 与可空标量之间的两个方向。
+//   双向变化的组合、type:null 与可空标量之间的两个方向；
+// - 标量枚举 enum：枚举增删、顺序与重复无关、枚举与非枚举规则交叉
+//   （number 枚举全整数兼容非枚举 integer、无限域对有限枚举不兼容）、
+//   布尔全枚举等价、可空与枚举的交集（可空不越过枚举）、字段与数组元素枚举。
 //
 // 代表值域为何能区分这些规则对：域内含整数与非整数（区分 integer/number）、
 // 字段缺失与 null（区分“必填缺失”与 null 类型）、空与非空数组（元素收紧只在
@@ -401,6 +404,106 @@ const structuredPairs: RulePair[] = [
     name: 'nullable:nullable-string->null',
     oldRule: { type: 'string', nullable: true },
     newRule: { type: 'null' },
+  },
+  // 标量枚举：接受集合为类型及可空集合与枚举集合的交集；枚举值均取自
+  // 代表值域（'txt'/''/0/1/0.5/true/false/null），保证域内必有见证
+  {
+    // 新增枚举限制：旧版任意字符串，新版仅 'txt'
+    name: 'enum:add-string',
+    oldRule: { type: 'string' },
+    newRule: { type: 'string', enum: ['txt'] },
+  },
+  {
+    // 移除枚举限制：更宽松
+    name: 'enum:remove-string',
+    oldRule: { type: 'string', enum: ['txt'] },
+    newRule: { type: 'string' },
+  },
+  {
+    // 枚举候选值相同、顺序与重复不同：语义不变
+    name: 'enum:order-and-duplicates-irrelevant',
+    oldRule: { type: 'integer', enum: [1, 0] },
+    newRule: { type: 'integer', enum: [0, 1, 0] },
+  },
+  {
+    // number 枚举全为整数：兼容非枚举 integer（枚举 ⊆ integer）
+    name: 'enum:number-all-integers->integer',
+    oldRule: { type: 'number', enum: [0, 1] },
+    newRule: { type: 'integer' },
+  },
+  {
+    // number 枚举含非整数：对 integer 不兼容
+    name: 'enum:number-with-fraction->integer',
+    oldRule: { type: 'number', enum: [0.5, 1] },
+    newRule: { type: 'integer' },
+  },
+  {
+    // integer 枚举放宽为非枚举 number：枚举 ⊆ number
+    name: 'enum:integer-enum->number',
+    oldRule: { type: 'integer', enum: [0, 1] },
+    newRule: { type: 'number' },
+  },
+  {
+    // 非枚举 integer 收紧为 number 枚举：无限域对有限枚举，不兼容
+    name: 'enum:integer->number-enum',
+    oldRule: { type: 'integer' },
+    newRule: { type: 'number', enum: [0] },
+  },
+  {
+    // 布尔全枚举与无枚举等价
+    name: 'enum:boolean-full',
+    oldRule: { type: 'boolean' },
+    newRule: { type: 'boolean', enum: [true, false] },
+  },
+  {
+    // 布尔部分枚举：丢失 false
+    name: 'enum:boolean-partial',
+    oldRule: { type: 'boolean' },
+    newRule: { type: 'boolean', enum: [true] },
+  },
+  {
+    // 可空且 null 列入枚举：对可空无枚举兼容（子集）
+    name: 'enum:nullable-enum->nullable-open',
+    oldRule: { type: 'string', nullable: true, enum: ['txt', null] },
+    newRule: { type: 'string', nullable: true },
+  },
+  {
+    // 可空无枚举收紧为可空枚举：非枚举字符串丢失
+    name: 'enum:nullable-open->nullable-enum',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'string', nullable: true, enum: ['txt', null] },
+  },
+  {
+    // 可空不越过枚举：候选值中移除 null 即不再接受 null
+    name: 'enum:null-removed-from-enum',
+    oldRule: { type: 'string', nullable: true, enum: ['txt', null] },
+    newRule: { type: 'string', nullable: true, enum: ['txt'] },
+  },
+  {
+    // type:null 附枚举 [null]：接受集合不变
+    name: 'enum:null-type-with-enum',
+    oldRule: { type: 'null' },
+    newRule: { type: 'null', enum: [null] },
+  },
+  {
+    // 字段级枚举收紧
+    name: 'enum:field-tightened',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true, enum: ['txt'] } },
+      additionalProperties: false,
+    },
+  },
+  {
+    // 数组元素枚举收紧
+    name: 'enum:array-items-tightened',
+    oldRule: { type: 'array', items: { type: 'integer' } },
+    newRule: { type: 'array', items: { type: 'integer', enum: [1] } },
   },
 ];
 
