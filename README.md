@@ -1,6 +1,6 @@
 # contractlab
 
-本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的请求正文约定转换为场景文件的 `requestBody` 规则），以及一个**离线批量请求校验**命令（把保存的请求记录快照对照指定场景逐条重新检查）。
+本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的请求正文约定转换为场景文件的 `requestBody` 规则），一个**离线批量请求校验**命令（把保存的请求记录快照对照指定场景逐条重新检查），以及一个**本机请求重放与响应差异报告**命令（把快照中的请求逐条重放到本机目标端口，对照计划响应报告差异）。
 
 - 运行环境：Node.js 24（可直接运行 TypeScript，无需构建、无外部运行依赖）
 - 仅监听 `127.0.0.1`
@@ -28,6 +28,10 @@ node app.ts import -s ./api.json -c ./scenes.json > scenes.new.json
 # 离线批量请求校验：把请求记录快照对照指定场景逐条重新检查
 node app.ts verify --requests ./snapshot.json --config ./scenes.json
 node app.ts verify -r ./snapshot.json -c ./scenes.json
+
+# 本机请求重放：把快照中的请求逐条重放到 127.0.0.1 的目标端口并对照计划响应
+node app.ts replay --requests ./snapshot.json --port 8080 --timeout 5000
+node app.ts replay -r ./snapshot.json -p 8080 -t 5000
 ```
 
 不支持的命令行参数会报错并以状态码 **2** 退出。
@@ -323,9 +327,64 @@ node app.ts verify --requests ./snapshot.json --config ./scenes.json
 - `count` 与 `records` 数量不符、记录编号重复；
 - `rawHeaders` 不成对（名称、值交替）或元素非字符串；
 - `body.encoding` 不是 `"utf-8"` / `"base64"`、base64 内容非法；
+- `utf-8` 文本含**孤立代理项**（重新编码会被替换为 U+FFFD，即使替换后字节数与 `bodyBytes` 巧合吻合，原始字节也已丢失）；
 - 还原字节长度与 `bodyBytes` 不符（快照已丢字节）。
 
 记录中的版本、匹配/校验结论、计划响应、发送状态等字段不被信任、不参与判定，也不要求其存在。
+
+## 本机请求重放与响应差异报告（replay）
+
+不启动监听、不修改任何文件：读取 `GET /__contractlab/requests` 的**完整 JSON 快照文件**，把其中的请求按**输入顺序**（保留原编号 `id`）逐条重放到 `127.0.0.1` 的指定目标端口，对照记录中的计划响应报告差异，报告写往 **stdout**：
+
+```sh
+node app.ts replay --requests ./snapshot.json --port 8080 --timeout 5000
+```
+
+- `--port`：`127.0.0.1` 上的有效**非零**目标端口（1–65535）；`--timeout`：每条请求的**正整数毫秒总超时**，从开始连接覆盖完整收发，持续来数据也不延长。
+- **前一条完整结束才发下一条**；每次执行每条只尝试一次，**不跟随重定向**。已发送的请求可能已被目标处理——replay 不重载、不清空、不回滚目标状态。
+
+### 重放哪些请求、如何重建
+
+- 沿用 verify 的**完整快照校验**，另要求每条记录：方法为 **GET/POST**；`target` 是以 `/` 开头的合法 HTTP 请求目标（保留查询串与百分号编码，**不归一化**路径）；`path` 与去掉查询串的 `target` 一致；不在管理范围（`/__contractlab` 本身及 `/__contractlab/` 前缀**禁止重放**）；带 **200–599 的计划响应状态**与**文本正文**（`plannedResponse.status` / `plannedResponse.body`）。
+- 正文按记录编码**无损还原**（BOM、空白与非法 UTF-8 字节原样发送，不改 JSON）；`utf-8` 文本含孤立代理项即使替换后长度吻合也拒绝（与 verify 同一无损性校验）。
+- **参数与全部记录（含可发送的头名称和值）有效后才建立任何连接**；参数或快照失败退出 **2**，stderr 给出原因（快照错误定位文件及字段，如 `records[0].plannedResponse.status`），stdout 为空且不发任何请求。
+- 发送时**保留业务头的大小写、重复项与在线顺序**；去掉原 `Host`、`Expect`、HTTP 逐跳与分帧头（`Connection`、`Keep-Alive`、`Proxy-Authenticate`、`Proxy-Authorization`、`TE`、`Trailer`、`Transfer-Encoding`、`Upgrade`，以及 `Connection` 指名的头），按目标和实际字节数**重建 `Host` 与 `Content-Length`**。
+
+### 比较与报告
+
+- **仅比较状态码与正文原始字节**（计划正文按 UTF-8 编码）；不比较响应头，也不依据记录版本与发送状态判定——`pending` / `sent` / `interrupted` 记录同样重放，400/404/500 也按内容比较。
+- 连接失败、**总超时到期**或**响应中途断开**记**通信失败**：关闭连接后继续后续记录；部分响应不算完整。
+
+报告含总数、相同数、差异数、通信失败数与逐条结果；完整响应保留状态及无损正文（与请求记录同一约定：合法 UTF-8 给文本，否则 base64），差异指出状态或正文不同，失败给出原因：
+
+```json
+{
+  "requestsFile": "/abs/snapshot.json",
+  "target": "127.0.0.1:8080",
+  "timeout": 5000,
+  "total": 3,
+  "same": 1,
+  "different": 1,
+  "failed": 1,
+  "results": [
+    {
+      "id": 1,
+      "outcome": "same",
+      "response": { "status": 200, "body": { "encoding": "utf-8", "content": "seq-ok" } }
+    },
+    {
+      "id": 2,
+      "outcome": "different",
+      "differences": ["status", "body"],
+      "planned": { "status": 200, "body": "ok" },
+      "response": { "status": 500, "body": { "encoding": "utf-8", "content": "boom" } }
+    },
+    { "id": 3, "outcome": "failed", "reason": "连接 127.0.0.1:8080 失败：connect ECONNREFUSED ..." }
+  ]
+}
+```
+
+退出码：**空快照或全部相同 0**；**存在差异或通信失败 1**（仍报告全部记录）；参数/读取/解析/校验失败 **2**（stderr 给原因，stdout 为空且不发请求）。
 
 ## 响应序列语义
 
@@ -536,7 +595,7 @@ curl -sS -X POST http://127.0.0.1:8080/__contractlab/requests/clear
 
 ## 自动化回归测试
 
-离线兼容报告（compare）、OpenAPI 导入（import）、请求记录与离线批量请求校验（verify）均配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
+离线兼容报告（compare）、OpenAPI 导入（import）、请求记录与离线批量请求校验（verify）、本机请求重放（replay）均配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
 
 ```sh
 npm test        # 等价于 node --test "test/*.test.ts"
@@ -547,6 +606,7 @@ npm test        # 等价于 node --test "test/*.test.ts"
 - `test/request-log.test.ts` —— 进程内请求记录：真实本机服务 + 真实 HTTP/原始套接字请求，覆盖记录字段（方法、含查询串 target、保序保大小写含重复头的 rawHeaders、UTF-8/非法 UTF-8 的 base64 无损正文、接收时版本、匹配与校验结论、400 实际差异报告、消费位置与末项复用、场景/框架计划响应含准确版本头），写出生命周期（延迟期间 pending、完成 sent 且不随后续关连接回退、写出前断开 interrupted 且消费保留），清空（移除含 pending 的全部记录、不取消响应、不改配置/版本/序列、旧记录不再出现、编号不复用），reload（成功/失败均保留记录、在途请求钉住旧版本与旧计划、新请求用新版本、编号不重置），管理范围不记录、查询不推进序列，以及未收完整断开与超出上限（413）均不创建记录、不消费序列。
 - `test/compare-errors.test.ts` —— 任一输入文件读取、JSON 解析或递归配置校验失败时退出码 2、stderr 可定位、stdout 无部分报告。
 - `test/import.test.ts` —— OpenAPI 导入：基本转换（替换/移除规则、保留接口顺序与 responses、additionalProperties 缺省显式输出、特殊字段名保留）、本文件内 $ref（共享引用、指针转义、缺失目标、外部引用、循环链定位）、纯对象 allOf 交集（同名字段递归相交、number∩integer、必填并集、额外字段限制、空交集与无法表达的拒绝）、**嵌套 allOf 整体交集**（三分支原例的 flat 全排列 / 嵌套分组 / $ref 等 13 种等价写法接受集合一致；删除第三支以无法表达拒绝；必填冲突定位到嵌套叶分支；被禁止字段中的非法值/未知关键字仍拒绝；数组元素版规则一致），以及把成功输出写入临时文件用**真实本机 serve**核对允许（省略/空 box、数组空对象元素）与拒绝（box 内任意字段、数组非空字段元素）的正文、用 compare 验证可用性；此外覆盖操作选择错误（缺少操作、GET 声明正文、required/content/schema 不符）、未支持关键字与非法值，以及未选中操作与不可达定义不参与转换；失败一律退出 2、stderr 可定位（文件 + 操作/定义位置 + 冲突字段/元素）、stdout 为空。
-- `test/verify.test.ts` —— 离线批量请求校验：由真实本机服务产生 `GET /__contractlab/requests` 快照（真实 HTTP/原始套接字请求，含重复媒体类型头、非法 UTF-8、BOM、无正文规则接口、404、非 GET/POST 方法），用 verify 对照场景逐条重判，并把**相同原始请求字节回放**到加载目标配置的另一台真实服务核对在线/离线接受结论一致（场景 500 不算请求拒绝）；覆盖规则变化（同一快照对照修改规则/删除接口的新场景结论翻转）、记录无损性（BOM 保留、bodyBytes 一致）、空快照与全部接受退出 0、存在拒绝退出 1，以及全部输入失败形态（缺字段、类型错误、计数不符、重复编号、头数组不成对、path 与 target 不符、非法编码、长度不符、场景非法、文件缺失）退出 2 且 stdout 无部分报告。
+- `test/verify.test.ts` —— 离线批量请求校验：由真实本机服务产生 `GET /__contractlab/requests` 快照（真实 HTTP/原始套接字请求，含重复媒体类型头、非法 UTF-8、BOM、无正文规则接口、404、非 GET/POST 方法），用 verify 对照场景逐条重判，并把**相同原始请求字节回放**到加载目标配置的另一台真实服务核对在线/离线接受结论一致（场景 500 不算请求拒绝）；覆盖规则变化（同一快照对照修改规则/删除接口的新场景结论翻转）、记录无损性（BOM 保留、bodyBytes 一致、utf-8 孤立代理项即使替换后长度吻合也拒绝）、空快照与全部接受退出 0、存在拒绝退出 1，以及全部输入失败形态（缺字段、类型错误、计数不符、重复编号、头数组不成对、path 与 target 不符、非法编码、长度不符、场景非法、文件缺失）退出 2 且 stdout 无部分报告。
+- `test/replay.test.ts` —— 本机请求重放：由真实本机服务产生快照，重放到加载**相同配置**的另一台真实服务（全部相同、退出 0，含场景 500、400 差异报告、404、查询串），重放到**不同配置**服务（状态/正文差异逐条指出、退出 1）；通信失败（无监听端口、静默服务器总超时到期、响应中途断开且部分响应不算完整）逐条记 failed 并继续后续记录；用原始捕获服务器核对发送字节（业务头大小写/重复/顺序保留，Host/Expect/逐跳与分帧头含 Connection 指名的头被剥落，Host 与 Content-Length 按目标与实际字节数重建，请求目标保留查询串与百分号编码，含 BOM 正文逐字节无损，Content-Length / chunked / 连接关闭界定三种完整响应形式，pending / interrupted 记录同样重放）；输入失败（非 GET/POST、管理范围路径、非法目标、计划响应缺失或越界、孤立代理项、不可发送的头名称/值、非法端口/超时参数）退出 2、stderr 定位文件与字段、stdout 为空且**不发任何请求**。
 
 测试使用独立临时文件与端口 0（以实际监听地址继续请求），不依赖固定端口、外网或固定等待时间；子进程卡住会在有限时间内使测试失败，成功与失败均关闭子进程并清理临时文件。
