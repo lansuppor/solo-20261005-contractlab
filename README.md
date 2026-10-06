@@ -1,6 +1,6 @@
 # contractlab
 
-本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），以及一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版）。
+本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断）、一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），以及一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的 requestBody 约定转换为场景规则，输出可供 serve、compare 使用的场景 JSON）。
 
 - 运行环境：Node.js 24（可直接运行 TypeScript，无需构建、无外部运行依赖）
 - 仅监听 `127.0.0.1`
@@ -20,6 +20,10 @@ node app.ts serve -c ./scenes.json -p 0     # 端口 0：由操作系统分配�
 # 离线兼容报告：比较旧、新两份场景文件，不启动服务
 node app.ts compare --old ./v1.json --new ./v2.json
 node app.ts compare -o ./v1.json -n ./v2.json
+
+# OpenAPI 请求正文约定导入：结果场景 JSON 写 stdout，可重定向为新的场景文件
+node app.ts import --openapi ./api.json --config ./scenes.json > ./scenes.imported.json
+node app.ts import -o ./api.json -c ./scenes.json
 ```
 
 不支持的命令行参数会报错并以状态码 **2** 退出。
@@ -202,6 +206,35 @@ node app.ts compare --old ./v1.json --new ./v2.json
 ```
 
 退出码：兼容 **0**，不兼容 **1**，参数/读取/解析/校验失败 **2**。
+
+## OpenAPI 请求正文约定导入（import）
+
+不启动监听、不联网、不修改任何输入文件，把本地 **OpenAPI 3.0 JSON** 文档中的请求正文约定导入现有场景配置：
+
+```sh
+node app.ts import --openapi ./api.json --config ./scenes.json > ./scenes.imported.json
+```
+
+按场景每个接口的**方法 + 字面路径**选择文档操作（`paths` 须含字面相同的路径键与小写方法键），**仅替换 `requestBody`**：接口顺序与 `responses` 原样保留，结果场景 JSON 写往 **stdout**，可直接用于 `serve` 与 `compare`。
+
+操作级约定：
+
+- 文档中**缺少对应操作**（路径或方法缺失）→ 拒绝；
+- **GET 操作声明 `requestBody`** → 拒绝；
+- 操作**未声明 `requestBody`** → 移除场景中的旧规则（输出接口不带 `requestBody`）；
+- POST 声明 `requestBody` 时：必须 `required: true`，`content` **仅含 `application/json`** 且带 `schema`，否则拒绝（`description`、`example`、`examples` 为可忽略注释）。
+
+schema 子集（与场景规则一一对应，不扩展规则种类）：
+
+- 基础 schema 必须声明 `type`：`object` / `array` / `string` / `number` / `integer` / `boolean`；
+- `object`：支持递归 `properties`、`required`（必填名称须在同层 `properties` 中声明）、**布尔** `additionalProperties`；缺省按 OpenAPI 允许（`true`），输出时**始终显式写出**；
+- `array`：必须声明 `items`；
+- `title` / `description` / `example` 与 `nullable: false` 为可忽略注释；`nullable: true` 及其余未支持关键字（`format`、`enum`、`minLength`、`oneOf`……）或非法值一律拒绝；
+- 字段名中的空名、`__proto__`、斜杠与波浪号均原样保留；
+- **本文件内 `$ref`**：引用节点只含 `$ref`，按 RFC 6901 转义（`~0`、`~1`）解析；共享引用允许，目标缺失、外部引用与循环引用拒绝并在 stderr 给出引用链；
+- **纯对象 `allOf`**：组合节点仅含 `allOf` 与上述注释，分支可引用或嵌套组合，最终均为 `object`。结果是各分支接受集合的**交集**：同名字段递归相交（`number` ∩ `integer` 取 `integer`）、必填合并、各分支额外字段限制取严（仅一方声明的字段在另一方拒绝额外字段时不得出现，若该字段必填则交集为空）；空交集或现有规则无法表达时定位原因拒绝，不扩展规则种类。
+
+未被任何场景接口选中的操作与不可达的定义**不参与转换**（其中的非法内容不影响结果）。全部输入及所选可达定义有效后才输出：成功退出 **0**；参数、读取、解析、场景校验或转换失败退出 **2**，stderr 指明文件与操作或定义位置（如 `#/paths["/api/order"].post.requestBody.content["application/json"]/schema`、`#/components/schemas/Order`），stdout 为空。
 
 ## 响应序列语义
 
@@ -422,5 +455,6 @@ npm test        # 等价于 node --test "test/*.test.ts"
 - `test/scenarios.test.ts` —— 典型变更场景（双方允许额外字段但新版新增可选字段限制取值、必填字段嵌套收紧、删除带正文规则的 POST 接口、启用/移除正文规则、新增接口、仅修改响应，以及空字段名、`__proto__`、含斜杠/波浪号的字段名）：断言结论与原因的 JSON Pointer 转义和定位（不固定自然语言措辞、原因排序或反例正文取值），并把报告给出的完整请求反例**原样重放**到分别加载旧、新配置的真实本机服务——旧服务必须返回场景成功响应，新服务必须返回与变更相符的 400（正文校验）或 404（接口不存在）。
 - `test/request-log.test.ts` —— 进程内请求记录：真实本机服务 + 真实 HTTP/原始套接字请求，覆盖记录字段（方法、含查询串 target、保序保大小写含重复头的 rawHeaders、UTF-8/非法 UTF-8 的 base64 无损正文、接收时版本、匹配与校验结论、400 实际差异报告、消费位置与末项复用、场景/框架计划响应含准确版本头），写出生命周期（延迟期间 pending、完成 sent 且不随后续关连接回退、写出前断开 interrupted 且消费保留），清空（移除含 pending 的全部记录、不取消响应、不改配置/版本/序列、旧记录不再出现、编号不复用），reload（成功/失败均保留记录、在途请求钉住旧版本与旧计划、新请求用新版本、编号不重置），管理范围不记录、查询不推进序列，以及未收完整断开与超出上限（413）均不创建记录、不消费序列。
 - `test/compare-errors.test.ts` —— 任一输入文件读取、JSON 解析或递归配置校验失败时退出码 2、stderr 可定位、stdout 无部分报告。
+- `test/import.test.ts` —— OpenAPI 导入：基本转换与显式 `additionalProperties`、接口顺序与 responses 保留、未声明请求体时移除旧规则、共享/缺失/外部/循环 `$ref`（引用链定位）、纯对象 `allOf` 交集（同名字段递归相交、number∩integer、必填合并、额外字段取严、空交集拒绝）、特殊字段名（空名、`__proto__`、斜杠、波浪号）保留、未选操作与不可达定义不参与转换、各类非法输入退出 2 且 stdout 为空，以及导入结果可直接用于 serve（真实请求校验生效）与 compare。
 
 测试使用独立临时文件与端口 0（以实际监听地址继续请求），不依赖固定端口、外网或固定等待时间；子进程卡住会在有限时间内使测试失败，成功与失败均关闭子进程并清理临时文件。

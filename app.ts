@@ -19,6 +19,10 @@
 //   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）的请求一律不记录。
 // - compare 子命令：离线比较旧、新两份场景文件，判断沿用旧接口约定的客户端
 //   是否仍能调用新版；报告写 stdout，不启动监听、不修改文件。
+// - import 子命令：离线读取本地 OpenAPI 3.0 JSON 与现有场景配置，按场景接口的
+//   方法 + 字面路径选择文档操作，仅把 requestBody 约定转换为场景规则（接口顺序
+//   与 responses 原样保留），结果场景 JSON 写 stdout，可供 serve、compare 使用；
+//   不监听、不联网、不修改输入文件。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -1095,6 +1099,514 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
   process.exit(report.compatible ? 0 : 1);
 }
 
+// ---------------------------------------------------------------------------
+// OpenAPI 请求正文约定导入（import 子命令）
+// ---------------------------------------------------------------------------
+//
+// 离线读取本地 OpenAPI 3.0 JSON 与现有场景配置：按场景每个接口的
+// “方法 + 字面路径”选择文档中的操作，仅把该操作的 requestBody 约定转换为
+// 场景正文规则（endpoints[].requestBody），接口顺序与 responses 原样保留；
+// 结果场景 JSON 写 stdout，可直接用于 serve 与 compare。
+// 不监听端口、不联网、不修改输入文件；全部输入及所选可达定义有效后才输出，
+// 任何失败都以状态码 2 退出、错误写 stderr、stdout 为空。
+//
+// 支持的 schema 子集（与场景规则一一对应，不扩展规则种类）：
+// - 基础 schema 必须声明 type：object / array / string / number / integer / boolean；
+// - object：properties（递归）、required（必填名称须在同层 properties 声明）、
+//   布尔 additionalProperties（缺省按 OpenAPI 允许即 true，输出时显式写出）；
+// - array：必须声明 items 元素规则；
+// - title / description / example 与 nullable:false 为可忽略注释；
+//   其余关键字（format、enum、minLength、oneOf……）或非法值一律拒绝；
+// - 本文件内 $ref：引用节点只含 $ref，按 RFC 6901 转义解析；共享引用允许，
+//   目标缺失、外部引用与循环引用拒绝并给出引用链；
+// - 纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或嵌套组合，
+//   最终均为 object；结果是各分支接受集合的交集（同名字段递归相交、
+//   number∩integer 取 integer、必填合并、额外字段限制取严），
+//   空交集或现有规则无法表达时定位原因拒绝。
+
+interface ImportContext {
+  readonly doc: unknown;
+  // OpenAPI 文件路径（错误定位用）
+  readonly file: string;
+  // 已完成转换的引用目标（共享引用只转换一次）
+  readonly refCache: Map<string, BodyRule>;
+  // 正在解析的引用链（环路检测）
+  readonly refStack: string[];
+}
+
+function importFail(ctx: ImportContext, where: string, message: string): never {
+  throw new Error(`${ctx.file}：${where}：${message}`);
+}
+
+const OPENAPI_SCALAR_TYPES: ReadonlySet<string> = new Set([
+  'string',
+  'number',
+  'integer',
+  'boolean',
+]);
+
+// 可忽略注释：title / description / example 任意值忽略；nullable 仅允许 false
+const SCHEMA_ANNOTATION_KEYS: ReadonlySet<string> = new Set([
+  'title',
+  'description',
+  'example',
+  'nullable',
+]);
+
+function hasOwn(value: object, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function checkSchemaAnnotations(
+  ctx: ImportContext,
+  raw: Record<string, unknown>,
+  where: string,
+): void {
+  if (hasOwn(raw, 'nullable') && raw.nullable !== false) {
+    importFail(ctx, `${where}/nullable`, '仅支持 nullable: false（可省略）；true 无法用场景规则表达');
+  }
+}
+
+function checkUnknownKeys(
+  ctx: ImportContext,
+  raw: Record<string, unknown>,
+  allowed: ReadonlySet<string>,
+  where: string,
+): void {
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) {
+      importFail(ctx, where, `含未支持的关键字 "${key}"`);
+    }
+  }
+}
+
+function refChainText(ctx: ImportContext, ref: string): string {
+  return [...ctx.refStack, ref].join(' -> ');
+}
+
+// RFC 6901 段反转义：~1 -> /，~0 -> ~（调用前已校验无非法 ~ 序列）
+function unescapeRefSegment(segment: string): string {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+function resolveRefTarget(ctx: ImportContext, ref: string, where: string): unknown {
+  const segments = ref.slice(2).split('/');
+  for (const segment of segments) {
+    if (/~(?![01])/.test(segment)) {
+      importFail(ctx, where, `$ref "${ref}" 含非法 JSON Pointer 转义（仅允许 ~0 与 ~1）`);
+    }
+  }
+  let current: unknown = ctx.doc;
+  for (const segment of segments) {
+    const name = unescapeRefSegment(segment);
+    if (Array.isArray(current)) {
+      if (!/^(0|[1-9]\d*)$/.test(name) || Number(name) >= current.length) {
+        importFail(ctx, where, `$ref 目标缺失：${ref}（引用链：${refChainText(ctx, ref)}）`);
+      }
+      current = current[Number(name)];
+    } else if (isPlainObject(current) && hasOwn(current, name)) {
+      current = current[name];
+    } else {
+      importFail(ctx, where, `$ref 目标缺失：${ref}（引用链：${refChainText(ctx, ref)}）`);
+    }
+  }
+  return current;
+}
+
+function convertRef(ctx: ImportContext, refValue: unknown, where: string): BodyRule {
+  if (typeof refValue !== 'string' || !refValue.startsWith('#/')) {
+    importFail(
+      ctx,
+      where,
+      `仅支持本文件内 "#/" 开头的 $ref（外部引用不支持），收到 ${JSON.stringify(refValue)}`,
+    );
+  }
+  if (ctx.refStack.includes(refValue)) {
+    importFail(ctx, where, `循环引用：${refChainText(ctx, refValue)}`);
+  }
+  const cached = ctx.refCache.get(refValue);
+  if (cached !== undefined) {
+    return cached; // 共享引用：同一目标只转换一次
+  }
+  const target = resolveRefTarget(ctx, refValue, where);
+  ctx.refStack.push(refValue);
+  try {
+    // 目标位置即定义位置：schema 内部错误直接以引用指针定位
+    const rule = convertSchema(ctx, target, refValue);
+    ctx.refCache.set(refValue, rule);
+    return rule;
+  } finally {
+    ctx.refStack.pop();
+  }
+}
+
+function convertSchema(ctx: ImportContext, raw: unknown, where: string): BodyRule {
+  if (!isPlainObject(raw)) {
+    importFail(ctx, where, `schema 必须是对象，收到 ${jsonTypeOf(raw)}`);
+  }
+  const node: Record<string, unknown> = raw;
+  const keys = Object.keys(node);
+
+  if (keys.includes('$ref')) {
+    if (keys.length !== 1) {
+      importFail(ctx, where, '引用节点只含 $ref，不得与其他字段并存');
+    }
+    return convertRef(ctx, node.$ref, where);
+  }
+
+  if (keys.includes('allOf')) {
+    checkUnknownKeys(ctx, node, new Set(['allOf', ...SCHEMA_ANNOTATION_KEYS]), where);
+    checkSchemaAnnotations(ctx, node, where);
+    return convertAllOf(ctx, node.allOf, where);
+  }
+
+  const type = node.type;
+  const allowed = new Set<string>(['type', ...SCHEMA_ANNOTATION_KEYS]);
+  if (type === 'object') {
+    allowed.add('properties');
+    allowed.add('required');
+    allowed.add('additionalProperties');
+  } else if (type === 'array') {
+    allowed.add('items');
+  } else if (!OPENAPI_SCALAR_TYPES.has(type as string)) {
+    importFail(
+      ctx,
+      `${where}/type`,
+      '基础 schema 必须声明 type 为 "object" | "array" | "string" | "number" | "integer" | "boolean"，' +
+        `收到 ${JSON.stringify(type)}`,
+    );
+  }
+  checkUnknownKeys(ctx, node, allowed, where);
+  checkSchemaAnnotations(ctx, node, where);
+
+  if (type === 'object') {
+    return convertObjectSchema(ctx, node, where);
+  }
+  if (type === 'array') {
+    if (!hasOwn(node, 'items')) {
+      importFail(ctx, where, '数组 schema 必须声明 items 元素规则');
+    }
+    return { kind: 'array', items: convertSchema(ctx, node.items, `${where}/items`) };
+  }
+  return { kind: type as ScalarKind };
+}
+
+function convertObjectSchema(
+  ctx: ImportContext,
+  node: Record<string, unknown>,
+  where: string,
+): BodyRule {
+  const propsRaw = node.properties;
+  if (propsRaw !== undefined && !isPlainObject(propsRaw)) {
+    importFail(ctx, `${where}/properties`, '必须是对象（字段名 → schema）');
+  }
+
+  const requiredNames = new Set<string>();
+  const requiredRaw = node.required;
+  if (requiredRaw !== undefined) {
+    if (!Array.isArray(requiredRaw)) {
+      importFail(ctx, `${where}/required`, '必须是字符串数组');
+    }
+    for (let i = 0; i < requiredRaw.length; i += 1) {
+      const name = requiredRaw[i];
+      if (typeof name !== 'string') {
+        importFail(ctx, `${where}/required[${i}]`, '必填名称必须是字符串');
+      }
+      if (requiredNames.has(name)) {
+        importFail(ctx, `${where}/required[${i}]`, `必填名称 ${JSON.stringify(name)} 重复`);
+      }
+      if (!isPlainObject(propsRaw) || !hasOwn(propsRaw, name)) {
+        importFail(
+          ctx,
+          `${where}/required[${i}]`,
+          `必填名称 ${JSON.stringify(name)} 未在同层 properties 中声明`,
+        );
+      }
+      requiredNames.add(name);
+    }
+  }
+
+  const additionalRaw = node.additionalProperties;
+  if (additionalRaw !== undefined && typeof additionalRaw !== 'boolean') {
+    importFail(ctx, `${where}/additionalProperties`, '仅支持布尔值（schema 形式无法用场景规则表达）');
+  }
+
+  const fields = new Map<string, FieldRule>();
+  if (isPlainObject(propsRaw)) {
+    for (const [name, sub] of Object.entries(propsRaw)) {
+      fields.set(name, {
+        rule: convertSchema(ctx, sub, `${where}/properties/${escapePointerSegment(name)}`),
+        required: requiredNames.has(name),
+      });
+    }
+  }
+  // 缺省按 OpenAPI 允许（true），输出时显式写出
+  return { kind: 'object', fields, additionalProperties: additionalRaw !== false };
+}
+
+function convertAllOf(ctx: ImportContext, raw: unknown, where: string): BodyRule {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    importFail(ctx, `${where}/allOf`, '必须是非空数组');
+  }
+  let acc: BodyRule | undefined;
+  for (let i = 0; i < raw.length; i += 1) {
+    const branchWhere = `${where}/allOf/${i}`;
+    const rule = convertSchema(ctx, raw[i], branchWhere);
+    if (rule.kind !== 'object') {
+      importFail(ctx, branchWhere, `allOf 仅支持纯对象组合，该分支最终为 ${rule.kind}（最终均须为 object）`);
+    }
+    acc = acc === undefined ? rule : intersectObjectRules(ctx, acc, rule, where);
+  }
+  return acc as BodyRule;
+}
+
+// 两条规则的交集；空交集时定位原因拒绝，不扩展规则种类
+function intersectRules(ctx: ImportContext, a: BodyRule, b: BodyRule, where: string): BodyRule {
+  if (a.kind === 'object' && b.kind === 'object') {
+    return intersectObjectRules(ctx, a, b, where);
+  }
+  if (a.kind === 'array' && b.kind === 'array') {
+    return { kind: 'array', items: intersectRules(ctx, a.items, b.items, `${where} 的 items`) };
+  }
+  if (a.kind !== 'object' && a.kind !== 'array' && b.kind !== 'object' && b.kind !== 'array') {
+    if (a.kind === b.kind) {
+      return a;
+    }
+    // 数字与整数相交取整数
+    const pair = new Set([a.kind, b.kind]);
+    if (pair.has('number') && pair.has('integer')) {
+      return { kind: 'integer' };
+    }
+  }
+  return importFail(ctx, where, `空交集：一个分支接受 ${a.kind}，另一分支接受 ${b.kind}，无法同时满足`);
+}
+
+// 两个 object 规则的交集：
+// - 同名声明字段递归相交，必填取并集；
+// - 仅一方声明的字段：另一方允许额外字段（additionalProperties: true）时保留该方规则；
+//   否则交集中该字段不得出现——若该字段在声明方必填则交集为空（拒绝），
+//   可缺省则从结果中省略（结果 additionalProperties 已为 false，效果等价）；
+// - additionalProperties 取两方之严（逻辑与）。
+function intersectObjectRules(
+  ctx: ImportContext,
+  a: Extract<BodyRule, { kind: 'object' }>,
+  b: Extract<BodyRule, { kind: 'object' }>,
+  where: string,
+): BodyRule {
+  const fields = new Map<string, FieldRule>();
+  const names = new Set<string>([...a.fields.keys(), ...b.fields.keys()]);
+  for (const name of names) {
+    const fa = a.fields.get(name);
+    const fb = b.fields.get(name);
+    const whereField = `${where} 的字段 ${JSON.stringify(name)}`;
+    if (fa && fb) {
+      fields.set(name, {
+        rule: intersectRules(ctx, fa.rule, fb.rule, whereField),
+        required: fa.required || fb.required,
+      });
+    } else if (fa) {
+      if (b.additionalProperties) {
+        fields.set(name, fa);
+      } else if (fa.required) {
+        importFail(
+          ctx,
+          whereField,
+          '空交集：该字段在一个分支中必填，另一分支未声明且 additionalProperties 为 false',
+        );
+      }
+    } else if (fb) {
+      if (a.additionalProperties) {
+        fields.set(name, fb);
+      } else if (fb.required) {
+        importFail(
+          ctx,
+          whereField,
+          '空交集：该字段在一个分支中必填，另一分支未声明且 additionalProperties 为 false',
+        );
+      }
+    }
+  }
+  return {
+    kind: 'object',
+    fields,
+    additionalProperties: a.additionalProperties && b.additionalProperties,
+  };
+}
+
+// 内部规则 → 场景 JSON 规则。字段名可能是 "" 或 "__proto__"，
+// 一律用无原型对象按自有字段构造；additionalProperties 始终显式写出。
+function bodyRuleToJson(rule: BodyRule, required: boolean): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.create(null);
+  switch (rule.kind) {
+    case 'object': {
+      out.type = 'object';
+      const fields: Record<string, unknown> = Object.create(null);
+      for (const [name, field] of rule.fields) {
+        fields[name] = bodyRuleToJson(field.rule, field.required);
+      }
+      out.fields = fields;
+      out.additionalProperties = rule.additionalProperties;
+      break;
+    }
+    case 'array':
+      out.type = 'array';
+      out.items = bodyRuleToJson(rule.items, false);
+      break;
+    default:
+      out.type = rule.kind;
+  }
+  if (required) {
+    out.required = true;
+  }
+  return out;
+}
+
+function operationLocation(routePath: string, method: HttpMethod): string {
+  return `#/paths[${JSON.stringify(routePath)}].${method.toLowerCase()}`;
+}
+
+// 按场景接口的 方法 + 字面路径 选择文档操作；路径键须字面相同
+function selectOperation(
+  ctx: ImportContext,
+  method: HttpMethod,
+  routePath: string,
+): Record<string, unknown> {
+  const paths = (ctx.doc as Record<string, unknown>).paths as Record<string, unknown>;
+  const wherePath = `#/paths[${JSON.stringify(routePath)}]`;
+  if (!hasOwn(paths, routePath) || !isPlainObject(paths[routePath])) {
+    importFail(ctx, wherePath, `缺少与场景接口 ${method} ${routePath} 对应的路径（paths 须含字面相同的键）`);
+  }
+  const item = paths[routePath] as Record<string, unknown>;
+  const lower = method.toLowerCase();
+  if (!hasOwn(item, lower) || !isPlainObject(item[lower])) {
+    importFail(ctx, `${wherePath}.${lower}`, `缺少与场景接口 ${method} ${routePath} 对应的 ${lower} 操作`);
+  }
+  return item[lower] as Record<string, unknown>;
+}
+
+// 转换操作声明的 requestBody；返回 undefined 表示文档未声明请求体（移除场景旧规则）
+function convertOperationBody(
+  ctx: ImportContext,
+  operation: Record<string, unknown>,
+  opWhere: string,
+  method: HttpMethod,
+): BodyRule | undefined {
+  if (!hasOwn(operation, 'requestBody')) {
+    return undefined;
+  }
+  const where = `${opWhere}.requestBody`;
+  if (method === 'GET') {
+    importFail(ctx, where, 'GET 操作不得声明 requestBody');
+  }
+  const rb = operation.requestBody;
+  if (!isPlainObject(rb)) {
+    importFail(ctx, where, 'requestBody 必须是对象');
+  }
+  checkUnknownKeys(ctx, rb, new Set(['required', 'content', 'description']), where);
+  if (rb.required !== true) {
+    importFail(ctx, `${where}.required`, 'POST 导入要求 requestBody.required 必须为 true');
+  }
+  const content = rb.content;
+  if (!isPlainObject(content)) {
+    importFail(ctx, `${where}.content`, '必须是对象，且仅含 application/json');
+  }
+  const mediaKeys = Object.keys(content);
+  if (mediaKeys.length !== 1 || mediaKeys[0] !== 'application/json') {
+    importFail(
+      ctx,
+      `${where}.content`,
+      `须且仅须声明 application/json，收到 ${mediaKeys.map((k) => JSON.stringify(k)).join(', ') || '（空）'}`,
+    );
+  }
+  const media = content['application/json'];
+  const whereMedia = `${where}.content["application/json"]`;
+  if (!isPlainObject(media)) {
+    importFail(ctx, whereMedia, '必须是对象（含 schema）');
+  }
+  checkUnknownKeys(ctx, media, new Set(['schema', 'example', 'examples']), whereMedia);
+  if (!hasOwn(media, 'schema')) {
+    importFail(ctx, whereMedia, '缺少 schema');
+  }
+  return convertSchema(ctx, media.schema, `${whereMedia}/schema`);
+}
+
+function checkOpenApiDocument(raw: unknown, file: string): void {
+  if (!isPlainObject(raw)) {
+    throw new Error(`${file}：OpenAPI 文档顶层必须是 JSON 对象`);
+  }
+  // 版本字段缺失时宽容处理；显式给出时必须是 3.0.x（其余版本的 schema 语义不同）
+  if (raw.openapi !== undefined) {
+    const version = raw.openapi;
+    if (typeof version !== 'string' || !/^3\.0\.\d+/.test(version)) {
+      throw new Error(`${file}：openapi 字段必须是 "3.0.x" 版本字符串，收到 ${JSON.stringify(version)}`);
+    }
+  }
+  if (!isPlainObject(raw.paths)) {
+    throw new Error(`${file}：paths 必须是对象`);
+  }
+}
+
+async function readJsonFile(file: string, label: string): Promise<unknown> {
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (e) {
+    throw new Error(`读取${label} ${file} 失败：${describeError(e)}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${label} ${file} 不是合法 JSON：${describeError(e)}`);
+  }
+}
+
+async function runImport(openapiArg: string, configArg: string): Promise<never> {
+  const openapiFile = path.resolve(openapiArg);
+  const scenarioFile = path.resolve(configArg);
+  try {
+    const doc = await readJsonFile(openapiFile, 'OpenAPI 文件');
+    checkOpenApiDocument(doc, openapiFile);
+
+    const scenarioRaw = await readJsonFile(scenarioFile, '场景配置文件');
+    let specs: EndpointSpec[];
+    try {
+      specs = validateConfig(scenarioRaw);
+    } catch (e) {
+      throw new Error(`场景配置文件 ${scenarioFile} 校验失败：${describeError(e)}`);
+    }
+    const rawEndpoints = (scenarioRaw as { endpoints: unknown[] }).endpoints;
+
+    const ctx: ImportContext = { doc, file: openapiFile, refCache: new Map(), refStack: [] };
+
+    // 全部接口的操作选择与规则转换都成功后才输出（stdout 不会出现部分结果）
+    const outEndpoints = specs.map((spec, i) => {
+      const rawEp = rawEndpoints[i] as Record<string, unknown>;
+      const operation = selectOperation(ctx, spec.method, spec.path);
+      const rule = convertOperationBody(
+        ctx,
+        operation,
+        operationLocation(spec.path, spec.method),
+        spec.method,
+      );
+      const out: Record<string, unknown> = Object.create(null);
+      out.method = spec.method;
+      out.path = spec.path;
+      if (rule !== undefined) {
+        out.requestBody = bodyRuleToJson(rule, false);
+      }
+      // responses 原样保留（取自输入解析值，不重新构造）
+      out.responses = rawEp.responses;
+      return out;
+    });
+
+    process.stdout.write(`${JSON.stringify({ endpoints: outEndpoints }, null, 2)}\n`);
+    process.exit(0);
+  } catch (e) {
+    process.stderr.write(`${APP_NAME}: import：${describeError(e)}\n`);
+    process.exit(2);
+  }
+}
+
 
 // ---------------------------------------------------------------------------
 // HTTP 服务
@@ -1566,6 +2078,7 @@ function helpText(): string {
     '  node app.ts [--help]',
     '  node app.ts serve --config <file> --port <port>',
     '  node app.ts compare --old <file> --new <file>',
+    '  node app.ts import --openapi <file> --config <file>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
@@ -1580,6 +2093,16 @@ function helpText(): string {
     '                        不启动监听；报告以 JSON 写往 stdout：',
     '                        兼容退出 0，不兼容退出 1，',
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr）',
+    '',
+    'Options (import):',
+    '  -o, --openapi <file>  本地 OpenAPI 3.0 JSON 文件（必填）',
+    '  -c, --config <file>   现有场景配置文件（必填）',
+    '                        按场景接口的 方法 + 字面路径 选择文档操作，仅把',
+    '                        requestBody 约定转换为场景规则（接口顺序与 responses',
+    '                        原样保留），结果场景 JSON 写往 stdout，可供 serve、',
+    '                        compare 使用；不监听、不联网、不修改输入文件。',
+    '                        成功退出 0；参数/读取/解析/场景校验/转换失败',
+    '                        退出 2（错误写 stderr，stdout 为空）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
     '  GET  /__contractlab/health          健康查询，返回当前配置版本',
@@ -1711,6 +2234,59 @@ function parseCompareArgv(argv: readonly string[]): CompareOptions {
   return { oldFile, newFile };
 }
 
+interface ImportOptions {
+  openapi: string;
+  config: string;
+}
+
+function parseImportArgv(argv: readonly string[]): ImportOptions {
+  let openapi: string | undefined;
+  let config: string | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`import: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--openapi' || flag === '-o') {
+      [openapi, i] = readValue(flag, inline, i);
+    } else if (flag === '--config' || flag === '-c') {
+      [config, i] = readValue(flag, inline, i);
+    } else {
+      cliFail(`import: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (openapi === undefined) {
+    cliFail('import: 缺少必填参数 --openapi <file>');
+  }
+  if (config === undefined) {
+    cliFail('import: 缺少必填参数 --config <file>');
+  }
+  return { openapi, config };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -1736,6 +2312,15 @@ function main(): void {
     const options = parseCompareArgv(argv.slice(1));
     runCompare(options.oldFile, options.newFile).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: compare 失败：${describeError(e)}\n`);
+      process.exit(2);
+    });
+    return;
+  }
+
+  if (argv[0] === 'import') {
+    const options = parseImportArgv(argv.slice(1));
+    runImport(options.openapi, options.config).catch((e: unknown) => {
+      process.stderr.write(`${APP_NAME}: import 失败：${describeError(e)}\n`);
       process.exit(2);
     });
     return;
