@@ -1118,10 +1118,14 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
 //   nullable=false 忽略，其余关键字或非法值一律拒绝；
 // - 支持本文件内 $ref（按 JSON Pointer 转义解析）：共享引用允许，目标缺失、
 //   外部引用与循环引用拒绝并给出引用链；引用节点只含 $ref；
-// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或嵌套组合，
-//   结果取各分支接受集合的交集（同名字段递归相交、number∩integer 取
-//   integer、必填合并、各分支额外字段限制同时生效）；空交集或现有规则
-//   无法表达时定位原因并拒绝，不扩展规则种类；
+// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或嵌套组合
+//   （嵌套组合先展平）；结果取各分支接受集合的交集——所有分支一次性求交，
+//   同名字段、对象内部与数组元素的约束递归共同生效，可表达性按最终接受
+//   集合判断，不因中间两分支无法表达而误拒（同名字段递归相交、
+//   number∩integer 取 integer、必填合并、各分支额外字段限制同时生效）；
+//   分支换序、等价嵌套分组与本文件内引用不改变结论与接受集合；
+//   空交集或现有规则无法表达时定位原因（文件 + 操作/定义位置 + 冲突字段）
+//   并拒绝，不扩展规则种类；
 // - 未被场景选中的操作与不可达定义不参与转换（其中的错误不影响结果）；
 //   全部输入与所选可达定义有效后才输出，成功退出 0，失败退出 2
 //   （stderr 指明文件与操作或定义位置，stdout 为空）。
@@ -1274,17 +1278,16 @@ function dereference(
   return { target, where: `${where} -> ${ref as string}`, refChain: [...refChain, ref as string] };
 }
 
-// schema（或引用链尽头的 schema）-> 规范化规则
-function schemaToNorm(
+// 解析引用链：引用节点可以层层指向另一个引用节点，返回尽头节点及其位置/引用链
+function resolveRefs(
   rawNode: unknown,
   ctx: ImportCtx,
   where: string,
   refChain: readonly string[],
-): NormRule {
+): { node: unknown; where: string; chain: readonly string[] } {
   let node = rawNode;
   let nodeWhere = where;
   let chain = refChain;
-  // 引用节点可以层层指向另一个引用节点
   for (;;) {
     if (!isPlainObject(node)) {
       importFail(ctx, nodeWhere, 'schema 必须是对象');
@@ -1297,6 +1300,72 @@ function schemaToNorm(
     nodeWhere = ref.where;
     chain = ref.refChain;
   }
+  return { node, where: nodeWhere, chain };
+}
+
+// 校验组合节点（仅 allOf + 注释字段，nullable 仅允许 false），返回分支数组
+function allOfBranchList(n: Record<string, unknown>, ctx: ImportCtx, nodeWhere: string): unknown[] {
+  if (hasOwnKey(n, 'nullable') && n.nullable !== false) {
+    importFail(
+      ctx,
+      `${nodeWhere}.nullable`,
+      `仅支持 false（或不声明），收到 ${JSON.stringify(n.nullable)}`,
+    );
+  }
+  for (const key of Object.keys(n)) {
+    if (key !== 'allOf' && !OPENAPI_ANNOTATION_KEYS.has(key)) {
+      importFail(
+        ctx,
+        nodeWhere,
+        `组合节点仅允许 allOf 及注释（title/description/example/nullable），含未支持的关键字 "${key}"`,
+      );
+    }
+  }
+  const list = n.allOf;
+  if (!Array.isArray(list) || list.length === 0) {
+    importFail(ctx, `${nodeWhere}.allOf`, '必须是非空数组');
+  }
+  return list as unknown[];
+}
+
+// 把 allOf 分支展平为叶子对象规则列表：分支可以是 $ref（可层层引用），
+// 引用尽头或字面上的嵌套组合节点递归展平；其余分支必须最终是对象 schema。
+// 每个叶子分支仍经 schemaToNorm 完整校验——即使该字段最终在交集中被禁止出现，
+// 所选可达定义中的非法值、未知关键字与引用错误也一律拒绝。
+function flattenAllOf(
+  items: readonly unknown[],
+  ctx: ImportCtx,
+  where: string,
+  chain: readonly string[],
+  out: NormObject[],
+): void {
+  for (let i = 0; i < items.length; i += 1) {
+    const itemWhere = `${where}.allOf[${i}]`;
+    const resolved = resolveRefs(items[i], ctx, itemWhere, chain);
+    const rn = resolved.node as Record<string, unknown>;
+    if (hasOwnKey(rn, 'allOf')) {
+      flattenAllOf(allOfBranchList(rn, ctx, resolved.where), ctx, resolved.where, resolved.chain, out);
+      continue;
+    }
+    const norm = schemaToNorm(items[i], ctx, itemWhere, chain);
+    if (norm.kind !== 'object') {
+      importFail(ctx, itemWhere, `仅支持纯对象 allOf 组合，该分支最终类型为 ${norm.kind}`);
+    }
+    out.push(norm as NormObject);
+  }
+}
+
+// schema（或引用链尽头的 schema）-> 规范化规则
+function schemaToNorm(
+  rawNode: unknown,
+  ctx: ImportCtx,
+  where: string,
+  refChain: readonly string[],
+): NormRule {
+  const resolved = resolveRefs(rawNode, ctx, where, refChain);
+  const node = resolved.node;
+  const nodeWhere = resolved.where;
+  const chain = resolved.chain;
   const n = node as Record<string, unknown>;
 
   // nullable 仅允许 false（等同不声明，忽略）；true 属于非法值
@@ -1305,33 +1374,20 @@ function schemaToNorm(
   }
 
   if (hasOwnKey(n, 'allOf')) {
-    for (const key of Object.keys(n)) {
-      if (key !== 'allOf' && !OPENAPI_ANNOTATION_KEYS.has(key)) {
-        importFail(
-          ctx,
-          nodeWhere,
-          `组合节点仅允许 allOf 及注释（title/description/example/nullable），含未支持的关键字 "${key}"`,
-        );
+    const list = allOfBranchList(n, ctx, nodeWhere);
+    // 嵌套组合（含经 $ref 指向的组合节点）先展平为同一层分支列表，
+    // 再一次求交：等价的分组方式不得改变成功/拒绝结论与接受集合
+    const branches: NormObject[] = [];
+    flattenAllOf(list, ctx, nodeWhere, chain, branches);
+    try {
+      return mergeObjectNorms(branches, ctx, nodeWhere);
+    } catch (e) {
+      if (e instanceof EmptyIntersection) {
+        // 顶层空交集在此落位：指明文件、操作/定义位置与冲突字段
+        importFail(ctx, nodeWhere, `allOf 交集为空：${e.message}`);
       }
+      throw e;
     }
-    const list = n.allOf;
-    if (!Array.isArray(list) || list.length === 0) {
-      importFail(ctx, `${nodeWhere}.allOf`, '必须是非空数组');
-    }
-    const branches = (list as unknown[]).map((branch, i) =>
-      schemaToNorm(branch, ctx, `${nodeWhere}.allOf[${i}]`, chain),
-    );
-    for (let i = 0; i < branches.length; i += 1) {
-      const branch = branches[i] as NormRule;
-      if (branch.kind !== 'object') {
-        importFail(
-          ctx,
-          `${nodeWhere}.allOf[${i}]`,
-          `仅支持纯对象 allOf 组合，该分支最终类型为 ${branch.kind}`,
-        );
-      }
-    }
-    return mergeObjectNorms(branches as NormObject[], ctx, nodeWhere);
   }
 
   const type = n.type;
@@ -1415,15 +1471,21 @@ function schemaToNorm(
   return { kind: type as 'string' | 'number' | 'integer' | 'boolean' };
 }
 
-// 两个规范化规则的交集；交集为空抛 EmptyIntersection，现有规则种类无法表达
-// 时抛 ImportError。
-function intersectNorms(a: NormRule, b: NormRule, ctx: ImportCtx, where: string): NormRule {
-  if (a.kind === 'object' && b.kind === 'object') {
-    return mergeObjectNorms([a, b], ctx, where);
+// 多个规范化规则一次性求交（而非两两折叠）：可表达性只取决于最终接受集合，
+// 不允许“中间两个分支的交集无法表达”导致误拒——例如三分支中第三支
+// （additionalProperties: false）使前两支无法表达的“禁止字段出现”变得可表达。
+// 交集为空抛 EmptyIntersection，非空但现有规则种类无法表达时抛 ImportError。
+function intersectAllNorms(rules: readonly NormRule[], ctx: ImportCtx, where: string): NormRule {
+  if (rules.length === 1) {
+    return rules[0] as NormRule;
   }
-  if (a.kind === 'array' && b.kind === 'array') {
+  if (rules.every((r) => r.kind === 'object')) {
+    return mergeObjectNorms(rules as NormObject[], ctx, where);
+  }
+  if (rules.every((r) => r.kind === 'array')) {
+    const itemRules = rules.map((r) => (r as Extract<NormRule, { kind: 'array' }>).items);
     try {
-      return { kind: 'array', items: intersectNorms(a.items, b.items, ctx, `${where}.items`) };
+      return { kind: 'array', items: intersectAllNorms(itemRules, ctx, `${where}.items`) };
     } catch (e) {
       if (e instanceof EmptyIntersection) {
         throw new ImportError(
@@ -1437,23 +1499,29 @@ function intersectNorms(a: NormRule, b: NormRule, ctx: ImportCtx, where: string)
       throw e;
     }
   }
-  if (a.kind === 'object' || a.kind === 'array' || b.kind === 'object' || b.kind === 'array') {
-    throw new EmptyIntersection(`类型 ${a.kind} 与 ${b.kind} 没有共同接受的值`);
+  // 结构类型与标量/另一种结构类型混合：交集为空
+  const kinds: string[] = [];
+  for (const r of rules) {
+    if (!kinds.includes(r.kind)) {
+      kinds.push(r.kind);
+    }
   }
-  if (a.kind === b.kind) {
-    return a;
+  if (rules.some((r) => r.kind === 'object' || r.kind === 'array')) {
+    throw new EmptyIntersection(`类型 ${kinds.join(' 与 ')} 没有共同接受的值`);
   }
-  // number 与 integer 相交取 integer；其余标量组合交集为空
-  if (
-    (a.kind === 'number' && b.kind === 'integer') ||
-    (a.kind === 'integer' && b.kind === 'number')
-  ) {
+  // 纯标量：全部相同取该类型；number 与 integer 相交取 integer；其余组合交集为空
+  if (kinds.length === 1) {
+    return rules[0] as NormRule;
+  }
+  if (kinds.every((k) => k === 'number' || k === 'integer')) {
     return { kind: 'integer' };
   }
-  throw new EmptyIntersection(`类型 ${a.kind} 与 ${b.kind} 没有共同接受的值`);
+  throw new EmptyIntersection(`类型 ${kinds.join(' 与 ')} 没有共同接受的值`);
 }
 
 // 纯对象 allOf 的交集：结果接受集合 = 各分支接受集合的交集。
+// 分支列表一次整体求交（同名字段收集全部分支的声明后一次性相交），
+// 因此分支换序、等价嵌套分组与本文件内引用都不改变结论与接受集合。
 // - 字段可出现的条件：在每个分支中都已声明，或该分支允许额外字段；
 //   必填字段若被某分支禁止出现，则交集为空；
 // - 同名字段递归相交（number∩integer 取 integer）；必填取并集；
@@ -1494,38 +1562,37 @@ function mergeObjectNorms(
       }
       continue;
     }
-    let merged: NormRule | undefined;
+    // 收集所有分支对该字段的声明，一次性求交：可表达性按最终接受集合判断，
+    // 中间任意两分支无法表达（但其余分支使其可表达）不得导致误拒
+    const subs: NormRule[] = [];
     for (const branch of branches) {
       const sub = branch.props.get(name);
-      if (sub === undefined) {
-        continue;
+      if (sub !== undefined) {
+        subs.push(sub);
       }
-      if (merged === undefined) {
-        merged = sub;
-        continue;
-      }
-      try {
-        merged = intersectNorms(merged, sub, ctx, fieldWhere);
-      } catch (e) {
-        if (e instanceof EmptyIntersection) {
-          if (isRequired) {
-            throw new EmptyIntersection(
-              `必填字段 ${JSON.stringify(name)} 的各分支规则交集为空：${e.message}`,
-            );
-          }
-          if (addl) {
-            throw new ImportError(
-              importErrorMessage(
-                ctx,
-                fieldWhere,
-                `各分支规则交集为空（${e.message}），且所有分支都允许额外字段，现有规则种类无法表达“禁止该字段出现”`,
-              ),
-            );
-          }
-          // 可选字段交集为空且结果拒绝额外字段：不声明该字段即“禁止出现”
-          merged = undefined;
-          break;
+    }
+    let merged: NormRule | undefined;
+    try {
+      merged = intersectAllNorms(subs, ctx, fieldWhere);
+    } catch (e) {
+      if (e instanceof EmptyIntersection) {
+        if (isRequired) {
+          throw new EmptyIntersection(
+            `必填字段 ${JSON.stringify(name)} 的各分支规则交集为空：${e.message}`,
+          );
         }
+        if (addl) {
+          throw new ImportError(
+            importErrorMessage(
+              ctx,
+              fieldWhere,
+              `各分支规则交集为空（${e.message}），且所有分支都允许额外字段，现有规则种类无法表达“禁止该字段出现”`,
+            ),
+          );
+        }
+        // 可选字段交集为空且结果拒绝额外字段：不声明该字段即“禁止出现”
+        merged = undefined;
+      } else {
         throw e;
       }
     }
