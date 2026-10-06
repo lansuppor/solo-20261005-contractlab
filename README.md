@@ -1,6 +1,6 @@
 # contractlab
 
-本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），以及一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的请求正文约定转换为场景文件的 `requestBody` 规则）。
+本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的请求正文约定转换为场景文件的 `requestBody` 规则），以及一个**离线批量请求校验**命令（把保存的请求记录快照对照指定场景逐条重新检查）。
 
 - 运行环境：Node.js 24（可直接运行 TypeScript，无需构建、无外部运行依赖）
 - 仅监听 `127.0.0.1`
@@ -24,6 +24,10 @@ node app.ts compare -o ./v1.json -n ./v2.json
 # OpenAPI 请求正文约定导入：输出可直接用于 serve / compare 的新场景 JSON
 node app.ts import --openapi ./api.json --config ./scenes.json > scenes.new.json
 node app.ts import -s ./api.json -c ./scenes.json > scenes.new.json
+
+# 离线批量请求校验：把请求记录快照对照指定场景逐条重新检查
+node app.ts verify --requests ./snapshot.json --config ./scenes.json
+node app.ts verify -r ./snapshot.json -c ./scenes.json
 ```
 
 不支持的命令行参数会报错并以状态码 **2** 退出。
@@ -258,6 +262,71 @@ node app.ts import --openapi ./api.json --config ./scenes.json > scenes.new.json
 
 全部输入（场景配置须通过与 `serve` 完全相同的严格校验）与所选可达定义**全部有效后**才输出；成功退出 **0**。参数、读取、JSON 解析、场景校验或转换失败退出 **2**：stderr 指明文件与操作或定义位置（如 `paths["/api/order"].post.requestBody.content["application/json"].schema -> #/components/schemas/Order.properties["id"]`），stdout 为空。
 
+## 离线批量请求校验（verify）
+
+不启动监听、不发送请求、不修改任何文件：读取 `GET /__contractlab/requests` 的**完整 JSON 快照文件**与一份**场景配置**，把快照中保存的实际请求对照该场景**逐条重新检查**，报告写往 **stdout**：
+
+```sh
+node app.ts verify --requests ./snapshot.json --config ./scenes.json
+```
+
+### 判定规则
+
+- 按**输入顺序**保留原编号（`id`）逐条判定；结论仅依据记录中的原始请求（方法、`target`、原始请求头、无损正文）与所给场景**重新计算**——不信任记录里的配置版本、匹配/校验结论、计划响应与发送状态；`pending` / `sent` / `interrupted` 记录同样处理。
+- 匹配与在线一致：**方法 + `target` 去掉查询串后的字面路径**；`target` 推导出的路径与记录 `path` 不符视为**输入错误**；非 GET/POST 方法的记录一律为**未匹配**。
+- 仅对配置了 `requestBody` 的接口依次检查**媒体类型 → UTF-8 → JSON → 结构**（与在线完全相同的差异报告）；其余记录**不解析正文**。`Content-Type` 名称不分大小写，**重复头取在线顺序第一项**；媒体类型忽略大小写并允许参数。
+- 正文按记录编码**无损还原**（`utf-8` 文本或 `base64`）并核对 `bodyBytes`；启用正文规则时，base64 还原出的非法 UTF-8 属于**请求解析拒绝**（`stage: "parse"`），不是输入文件错误。
+- **命中接口且通过适用检查即为接受**：场景响应的状态码（包括 500）与请求是否被接受无关；不预留响应、不推进序列、不等待延迟。
+
+### 报告与退出码
+
+报告含总数、通过数、拒绝数与逐条结果；逐条结论区分四种：
+
+| `outcome` | 含义 |
+| --- | --- |
+| `unmatched` | 未匹配（无此“方法 + 字面路径”接口，或方法非 GET/POST） |
+| `no_body_check` | 命中接口，但该接口未配置正文规则（不解析正文） |
+| `passed` | 命中接口且通过正文校验 |
+| `rejected` | 命中接口但正文被拒绝（`rejection` 附完整的解析/结构差异报告，含全部 RFC 6901 指针、期望与实际值） |
+
+```json
+{
+  "requestsFile": "/abs/snapshot.json",
+  "configFile": "/abs/scenes.json",
+  "total": 2,
+  "accepted": 1,
+  "rejected": 1,
+  "results": [
+    { "id": 1, "outcome": "passed", "endpoint": "POST /api/order" },
+    {
+      "id": 2,
+      "outcome": "rejected",
+      "endpoint": "POST /api/order",
+      "rejection": {
+        "error": "invalid_request_body",
+        "stage": "structure",
+        "message": "请求正文与接口约定存在 1 处差异",
+        "problems": [ { "pointer": "/id", "expected": "integer", "actual": "string" } ]
+      }
+    }
+  ]
+}
+```
+
+退出码：**空快照或全部接受 0**；**存在请求拒绝（未匹配或正文拒绝）1**，此时仍报告全部记录；参数/读取/解析/校验失败 **2**。
+
+### 输入要求（失败即整份拒绝）
+
+两份输入**全部读取、解析与校验通过后**才输出任何报告。场景配置仍按与 `serve` 相同的严格校验；快照必须能**无损重建**每个请求，下列情况均属输入失败（退出 2，stderr 指明文件与位置如 `records[0].request.body`，stdout 为空，不猜补缺失字节）：
+
+- 重建所需字段缺失或类型错误（`id`、`request.method/target/path/rawHeaders/bodyBytes/body`）；
+- `count` 与 `records` 数量不符、记录编号重复；
+- `rawHeaders` 不成对（名称、值交替）或元素非字符串；
+- `body.encoding` 不是 `"utf-8"` / `"base64"`、base64 内容非法；
+- 还原字节长度与 `bodyBytes` 不符（快照已丢字节）。
+
+记录中的版本、匹配/校验结论、计划响应、发送状态等字段不被信任、不参与判定，也不要求其存在。
+
 ## 响应序列语义
 
 - 请求**被完整接收后**才按当时配置匹配接口并立即预留序列下一项；同一接口按完整接收的先后顺序取项：第 1 次请求取第 1 项，第 2 次取第 2 项，不跳项、不提前复用。
@@ -328,8 +397,8 @@ node app.ts import --openapi ./api.json --config ./scenes.json > scenes.new.json
 
 正文原始字节 `request.body`：
 
-- `{"encoding":"utf-8","content":"…"}`：正文是合法 UTF-8，`content` 为原文（空正文为 `""`）；
-- `{"encoding":"base64","content":"…"}`：正文不是合法 UTF-8，`content` 为原始字节的 base64，可无损还原。字段同时说明所用编码，记录从不以解析后的 JSON 代替原始字节。
+- `{"encoding":"utf-8","content":"…"}`：正文是合法 UTF-8，`content` 为原文（空正文为 `""`）；开头 BOM 与空白原样保留，将 `content` 重新按 UTF-8 编码即得原始字节；
+- `{"encoding":"base64","content":"…"}`：正文不是合法 UTF-8，`content` 为原始字节的 base64，可无损还原。字段同时说明所用编码，记录从不以解析后的 JSON 代替原始字节；两种编码还原出的字节数都与 `bodyBytes` 一致。
 
 `plannedResponse` 是接收完成那一刻定下、且与真正写上线的字节共用同一份数据的不可变快照（reload 不影响在途请求）：
 
@@ -467,7 +536,7 @@ curl -sS -X POST http://127.0.0.1:8080/__contractlab/requests/clear
 
 ## 自动化回归测试
 
-离线兼容报告（compare）与 OpenAPI 导入（import）配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
+离线兼容报告（compare）、OpenAPI 导入（import）、请求记录与离线批量请求校验（verify）均配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
 
 ```sh
 npm test        # 等价于 node --test "test/*.test.ts"
@@ -478,5 +547,6 @@ npm test        # 等价于 node --test "test/*.test.ts"
 - `test/request-log.test.ts` —— 进程内请求记录：真实本机服务 + 真实 HTTP/原始套接字请求，覆盖记录字段（方法、含查询串 target、保序保大小写含重复头的 rawHeaders、UTF-8/非法 UTF-8 的 base64 无损正文、接收时版本、匹配与校验结论、400 实际差异报告、消费位置与末项复用、场景/框架计划响应含准确版本头），写出生命周期（延迟期间 pending、完成 sent 且不随后续关连接回退、写出前断开 interrupted 且消费保留），清空（移除含 pending 的全部记录、不取消响应、不改配置/版本/序列、旧记录不再出现、编号不复用），reload（成功/失败均保留记录、在途请求钉住旧版本与旧计划、新请求用新版本、编号不重置），管理范围不记录、查询不推进序列，以及未收完整断开与超出上限（413）均不创建记录、不消费序列。
 - `test/compare-errors.test.ts` —— 任一输入文件读取、JSON 解析或递归配置校验失败时退出码 2、stderr 可定位、stdout 无部分报告。
 - `test/import.test.ts` —— OpenAPI 导入：基本转换（替换/移除规则、保留接口顺序与 responses、additionalProperties 缺省显式输出、特殊字段名保留）、本文件内 $ref（共享引用、指针转义、缺失目标、外部引用、循环链定位）、纯对象 allOf 交集（同名字段递归相交、number∩integer、必填并集、额外字段限制、空交集与无法表达的拒绝）、**嵌套 allOf 整体交集**（三分支原例的 flat 全排列 / 嵌套分组 / $ref 等 13 种等价写法接受集合一致；删除第三支以无法表达拒绝；必填冲突定位到嵌套叶分支；被禁止字段中的非法值/未知关键字仍拒绝；数组元素版规则一致），以及把成功输出写入临时文件用**真实本机 serve**核对允许（省略/空 box、数组空对象元素）与拒绝（box 内任意字段、数组非空字段元素）的正文、用 compare 验证可用性；此外覆盖操作选择错误（缺少操作、GET 声明正文、required/content/schema 不符）、未支持关键字与非法值，以及未选中操作与不可达定义不参与转换；失败一律退出 2、stderr 可定位（文件 + 操作/定义位置 + 冲突字段/元素）、stdout 为空。
+- `test/verify.test.ts` —— 离线批量请求校验：由真实本机服务产生 `GET /__contractlab/requests` 快照（真实 HTTP/原始套接字请求，含重复媒体类型头、非法 UTF-8、BOM、无正文规则接口、404、非 GET/POST 方法），用 verify 对照场景逐条重判，并把**相同原始请求字节回放**到加载目标配置的另一台真实服务核对在线/离线接受结论一致（场景 500 不算请求拒绝）；覆盖规则变化（同一快照对照修改规则/删除接口的新场景结论翻转）、记录无损性（BOM 保留、bodyBytes 一致）、空快照与全部接受退出 0、存在拒绝退出 1，以及全部输入失败形态（缺字段、类型错误、计数不符、重复编号、头数组不成对、path 与 target 不符、非法编码、长度不符、场景非法、文件缺失）退出 2 且 stdout 无部分报告。
 
 测试使用独立临时文件与端口 0（以实际监听地址继续请求），不依赖固定端口、外网或固定等待时间；子进程卡住会在有限时间内使测试失败，成功与失败均关闭子进程并清理临时文件。

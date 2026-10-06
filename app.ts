@@ -22,6 +22,10 @@
 // - import 子命令：读取本地 OpenAPI 3.0 JSON 与现有场景配置，按“方法 + 字面
 //   路径”选择文档操作，仅用操作 requestBody 转换出的正文规则替换各接口的
 //   requestBody（保留接口顺序与 responses），新场景 JSON 写 stdout。
+// - verify 子命令：离线批量请求校验。读取 GET /__contractlab/requests 的完整
+//   JSON 快照与一份场景配置，按输入顺序保留原编号逐条重新判定（仅依据记录中的
+//   原始请求重新计算，不信任原版本、匹配/校验结论、计划响应与发送状态）；
+//   报告写 stdout，不监听、不发送请求、不修改文件。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -528,9 +532,11 @@ class RequestLog {
 
 // 原始正文字节的无损文本表示：先尝试严格 UTF-8；失败则用 base64 承载任意字节。
 // 记录的是原始字节而非解析后的 JSON，避免任何信息损失。
+// ignoreBOM：开头 BOM（EF BB BF）必须保留在文本中（默认行为会将其丢弃），
+// 否则文本重新编码回不去原始字节，快照就不再无损。
 function encodeBodyLosslessly(body: Buffer): { encoding: 'utf-8' | 'base64'; content: string } {
   try {
-    const text = new TextDecoder('utf-8', { fatal: true }).decode(body);
+    const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(body);
     return { encoding: 'utf-8', content: text };
   } catch {
     return { encoding: 'base64', content: body.toString('base64') };
@@ -648,13 +654,16 @@ function checkRule(
   }
 }
 
-// 返回 null 表示校验通过；否则为可直接序列化的 400 差异报告
-function validateRequestBody(
-  req: http.IncomingMessage,
+// 返回 null 表示校验通过；否则为可直接序列化的 400 差异报告。
+// contentType 为在线顺序第一项 Content-Type 头值（在线：Node 对重复
+// content-type 只保留首项；离线 verify：取 rawHeaders 中首个同名头）。
+// 正文解码与 JSON 解析不重写原文：BOM 与空白按 UTF-8 解码的默认规则处理，
+// 在线与离线对同一组字节给出同一结论。
+function validateBodyWithContentType(
+  contentType: string | undefined,
   body: Buffer,
   rule: BodyRule,
 ): BodyReport | null {
-  const contentType = req.headers['content-type'];
   const mediaType =
     typeof contentType === 'string' ? contentType.split(';', 1)[0].trim().toLowerCase() : '';
   if (mediaType !== 'application/json') {
@@ -1890,6 +1899,305 @@ async function runImport(openapiArg: string, configArg: string): Promise<never> 
 }
 
 // ---------------------------------------------------------------------------
+// 离线批量请求校验（verify 子命令）
+// ---------------------------------------------------------------------------
+//
+// 读取 GET /__contractlab/requests 的完整 JSON 快照与一份场景配置，按输入顺序
+// 保留原编号逐条重新判定：仅依据记录中的原始请求（方法、target、原始请求头、
+// 无损正文）与所给场景重新计算，不信任记录里的配置版本、匹配/校验结论、计划
+// 响应与发送状态；待发送、已发送、中断记录同样处理。不监听端口、不发送请求、
+// 不修改文件，也不预留响应、不推进序列、不等待延迟。
+//
+// 判定规则与在线一致：方法 + target 去掉查询串后的字面路径匹配（非 GET/POST
+// 一律未匹配）；仅对配置了 requestBody 的接口依次检查媒体类型、UTF-8、JSON
+// 与结构，其余记录不解析正文。Content-Type 名称不分大小写，重复头取在线顺序
+// 第一项；媒体类型忽略大小写并允许参数。命中接口且通过适用检查即为接受
+// （场景响应的状态码——包括 500——与请求是否被接受无关）。
+//
+// 快照必须能无损重建每个请求：字段缺失或类型错误、count 与记录数不符、编号
+// 重复、头数组不成对、target 与 path 不符、未知编码、base64 非法或还原长度与
+// bodyBytes 不符，都属于输入失败（整份拒绝，不猜补缺失字节）。两份输入全部
+// 读取、解析、校验通过后才输出报告。
+
+class SnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SnapshotError';
+  }
+}
+
+function snapshotFail(where: string, message: string): never {
+  throw new SnapshotError(where === '' ? message : `${where} ${message}`);
+}
+
+// 从快照无损重建出来、供重新判定的一条请求
+interface SnapshotRequest {
+  readonly id: number;
+  readonly method: string;
+  // target 去掉查询串后的字面路径（已核对与记录 path 一致）
+  readonly path: string;
+  // 在线顺序第一项 Content-Type 头值（名称不分大小写）；没有则为 undefined
+  readonly contentType: string | undefined;
+  readonly body: Buffer;
+}
+
+// 严格 base64：完整四字符组 + 可选末尾填充；空串合法（还原为 0 字节）
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+function parseSnapshotRecord(raw: unknown, index: number, seen: Set<number>): SnapshotRequest {
+  const where = `records[${index}]`;
+  if (!isPlainObject(raw)) {
+    snapshotFail(where, '必须是对象');
+  }
+  const { id, request } = raw;
+  if (!Number.isInteger(id) || (id as number) < 1) {
+    snapshotFail(`${where}.id`, `必须是正整数，收到 ${JSON.stringify(id)}`);
+  }
+  if (seen.has(id as number)) {
+    snapshotFail(`${where}.id`, `与其他记录重复：${id as number}`);
+  }
+  seen.add(id as number);
+
+  const reqWhere = `${where}.request`;
+  if (!isPlainObject(request)) {
+    snapshotFail(reqWhere, '必须是对象');
+  }
+  const { method, target, path: recordPath, rawHeaders, bodyBytes, body } = request;
+  if (typeof method !== 'string') {
+    snapshotFail(`${reqWhere}.method`, '必须是字符串');
+  }
+  if (typeof target !== 'string') {
+    snapshotFail(`${reqWhere}.target`, '必须是字符串');
+  }
+  if (typeof recordPath !== 'string') {
+    snapshotFail(`${reqWhere}.path`, '必须是字符串');
+  }
+  // 匹配所用路径由 target 去掉查询串重新推导；与记录 path 不符说明快照不可靠
+  const derived = (target as string).split('?')[0];
+  if (derived !== recordPath) {
+    snapshotFail(
+      `${reqWhere}.path`,
+      `与 target 去掉查询串后的路径不符：path=${JSON.stringify(recordPath)}，target=${JSON.stringify(target)}`,
+    );
+  }
+  if (!Array.isArray(rawHeaders)) {
+    snapshotFail(`${reqWhere}.rawHeaders`, '必须是按在线顺序成对排列的字符串数组');
+  }
+  if (rawHeaders.length % 2 !== 0) {
+    snapshotFail(
+      `${reqWhere}.rawHeaders`,
+      `必须成对（名称、值交替），当前长度为 ${rawHeaders.length}`,
+    );
+  }
+  for (let j = 0; j < rawHeaders.length; j += 1) {
+    if (typeof rawHeaders[j] !== 'string') {
+      snapshotFail(`${reqWhere}.rawHeaders[${j}]`, '必须是字符串');
+    }
+  }
+  // 重复头取在线顺序第一项（与 Node 在线解析 content-type 的行为一致）
+  let contentType: string | undefined;
+  for (let j = 0; j + 1 < rawHeaders.length; j += 2) {
+    if ((rawHeaders[j] as string).toLowerCase() === 'content-type') {
+      contentType = rawHeaders[j + 1] as string;
+      break;
+    }
+  }
+
+  if (!Number.isInteger(bodyBytes) || (bodyBytes as number) < 0) {
+    snapshotFail(`${reqWhere}.bodyBytes`, `必须是非负整数，收到 ${JSON.stringify(bodyBytes)}`);
+  }
+
+  const bodyWhere = `${reqWhere}.body`;
+  if (!isPlainObject(body)) {
+    snapshotFail(bodyWhere, '必须是对象（含 encoding 与 content）');
+  }
+  const { encoding, content } = body;
+  if (encoding !== 'utf-8' && encoding !== 'base64') {
+    snapshotFail(
+      `${bodyWhere}.encoding`,
+      `必须是 "utf-8" 或 "base64"，收到 ${JSON.stringify(encoding)}`,
+    );
+  }
+  if (typeof content !== 'string') {
+    snapshotFail(`${bodyWhere}.content`, '必须是字符串');
+  }
+  let bytes: Buffer;
+  if (encoding === 'utf-8') {
+    bytes = Buffer.from(content as string, 'utf8');
+  } else {
+    if (!BASE64_RE.test(content as string)) {
+      snapshotFail(`${bodyWhere}.content`, '不是合法的 base64 编码');
+    }
+    bytes = Buffer.from(content as string, 'base64');
+  }
+  if (bytes.byteLength !== (bodyBytes as number)) {
+    snapshotFail(
+      bodyWhere,
+      `按 ${encoding as string} 还原为 ${bytes.byteLength} 字节，与 bodyBytes=${bodyBytes as number} 不符：快照已丢失字节，无法无损重建`,
+    );
+  }
+
+  return {
+    id: id as number,
+    method: method as string,
+    path: recordPath as string,
+    contentType,
+    body: bytes,
+  };
+}
+
+// 仅校验“重建请求所需”的字段；记录中的版本、匹配/校验结论、计划响应、
+// 发送状态等字段不被信任，也不参与判定，故不要求其存在。
+function parseSnapshot(raw: unknown): SnapshotRequest[] {
+  if (!isPlainObject(raw)) {
+    snapshotFail('', '快照顶层必须是 JSON 对象（含 count 与 records）');
+  }
+  const { count, records } = raw;
+  if (!Array.isArray(records)) {
+    snapshotFail('records', '必须是数组');
+  }
+  if (!Number.isInteger(count) || (count as number) < 0) {
+    snapshotFail('count', `必须是非负整数，收到 ${JSON.stringify(count)}`);
+  }
+  if ((count as number) !== records.length) {
+    snapshotFail('count', `与 records 数量不符：count=${count as number}，实际 ${records.length} 条`);
+  }
+  const seen = new Set<number>();
+  return records.map((rec, i) => parseSnapshotRecord(rec, i, seen));
+}
+
+// 读取 -> 解析 -> 校验并重建；任何一步失败都抛出含文件路径与可定位原因的错误
+async function loadSnapshotFromFile(snapshotPath: string): Promise<SnapshotRequest[]> {
+  let text: string;
+  try {
+    text = await readFile(snapshotPath, 'utf8');
+  } catch (e) {
+    throw new Error(`读取请求记录快照文件 ${snapshotPath} 失败：${describeError(e)}`);
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`请求记录快照文件 ${snapshotPath} 不是合法 JSON：${describeError(e)}`);
+  }
+
+  try {
+    return parseSnapshot(raw);
+  } catch (e) {
+    throw new Error(`请求记录快照文件 ${snapshotPath} 校验失败：${describeError(e)}`);
+  }
+}
+
+// 逐条判定结论：
+//   unmatched      —— 未匹配（无此“方法 + 字面路径”接口，或方法非 GET/POST）
+//   no_body_check  —— 命中接口，但该接口未配置正文规则（不解析正文）
+//   passed         —— 命中接口且通过正文校验
+//   rejected       —— 命中接口但正文被拒绝（附解析/结构差异报告）
+type VerifyOutcome = 'unmatched' | 'no_body_check' | 'passed' | 'rejected';
+
+interface VerifyResultEntry {
+  readonly id: number;
+  readonly outcome: VerifyOutcome;
+  readonly endpoint: string | null;
+  readonly rejection?: BodyReport;
+}
+
+interface VerifyReport {
+  readonly requestsFile: string;
+  readonly configFile: string;
+  readonly total: number;
+  readonly accepted: number;
+  readonly rejected: number;
+  readonly results: readonly VerifyResultEntry[];
+}
+
+function verifyRequests(
+  requests: readonly SnapshotRequest[],
+  specs: readonly EndpointSpec[],
+  requestsFile: string,
+  configFile: string,
+): VerifyReport {
+  const byKey = new Map<string, EndpointSpec>();
+  for (const spec of specs) {
+    byKey.set(`${spec.method} ${spec.path}`, spec);
+  }
+  const results = requests.map((req): VerifyResultEntry => {
+    const endpoint =
+      req.method === 'GET' || req.method === 'POST'
+        ? byKey.get(`${req.method} ${req.path}`)
+        : undefined;
+    if (!endpoint) {
+      return { id: req.id, outcome: 'unmatched', endpoint: null };
+    }
+    const key = `${endpoint.method} ${endpoint.path}`;
+    if (endpoint.bodyRule) {
+      const rejection = validateBodyWithContentType(req.contentType, req.body, endpoint.bodyRule);
+      if (rejection) {
+        return { id: req.id, outcome: 'rejected', endpoint: key, rejection };
+      }
+      return { id: req.id, outcome: 'passed', endpoint: key };
+    }
+    return { id: req.id, outcome: 'no_body_check', endpoint: key };
+  });
+  const accepted = results.filter(
+    (r) => r.outcome === 'passed' || r.outcome === 'no_body_check',
+  ).length;
+  return {
+    requestsFile,
+    configFile,
+    total: results.length,
+    accepted,
+    rejected: results.length - accepted,
+    results,
+  };
+}
+
+async function runVerify(requestsArg: string, configArg: string): Promise<never> {
+  const requestsFile = path.resolve(requestsArg);
+  const configFile = path.resolve(configArg);
+
+  const attemptSnapshot = async (): Promise<{ requests?: SnapshotRequest[]; error?: string }> => {
+    try {
+      return { requests: await loadSnapshotFromFile(requestsFile) };
+    } catch (e) {
+      return { error: describeError(e) };
+    }
+  };
+  const attemptSpecs = async (): Promise<{ specs?: EndpointSpec[]; error?: string }> => {
+    try {
+      return { specs: await loadSpecsFromFile(configFile) };
+    } catch (e) {
+      return { error: describeError(e) };
+    }
+  };
+
+  // 两份输入都完整经历 读取 -> 解析 -> 严格校验；任一失败则不输出任何报告
+  const [snapResult, specResult] = await Promise.all([attemptSnapshot(), attemptSpecs()]);
+  let failed = false;
+  if (snapResult.error !== undefined) {
+    process.stderr.write(`${APP_NAME}: verify 请求快照：${snapResult.error}\n`);
+    failed = true;
+  }
+  if (specResult.error !== undefined) {
+    process.stderr.write(`${APP_NAME}: verify 场景配置：${specResult.error}\n`);
+    failed = true;
+  }
+  if (failed) {
+    process.exit(2);
+  }
+
+  const report = verifyRequests(
+    snapResult.requests as SnapshotRequest[],
+    specResult.specs as EndpointSpec[],
+    requestsFile,
+    configFile,
+  );
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  process.exit(report.rejected === 0 ? 0 : 1);
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 服务
 // ---------------------------------------------------------------------------
 
@@ -2192,7 +2500,11 @@ async function dispatch(
   // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
   // 规则、序列与版本均取自上面同一快照 state。
   if (endpoint.bodyRule) {
-    const report = validateRequestBody(req, body, endpoint.bodyRule);
+    const report = validateBodyWithContentType(
+      req.headers['content-type'],
+      body,
+      endpoint.bodyRule,
+    );
     if (report) {
       record.bodyValidationPassed = false;
       record.bodyRejection = report;
@@ -2360,6 +2672,7 @@ function helpText(): string {
     '  node app.ts serve --config <file> --port <port>',
     '  node app.ts compare --old <file> --new <file>',
     '  node app.ts import --openapi <file> --config <file>',
+    '  node app.ts verify --requests <file> --config <file>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
@@ -2384,6 +2697,15 @@ function helpText(): string {
     '                        新场景 JSON 写往 stdout，可直接用于 serve/compare；',
     '                        成功退出 0，参数/读取/解析/场景校验/转换失败',
     '                        退出 2（错误写 stderr，stdout 为空）',
+    '',
+    'Options (verify):',
+    '  -r, --requests <file> GET /__contractlab/requests 的完整 JSON 快照文件（必填）',
+    '  -c, --config <file>   场景配置文件（必填）',
+    '                        离线按所给场景逐条重新校验快照中的请求：',
+    '                        不监听、不发送请求、不修改文件；',
+    '                        报告以 JSON 写往 stdout：空快照或全部接受退出 0，',
+    '                        存在请求拒绝退出 1，',
+    '                        参数/读取/解析/校验失败退出 2（错误写 stderr，stdout 为空）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
     '  GET  /__contractlab/health          健康查询，返回当前配置版本',
@@ -2568,6 +2890,59 @@ function parseImportArgv(argv: readonly string[]): ImportOptions {
   return { openapi, config };
 }
 
+interface VerifyOptions {
+  requests: string;
+  config: string;
+}
+
+function parseVerifyArgv(argv: readonly string[]): VerifyOptions {
+  let requests: string | undefined;
+  let config: string | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`verify: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--requests' || flag === '-r') {
+      [requests, i] = readValue(flag, inline, i);
+    } else if (flag === '--config' || flag === '-c') {
+      [config, i] = readValue(flag, inline, i);
+    } else {
+      cliFail(`verify: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (requests === undefined) {
+    cliFail('verify: 缺少必填参数 --requests <file>');
+  }
+  if (config === undefined) {
+    cliFail('verify: 缺少必填参数 --config <file>');
+  }
+  return { requests, config };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -2602,6 +2977,15 @@ function main(): void {
     const options = parseImportArgv(argv.slice(1));
     runImport(options.openapi, options.config).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: import 失败：${describeError(e)}\n`);
+      process.exit(2);
+    });
+    return;
+  }
+
+  if (argv[0] === 'verify') {
+    const options = parseVerifyArgv(argv.slice(1));
+    runVerify(options.requests, options.config).catch((e: unknown) => {
+      process.stderr.write(`${APP_NAME}: verify 失败：${describeError(e)}\n`);
       process.exit(2);
     });
     return;
