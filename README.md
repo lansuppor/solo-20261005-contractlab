@@ -1,6 +1,6 @@
 # contractlab
 
-本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），以及一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版）。
+本地 API 联调与契约工具。当前提供一个**可热更新的本地接口场景服务**（在本机启动 HTTP 服务，让客户端在同一接口上连续获得预设响应；修改场景文件后通过管理入口重新加载，重载期间服务不中断），一个**离线兼容报告**命令（比较旧、新两份场景文件，判断沿用旧接口约定的客户端是否仍能调用新版），以及一个 **OpenAPI 请求正文约定导入**命令（把本地 OpenAPI 3.0 文档中的请求正文约定转换为场景文件的 `requestBody` 规则）。
 
 - 运行环境：Node.js 24（可直接运行 TypeScript，无需构建、无外部运行依赖）
 - 仅监听 `127.0.0.1`
@@ -20,6 +20,10 @@ node app.ts serve -c ./scenes.json -p 0     # 端口 0：由操作系统分配�
 # 离线兼容报告：比较旧、新两份场景文件，不启动服务
 node app.ts compare --old ./v1.json --new ./v2.json
 node app.ts compare -o ./v1.json -n ./v2.json
+
+# OpenAPI 请求正文约定导入：输出可直接用于 serve / compare 的新场景 JSON
+node app.ts import --openapi ./api.json --config ./scenes.json > scenes.new.json
+node app.ts import -s ./api.json -c ./scenes.json > scenes.new.json
 ```
 
 不支持的命令行参数会报错并以状态码 **2** 退出。
@@ -202,6 +206,42 @@ node app.ts compare --old ./v1.json --new ./v2.json
 ```
 
 退出码：兼容 **0**，不兼容 **1**，参数/读取/解析/校验失败 **2**。
+
+## OpenAPI 请求正文约定导入（import）
+
+不启动监听、不联网、不修改任何输入文件：读取本地 **OpenAPI 3.0 JSON** 与**现有场景配置**，按“方法 + 字面路径”为每个场景接口选择文档操作，仅用操作声明的请求正文约定**替换**接口的 `requestBody`（保留接口顺序与 `responses` 原文），把可直接用于 `serve` / `compare` 的新场景 JSON 写往 **stdout**：
+
+```sh
+node app.ts import --openapi ./api.json --config ./scenes.json > scenes.new.json
+```
+
+### 操作选择与替换规则
+
+- 场景中的**每个**接口都必须在文档 `paths` 中找到**同字面路径、同方法**的操作，否则整份拒绝；未被场景选中的操作与不可达的定义不参与转换（其中的错误不影响结果）。
+- **GET** 操作声明 `requestBody` → 拒绝；**POST** 操作未声明 `requestBody` → **移除**该接口的旧规则。
+- **POST** 操作声明 `requestBody` 时：`required` 必须为 `true`；`content` 仅允许且必须包含 `application/json` 一种媒体类型，且带 `schema`；否则拒绝。`requestBody` 本身也可以是本文件内 `$ref`。
+
+### schema 转换规则
+
+- 基础 schema 必须声明 `type`，仅支持 `object` / `array` / `string` / `number` / `integer` / `boolean`；递归支持 `properties`、`required`、`items` 与**布尔** `additionalProperties`。
+- `required` 中的名称必须在**同层** `properties` 中声明；数组必须声明 `items`。
+- `additionalProperties` 缺省按 OpenAPI 语义为**允许**，并在输出规则中**显式写出**（`"additionalProperties": true`）。
+- `title` / `description` / `example` 与 `nullable: false` 可忽略；`nullable: true` 及其余未支持关键字、非法值一律拒绝。
+- 字段名中的空名、`__proto__`、斜杠与波浪号原样保留。
+- `$ref` 仅支持**本文件内**引用（`#` 开头的 JSON Pointer，按 `~0`/`~1` 转义解析）：共享引用允许；目标缺失、外部引用、循环引用拒绝并定位引用链；引用节点只含 `$ref` 一个字段。
+
+### 纯对象 allOf
+
+组合节点仅允许 `allOf` 及上述注释字段；分支可以是 `$ref` 或嵌套组合，最终都必须组合为对象。转换结果是各分支**接受集合的交集**，而非简单字段合并：
+
+- 同名字段**递归相交**（`number` ∩ `integer` 取 `integer`）；必填取**并集**；
+- 字段可出现的条件是：在**每个**分支中都已声明，或该分支允许额外字段——被某分支（`additionalProperties: false` 且未声明）禁止出现的字段不会留在结果中；
+- 结果的 `additionalProperties` 为各分支的合取（任一分支拒绝则拒绝）；
+- **空交集**（如必填字段被另一分支禁止出现、同名字段类型相交为空）或**现有规则种类无法表达**（如可选字段交集为空但所有分支都允许额外字段、数组元素交集为空）时，定位原因并拒绝，不扩展规则种类。
+
+### 输出与退出码
+
+全部输入（场景配置须通过与 `serve` 完全相同的严格校验）与所选可达定义**全部有效后**才输出；成功退出 **0**。参数、读取、JSON 解析、场景校验或转换失败退出 **2**：stderr 指明文件与操作或定义位置（如 `paths["/api/order"].post.requestBody.content["application/json"].schema -> #/components/schemas/Order.properties["id"]`），stdout 为空。
 
 ## 响应序列语义
 
@@ -412,7 +452,7 @@ curl -sS -X POST http://127.0.0.1:8080/__contractlab/requests/clear
 
 ## 自动化回归测试
 
-离线兼容报告（compare）配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
+离线兼容报告（compare）与 OpenAPI 导入（import）配有自动化回归测试，使用 Node.js 24 内置测试运行器，无外部依赖：
 
 ```sh
 npm test        # 等价于 node --test "test/*.test.ts"
@@ -422,5 +462,6 @@ npm test        # 等价于 node --test "test/*.test.ts"
 - `test/scenarios.test.ts` —— 典型变更场景（双方允许额外字段但新版新增可选字段限制取值、必填字段嵌套收紧、删除带正文规则的 POST 接口、启用/移除正文规则、新增接口、仅修改响应，以及空字段名、`__proto__`、含斜杠/波浪号的字段名）：断言结论与原因的 JSON Pointer 转义和定位（不固定自然语言措辞、原因排序或反例正文取值），并把报告给出的完整请求反例**原样重放**到分别加载旧、新配置的真实本机服务——旧服务必须返回场景成功响应，新服务必须返回与变更相符的 400（正文校验）或 404（接口不存在）。
 - `test/request-log.test.ts` —— 进程内请求记录：真实本机服务 + 真实 HTTP/原始套接字请求，覆盖记录字段（方法、含查询串 target、保序保大小写含重复头的 rawHeaders、UTF-8/非法 UTF-8 的 base64 无损正文、接收时版本、匹配与校验结论、400 实际差异报告、消费位置与末项复用、场景/框架计划响应含准确版本头），写出生命周期（延迟期间 pending、完成 sent 且不随后续关连接回退、写出前断开 interrupted 且消费保留），清空（移除含 pending 的全部记录、不取消响应、不改配置/版本/序列、旧记录不再出现、编号不复用），reload（成功/失败均保留记录、在途请求钉住旧版本与旧计划、新请求用新版本、编号不重置），管理范围不记录、查询不推进序列，以及未收完整断开与超出上限（413）均不创建记录、不消费序列。
 - `test/compare-errors.test.ts` —— 任一输入文件读取、JSON 解析或递归配置校验失败时退出码 2、stderr 可定位、stdout 无部分报告。
+- `test/import.test.ts` —— OpenAPI 导入：基本转换（替换/移除规则、保留接口顺序与 responses、additionalProperties 缺省显式输出、特殊字段名保留）、本文件内 $ref（共享引用、指针转义、缺失目标、外部引用、循环链定位）、纯对象 allOf 交集（同名字段递归相交、number∩integer、必填并集、额外字段限制、空交集与无法表达的拒绝）、操作选择错误（缺少操作、GET 声明正文、required/content/schema 不符）、未支持关键字与非法值，以及未选中操作与不可达定义不参与转换；成功输出会原样写入临时文件并用真实 serve 启动与 compare 运行验证可用性，失败一律退出 2、stderr 可定位、stdout 为空。
 
 测试使用独立临时文件与端口 0（以实际监听地址继续请求），不依赖固定端口、外网或固定等待时间；子进程卡住会在有限时间内使测试失败，成功与失败均关闭子进程并清理临时文件。
