@@ -691,7 +691,7 @@ test('requestBody 错误：required 非 true、content 不符、缺 schema', { t
 // schema 错误矩阵
 // ---------------------------------------------------------------------------
 
-test('schema 错误：缺 type、非法类型、未知关键字、nullable:true、required/items/additionalProperties 非法', { timeout: 60_000 }, async (t) => {
+test('schema 错误：缺 type、非法类型、未知关键字、nullable 非布尔、required/items/additionalProperties 非法', { timeout: 60_000 }, async (t) => {
   const dir = await makeTempDir(t);
   const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/a')]));
 
@@ -701,7 +701,8 @@ test('schema 错误：缺 type、非法类型、未知关键字、nullable:true�
     { name: '未知关键字 format', schema: { type: 'string', format: 'email' }, expect: /未支持的关键字 "format"/ },
     { name: '未知关键字 minLength', schema: { type: 'string', minLength: 1 }, expect: /未支持的关键字 "minLength"/ },
     { name: 'object 带 items', schema: { type: 'object', items: { type: 'string' } }, expect: /未支持的关键字 "items"/ },
-    { name: 'nullable true', schema: { type: 'string', nullable: true }, expect: /nullable/ },
+    { name: 'nullable 非布尔', schema: { type: 'string', nullable: 'yes' }, expect: /nullable/ },
+    { name: 'allOf 组合节点 nullable:true', schema: { nullable: true, allOf: [{ type: 'object' }, { type: 'object' }] }, expect: /nullable/ },
     { name: 'required 未在同层声明', schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['b'] }, expect: /未在同层 properties 中声明/ },
     { name: 'required 重复', schema: { type: 'object', properties: { a: { type: 'string' } }, required: ['a', 'a'] }, expect: /重复/ },
     { name: 'required 非字符串', schema: { type: 'object', properties: {}, required: [1] }, expect: /required\[0\]/ },

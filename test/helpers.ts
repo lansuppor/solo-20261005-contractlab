@@ -201,6 +201,7 @@ export function sceneResponse(): { status: number; headers: Record<string, never
 
 export interface RuleJson {
   readonly type: string;
+  readonly nullable?: boolean;
   readonly fields?: { readonly [name: string]: RuleJson & { readonly required?: boolean } };
   readonly additionalProperties?: boolean;
   readonly items?: RuleJson;
@@ -212,6 +213,10 @@ function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
 }
 
 export function accepts(rule: RuleJson, value: unknown): boolean {
+  // nullable:true 在原接受集合上加入 null；null 被接受时不产生子节点差异
+  if (value === null && rule.nullable === true) {
+    return true;
+  }
   switch (rule.type) {
     case 'string':
       return typeof value === 'string';

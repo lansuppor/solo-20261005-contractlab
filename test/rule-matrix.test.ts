@@ -15,7 +15,9 @@
 //   双方 true 时新版新增可选字段限制取值、双方 false 时新增可选字段）；
 // - 对象嵌套对象（嵌套必填收紧、嵌套字段类型收紧）、数组嵌套标量、
 //   数组嵌套对象（元素字段收紧）；
-// - object/array/标量之间的类型替换。
+// - object/array/标量之间的类型替换；
+// - nullable 可空约定：根/字段/数组元素的可空增减、可空与 integer/number
+//   双向变化的组合、type:null 与可空标量之间的两个方向。
 //
 // 代表值域为何能区分这些规则对：域内含整数与非整数（区分 integer/number）、
 // 字段缺失与 null（区分“必填缺失”与 null 类型）、空与非空数组（元素收紧只在
@@ -291,6 +293,114 @@ const structuredPairs: RulePair[] = [
     name: 'identical:empty-closed-object',
     oldRule: { type: 'object', fields: {}, additionalProperties: false },
     newRule: { type: 'object', fields: {}, additionalProperties: false },
+  },
+  // nullable：可空只在原接受集合上加入 null，不掩盖非 null 约束变化
+  {
+    name: 'nullable:add-root',
+    oldRule: { type: 'string' },
+    newRule: { type: 'string', nullable: true },
+  },
+  {
+    name: 'nullable:remove-root',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'string' },
+  },
+  {
+    name: 'nullable:integer->number-both-nullable',
+    oldRule: { type: 'integer', nullable: true },
+    newRule: { type: 'number', nullable: true },
+  },
+  {
+    name: 'nullable:integer->number-new-not-nullable',
+    oldRule: { type: 'integer', nullable: true },
+    newRule: { type: 'number' },
+  },
+  {
+    name: 'nullable:number->integer-both-nullable',
+    oldRule: { type: 'number', nullable: true },
+    newRule: { type: 'integer', nullable: true },
+  },
+  {
+    name: 'nullable:object-root-added',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      nullable: true,
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nullable:object-root-removed',
+    oldRule: {
+      type: 'object',
+      nullable: true,
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'integer', required: true } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nullable:field-added',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true, nullable: true } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nullable:field-removed',
+    oldRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true, nullable: true } },
+      additionalProperties: false,
+    },
+    newRule: {
+      type: 'object',
+      fields: { a: { type: 'string', required: true } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'nullable:array-items-added',
+    oldRule: { type: 'array', items: { type: 'integer' } },
+    newRule: { type: 'array', items: { type: 'integer', nullable: true } },
+  },
+  {
+    name: 'nullable:array-items-removed',
+    oldRule: { type: 'array', items: { type: 'integer', nullable: true } },
+    newRule: { type: 'array', items: { type: 'integer' } },
+  },
+  {
+    // type:null 附加 nullable 不改变接受集合（仍只接受 null）
+    name: 'nullable:null-type-with-nullable-flag',
+    oldRule: { type: 'null' },
+    newRule: { type: 'null', nullable: true },
+  },
+  {
+    // null 类型放宽为可空 string：null 仍被接受，兼容
+    name: 'nullable:null->nullable-string',
+    oldRule: { type: 'null' },
+    newRule: { type: 'string', nullable: true },
+  },
+  {
+    // 可空 string 收紧为 null 类型：非 null 字符串不再接受
+    name: 'nullable:nullable-string->null',
+    oldRule: { type: 'string', nullable: true },
+    newRule: { type: 'null' },
   },
 ];
 
