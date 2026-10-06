@@ -26,6 +26,11 @@
 //   JSON 快照与一份场景配置，按输入顺序保留原编号逐条重新判定（仅依据记录中的
 //   原始请求重新计算，不信任原版本、匹配/校验结论、计划响应与发送状态）；
 //   报告写 stdout，不监听、不发送请求、不修改文件。
+// - replay 子命令：本机请求重放与响应差异报告。读取同一份请求记录快照，
+//   按输入顺序把每条记录的原始请求逐条重放到 127.0.0.1 的指定端口
+//   （每条只尝试一次、不跟随重定向、每条有覆盖完整收发的总超时），
+//   仅比较实际响应的状态码与正文原始字节和记录中的计划响应；
+//   报告写 stdout，不监听、不修改文件。
 
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -1930,15 +1935,38 @@ function snapshotFail(where: string, message: string): never {
   throw new SnapshotError(where === '' ? message : `${where} ${message}`);
 }
 
-// 从快照无损重建出来、供重新判定的一条请求
+// 从快照无损重建出来、供重新判定/重放的一条请求
 interface SnapshotRequest {
   readonly id: number;
   readonly method: string;
+  // 含查询串的原始请求目标（重放时原样发送；verify 不使用）
+  readonly target: string;
   // target 去掉查询串后的字面路径（已核对与记录 path 一致）
   readonly path: string;
+  // 按在线顺序成对保留的原始请求头（重放时过滤后发送；verify 仅用于取 Content-Type）
+  readonly rawHeaders: readonly string[];
   // 在线顺序第一项 Content-Type 头值（名称不分大小写）；没有则为 undefined
   readonly contentType: string | undefined;
   readonly body: Buffer;
+}
+
+// utf-8 文本必须能无损编码往返：孤立代理项（lone surrogate）按 UTF-8 编码时
+// 会被替换为 U+FFFD，即使替换后的字节数恰好与 bodyBytes 吻合也不再是原始字节，
+// 必须拒绝（verify 与 replay 共用此校验）。
+function hasLoneSurrogate(text: string): boolean {
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = text.charCodeAt(i + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return true; // 高代理项后未跟低代理项
+      }
+      i += 1; // 跳过完整代理对
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true; // 孤立的低代理项
+    }
+  }
+  return false;
 }
 
 // 严格 base64：完整四字符组 + 可选末尾填充；空串合法（还原为 0 字节）
@@ -2023,6 +2051,12 @@ function parseSnapshotRecord(raw: unknown, index: number, seen: Set<number>): Sn
   }
   let bytes: Buffer;
   if (encoding === 'utf-8') {
+    if (hasLoneSurrogate(content as string)) {
+      snapshotFail(
+        `${bodyWhere}.content`,
+        '含孤立代理项（lone surrogate）：按 UTF-8 重新编码会被替换字符改写，无法无损还原原始字节',
+      );
+    }
     bytes = Buffer.from(content as string, 'utf8');
   } else {
     if (!BASE64_RE.test(content as string)) {
@@ -2040,15 +2074,16 @@ function parseSnapshotRecord(raw: unknown, index: number, seen: Set<number>): Sn
   return {
     id: id as number,
     method: method as string,
+    target: target as string,
     path: recordPath as string,
+    rawHeaders: rawHeaders as string[],
     contentType,
     body: bytes,
   };
 }
 
-// 仅校验“重建请求所需”的字段；记录中的版本、匹配/校验结论、计划响应、
-// 发送状态等字段不被信任，也不参与判定，故不要求其存在。
-function parseSnapshot(raw: unknown): SnapshotRequest[] {
+// 快照顶层结构校验（count 与 records 数量一致）；记录逐条校验由调用方继续
+function snapshotRecordsOf(raw: unknown): unknown[] {
   if (!isPlainObject(raw)) {
     snapshotFail('', '快照顶层必须是 JSON 对象（含 count 与 records）');
   }
@@ -2062,8 +2097,14 @@ function parseSnapshot(raw: unknown): SnapshotRequest[] {
   if ((count as number) !== records.length) {
     snapshotFail('count', `与 records 数量不符：count=${count as number}，实际 ${records.length} 条`);
   }
+  return records;
+}
+
+// 仅校验“重建请求所需”的字段；记录中的版本、匹配/校验结论、计划响应、
+// 发送状态等字段不被信任，也不参与判定，故不要求其存在。
+function parseSnapshot(raw: unknown): SnapshotRequest[] {
   const seen = new Set<number>();
-  return records.map((rec, i) => parseSnapshotRecord(rec, i, seen));
+  return snapshotRecordsOf(raw).map((rec, i) => parseSnapshotRecord(rec, i, seen));
 }
 
 // 读取 -> 解析 -> 校验并重建；任何一步失败都抛出含文件路径与可定位原因的错误
@@ -2195,6 +2236,366 @@ async function runVerify(requestsArg: string, configArg: string): Promise<never>
   );
   process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   process.exit(report.rejected === 0 ? 0 : 1);
+}
+
+// ---------------------------------------------------------------------------
+// 本机请求重放与响应差异报告（replay 子命令）
+// ---------------------------------------------------------------------------
+//
+// 读取 GET /__contractlab/requests 的完整 JSON 快照，按输入顺序保留原编号，
+// 把每条记录的原始请求逐条重放到 127.0.0.1 的指定端口：前一条结束才发下一条，
+// 每次执行每条只尝试一次，不跟随重定向。仅比较实际响应的状态码与正文原始字节
+// 和记录中的计划响应（计划正文按 UTF-8 编码）；不比较响应头，也不依据记录版本
+// 与发送状态判定——pending / sent / interrupted 均可重放，400/404/500 同样按
+// 内容比较。不监听端口、不修改文件；已发送的请求可能已被目标处理，不重载、
+// 清空或回滚目标状态。
+//
+// 仅重放 GET/POST；target 须为以 "/" 开头的合法 HTTP 请求目标，原样发送
+// （保留查询串与百分号编码，不归一化路径）；禁止重放 /__contractlab 本身及
+// /__contractlab/ 前缀路径。每条记录另须有 200–599 的计划响应状态与文本正文。
+// 参数与全部记录（含可发送的头名称和值）有效后才连接；参数或快照失败退出 2，
+// stderr 给原因，stdout 为空且不发任何请求。
+//
+// 每条请求的总超时自开始连接覆盖完整收发，持续来数据也不延长；连接失败、
+// 超时或响应中途断开记通信失败，关闭连接后继续下一条（部分响应不算完整）。
+
+// 重放时剥离的头（小写）：原 Host / Expect / HTTP 逐跳与分帧头；
+// Connection 头指名的头名也一并剥离。Host 与 Content-Length 按目标和实际
+// 字节数重建。
+const REPLAY_STRIP_HEADERS: ReadonlySet<string> = new Set([
+  'host',
+  'expect',
+  'connection',
+  'keep-alive',
+  'content-length',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'upgrade',
+  'proxy-authenticate',
+  'proxy-authorization',
+]);
+
+// 一条待重放的请求：共享快照校验之上再经重放专用校验
+interface ReplayRequest {
+  readonly id: number;
+  readonly method: 'GET' | 'POST';
+  // 原样发送的请求目标（含查询串与百分号编码，不归一化）
+  readonly target: string;
+  // 过滤后的业务头：名称大小写、重复项与在线顺序原样保留
+  readonly headers: readonly [string, string][];
+  readonly body: Buffer;
+  readonly plannedStatus: number;
+  readonly plannedBody: string;
+}
+
+// target 须为以 "/" 开头的合法 HTTP 请求目标：不含空白与控制字符，
+// 且每个字符都在 Latin-1 内（与 Node 客户端对 path 的接受范围一致）
+function validateReplayTarget(target: string, where: string): void {
+  if (target.length === 0 || !target.startsWith('/')) {
+    snapshotFail(where, `必须是以 "/" 开头的 HTTP 请求目标，收到 ${JSON.stringify(target)}`);
+  }
+  for (const ch of target) {
+    const code = ch.charCodeAt(0);
+    if (code <= 0x20 || code === 0x7f) {
+      snapshotFail(where, `含空白或控制字符，不是合法的 HTTP 请求目标：${JSON.stringify(target)}`);
+    }
+    if (code > 0xff) {
+      snapshotFail(where, `含 Latin-1 之外的字符，无法作为 HTTP 请求目标发送：${JSON.stringify(target)}`);
+    }
+  }
+}
+
+// 过滤并校验待发送的业务头：剥离 Host/Expect/逐跳/分帧头（含 Connection
+// 指名的头），其余按原顺序、大小写与重复项保留；保留的头名称与值必须可发送。
+function filterReplayHeaders(
+  rawHeaders: readonly string[],
+  where: string,
+): [string, string][] {
+  const connectionNamed = new Set<string>();
+  for (let j = 0; j + 1 < rawHeaders.length; j += 2) {
+    if ((rawHeaders[j] as string).toLowerCase() === 'connection') {
+      for (const token of (rawHeaders[j + 1] as string).split(',')) {
+        const name = token.trim().toLowerCase();
+        if (name !== '') {
+          connectionNamed.add(name);
+        }
+      }
+    }
+  }
+  const out: [string, string][] = [];
+  for (let j = 0; j + 1 < rawHeaders.length; j += 2) {
+    const name = rawHeaders[j] as string;
+    const value = rawHeaders[j + 1] as string;
+    const lower = name.toLowerCase();
+    if (REPLAY_STRIP_HEADERS.has(lower) || connectionNamed.has(lower)) {
+      continue;
+    }
+    if (!HEADER_NAME_RE.test(name)) {
+      snapshotFail(`${where}[${j}]`, `不是可发送的 HTTP 头名称：${JSON.stringify(name)}`);
+    }
+    for (let k = 0; k < value.length; k += 1) {
+      const code = value.charCodeAt(k);
+      // 与响应头同一规则：允许水平制表符；拒绝换行及其余控制字符；仅 Latin-1
+      if ((code <= 0x1f && code !== 0x09) || code === 0x7f || code > 0xff) {
+        snapshotFail(
+          `${where}[${j + 1}]`,
+          `头 ${JSON.stringify(name)} 的值不得包含换行或其他控制字符，且只能使用 Latin-1 字符`,
+        );
+      }
+    }
+    out.push([name, value]);
+  }
+  return out;
+}
+
+function parseReplayRecord(raw: unknown, index: number, seen: Set<number>): ReplayRequest {
+  const where = `records[${index}]`;
+  // 先完整经历与 verify 相同的快照校验（含 target/path 一致性与正文无损性）
+  const base = parseSnapshotRecord(raw, index, seen);
+
+  if (base.method !== 'GET' && base.method !== 'POST') {
+    snapshotFail(
+      `${where}.request.method`,
+      `仅支持重放 GET/POST，收到 ${JSON.stringify(base.method)}`,
+    );
+  }
+  validateReplayTarget(base.target, `${where}.request.target`);
+  if (base.path === ADMIN_BASE || base.path.startsWith(ADMIN_PREFIX)) {
+    snapshotFail(
+      `${where}.request.target`,
+      `指向管理入口（${ADMIN_BASE} 本身及 ${ADMIN_PREFIX} 前缀），禁止重放`,
+    );
+  }
+
+  // 每条记录另须有 200–599 的计划响应状态与文本正文（比较基准）
+  const prWhere = `${where}.plannedResponse`;
+  const planned = (raw as Record<string, unknown>).plannedResponse;
+  if (!isPlainObject(planned)) {
+    snapshotFail(prWhere, '必须是对象（重放需要计划响应状态与文本正文）');
+  }
+  const { status, body } = planned;
+  if (!Number.isInteger(status) || (status as number) < 200 || (status as number) > 599) {
+    snapshotFail(
+      `${prWhere}.status`,
+      `必须是 200 至 599 之间的整数，收到 ${JSON.stringify(status)}`,
+    );
+  }
+  if (typeof body !== 'string') {
+    snapshotFail(`${prWhere}.body`, '必须是文本字符串');
+  }
+  if (hasLoneSurrogate(body as string)) {
+    snapshotFail(
+      `${prWhere}.body`,
+      '含孤立代理项（lone surrogate）：按 UTF-8 编码会被替换字符改写，无法作为无损的比较基准',
+    );
+  }
+
+  return {
+    id: base.id,
+    method: base.method,
+    target: base.target,
+    headers: filterReplayHeaders(base.rawHeaders, `${where}.request.rawHeaders`),
+    body: base.body,
+    plannedStatus: status as number,
+    plannedBody: body as string,
+  };
+}
+
+function parseReplaySnapshot(raw: unknown): ReplayRequest[] {
+  const seen = new Set<number>();
+  return snapshotRecordsOf(raw).map((rec, i) => parseReplayRecord(rec, i, seen));
+}
+
+// 读取 -> 解析 -> 校验并重建；任何一步失败都抛出含文件路径与可定位原因的错误
+async function loadReplaySnapshotFromFile(snapshotPath: string): Promise<ReplayRequest[]> {
+  let text: string;
+  try {
+    text = await readFile(snapshotPath, 'utf8');
+  } catch (e) {
+    throw new Error(`读取请求记录快照文件 ${snapshotPath} 失败：${describeError(e)}`);
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`请求记录快照文件 ${snapshotPath} 不是合法 JSON：${describeError(e)}`);
+  }
+
+  try {
+    return parseReplaySnapshot(raw);
+  } catch (e) {
+    throw new Error(`请求记录快照文件 ${snapshotPath} 校验失败：${describeError(e)}`);
+  }
+}
+
+interface ReplayResponse {
+  readonly status: number;
+  readonly body: Buffer;
+}
+
+type ReplayExchange =
+  | { readonly ok: true; readonly response: ReplayResponse }
+  | { readonly ok: false; readonly reason: string };
+
+// 重放单条请求：独立连接、只尝试一次、不跟随重定向；总超时自开始连接覆盖
+// 完整收发，不因持续来数据而延长。通信失败时关闭连接并返回原因。
+function replayOne(port: number, request: ReplayRequest, timeoutMs: number): Promise<ReplayExchange> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (outcome: ReplayExchange): void => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        resolve(outcome);
+      }
+    };
+
+    // 业务头在前（原顺序/大小写/重复项），随后按目标与实际字节数重建
+    // Host 与 Content-Length；每条请求独立连接，响应结束后关闭。
+    const headers: string[] = [];
+    for (const [name, value] of request.headers) {
+      headers.push(name, value);
+    }
+    headers.push('Host', `127.0.0.1:${port}`);
+    headers.push('Content-Length', String(request.body.byteLength));
+    headers.push('Connection', 'close');
+
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      method: request.method,
+      path: request.target, // 原样发送：保留查询串与百分号编码，不归一化
+      headers,
+      agent: false, // 不连接池化：一次一条，每条只尝试一次
+    });
+
+    // 总超时：覆盖连接建立与完整收发，持续来数据不延长
+    const timer = setTimeout(() => {
+      req.destroy();
+      done({ ok: false, reason: `超过总超时 ${timeoutMs}ms（自开始连接覆盖完整收发）` });
+    }, timeoutMs);
+
+    req.on('response', (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        done({
+          ok: true,
+          response: { status: res.statusCode ?? 0, body: Buffer.concat(chunks) },
+        });
+      });
+      res.on('aborted', () => {
+        done({ ok: false, reason: '响应中途断开（部分响应不算完整）' });
+      });
+      res.on('error', (e: unknown) => {
+        done({ ok: false, reason: `响应读取失败：${describeError(e)}` });
+      });
+      res.on('close', () => {
+        if (!res.complete) {
+          done({ ok: false, reason: '响应中途断开（部分响应不算完整）' });
+        }
+      });
+    });
+    req.on('error', (e: Error) => {
+      done({ ok: false, reason: `通信失败：${e.message}` });
+    });
+    req.end(request.body);
+  });
+}
+
+// 完整响应的无损 JSON 表示（与请求记录正文同一套编码规则）
+function replayResponseJson(response: ReplayResponse): {
+  status: number;
+  body: { encoding: 'utf-8' | 'base64'; content: string };
+} {
+  return { status: response.status, body: encodeBodyLosslessly(response.body) };
+}
+
+type ReplayResultEntry =
+  | {
+      readonly id: number;
+      readonly outcome: 'same';
+      readonly response: ReturnType<typeof replayResponseJson>;
+    }
+  | {
+      readonly id: number;
+      readonly outcome: 'different';
+      // 差异点：状态码不同 / 正文原始字节不同（可同时为真）
+      readonly differences: { readonly status: boolean; readonly body: boolean };
+      readonly planned: ReturnType<typeof replayResponseJson>;
+      readonly response: ReturnType<typeof replayResponseJson>;
+    }
+  | { readonly id: number; readonly outcome: 'failed'; readonly reason: string };
+
+interface ReplayReport {
+  readonly requestsFile: string;
+  readonly port: number;
+  readonly timeoutMs: number;
+  readonly total: number;
+  readonly same: number;
+  readonly different: number;
+  readonly failed: number;
+  readonly results: readonly ReplayResultEntry[];
+}
+
+async function runReplay(requestsArg: string, port: number, timeoutMs: number): Promise<never> {
+  const requestsFile = path.resolve(requestsArg);
+
+  // 参数与全部记录有效后才连接：任何快照错误都不发任何请求
+  let requests: ReplayRequest[];
+  try {
+    requests = await loadReplaySnapshotFromFile(requestsFile);
+  } catch (e) {
+    process.stderr.write(`${APP_NAME}: replay 请求快照：${describeError(e)}\n`);
+    process.exit(2);
+  }
+
+  // 按输入顺序保留原编号逐条重放：前一条结束才发下一条
+  const results: ReplayResultEntry[] = [];
+  for (const request of requests) {
+    const exchange = await replayOne(port, request, timeoutMs);
+    if (!exchange.ok) {
+      results.push({ id: request.id, outcome: 'failed', reason: exchange.reason });
+      continue;
+    }
+    const { response } = exchange;
+    // 仅比较状态码与正文原始字节；计划正文按 UTF-8 编码
+    const statusDiff = response.status !== request.plannedStatus;
+    const bodyDiff = !response.body.equals(Buffer.from(request.plannedBody, 'utf8'));
+    if (!statusDiff && !bodyDiff) {
+      results.push({ id: request.id, outcome: 'same', response: replayResponseJson(response) });
+    } else {
+      results.push({
+        id: request.id,
+        outcome: 'different',
+        differences: { status: statusDiff, body: bodyDiff },
+        planned: {
+          status: request.plannedStatus,
+          body: { encoding: 'utf-8', content: request.plannedBody },
+        },
+        response: replayResponseJson(response),
+      });
+    }
+  }
+
+  const same = results.filter((r) => r.outcome === 'same').length;
+  const different = results.filter((r) => r.outcome === 'different').length;
+  const failed = results.filter((r) => r.outcome === 'failed').length;
+  const report: ReplayReport = {
+    requestsFile,
+    port,
+    timeoutMs,
+    total: results.length,
+    same,
+    different,
+    failed,
+    results,
+  };
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  // 空快照或全部相同退出 0；存在差异或通信失败退出 1
+  process.exit(different === 0 && failed === 0 ? 0 : 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -2673,6 +3074,7 @@ function helpText(): string {
     '  node app.ts compare --old <file> --new <file>',
     '  node app.ts import --openapi <file> --config <file>',
     '  node app.ts verify --requests <file> --config <file>',
+    '  node app.ts replay --requests <file> --port <port> --timeout <ms>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
@@ -2705,6 +3107,17 @@ function helpText(): string {
     '                        不监听、不发送请求、不修改文件；',
     '                        报告以 JSON 写往 stdout：空快照或全部接受退出 0，',
     '                        存在请求拒绝退出 1，',
+    '                        参数/读取/解析/校验失败退出 2（错误写 stderr，stdout 为空）',
+    '',
+    'Options (replay):',
+    '  -r, --requests <file> GET /__contractlab/requests 的完整 JSON 快照文件（必填）',
+    '  -p, --port <number>   目标端口：127.0.0.1 上的有效非零端口（必填）',
+    '  -t, --timeout <ms>    每条请求的总超时（正整数毫秒，自开始连接覆盖完整收发）',
+    '                        本机重放快照中的请求（仅 GET/POST，禁止管理入口路径）：',
+    '                        按输入顺序逐条发送，每条只尝试一次、不跟随重定向；',
+    '                        仅比较响应状态码与正文原始字节和记录中的计划响应；',
+    '                        不监听、不修改文件；报告以 JSON 写往 stdout：',
+    '                        空快照或全部相同退出 0，存在差异或通信失败退出 1，',
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr，stdout 为空）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
@@ -2943,6 +3356,82 @@ function parseVerifyArgv(argv: readonly string[]): VerifyOptions {
   return { requests, config };
 }
 
+interface ReplayOptions {
+  requests: string;
+  port: number;
+  timeoutMs: number;
+}
+
+function parseReplayArgv(argv: readonly string[]): ReplayOptions {
+  let requests: string | undefined;
+  let port: number | undefined;
+  let timeoutMs: number | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`replay: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--requests' || flag === '-r') {
+      [requests, i] = readValue(flag, inline, i);
+    } else if (flag === '--port' || flag === '-p') {
+      let value: string;
+      [value, i] = readValue(flag, inline, i);
+      if (!/^\d+$/.test(value)) {
+        cliFail(`replay: 端口必须是整数，收到 "${value}"`);
+      }
+      port = Number(value);
+      if (port < 1 || port > 65535) {
+        cliFail(`replay: 端口必须是 1 至 65535 之间的有效非零端口，收到 ${port}`);
+      }
+    } else if (flag === '--timeout' || flag === '-t') {
+      let value: string;
+      [value, i] = readValue(flag, inline, i);
+      if (!/^\d+$/.test(value)) {
+        cliFail(`replay: 总超时必须是正整数毫秒数，收到 "${value}"`);
+      }
+      timeoutMs = Number(value);
+      if (timeoutMs < 1) {
+        cliFail(`replay: 总超时必须是正整数毫秒数，收到 ${timeoutMs}`);
+      }
+    } else {
+      cliFail(`replay: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (requests === undefined) {
+    cliFail('replay: 缺少必填参数 --requests <file>');
+  }
+  if (port === undefined) {
+    cliFail('replay: 缺少必填参数 --port <port>');
+  }
+  if (timeoutMs === undefined) {
+    cliFail('replay: 缺少必填参数 --timeout <ms>');
+  }
+  return { requests, port, timeoutMs };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -2986,6 +3475,15 @@ function main(): void {
     const options = parseVerifyArgv(argv.slice(1));
     runVerify(options.requests, options.config).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: verify 失败：${describeError(e)}\n`);
+      process.exit(2);
+    });
+    return;
+  }
+
+  if (argv[0] === 'replay') {
+    const options = parseReplayArgv(argv.slice(1));
+    runReplay(options.requests, options.port, options.timeoutMs).catch((e: unknown) => {
+      process.stderr.write(`${APP_NAME}: replay 失败：${describeError(e)}\n`);
       process.exit(2);
     });
     return;

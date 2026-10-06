@@ -643,6 +643,16 @@ test('输入失败：快照损坏、场景非法、文件缺失均退出 2 且�
       expect: /不符/,
     },
     {
+      name: 'utf-8 正文含孤立代理项（替换后长度吻合也拒绝）',
+      snapshot: corrupt((_s, r) =>
+        withRequest(r, {
+          bodyBytes: 3, // U+FFFD 的 UTF-8 长度：孤立代理项替换后恰好吻合
+          body: { encoding: 'utf-8', content: '\uD800' },
+        }),
+      ),
+      expect: /孤立代理项/,
+    },
+    {
       name: 'records 非数组',
       snapshot: { count: 0, records: {} },
       expect: /records/,
