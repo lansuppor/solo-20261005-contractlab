@@ -1118,10 +1118,12 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
 //   nullable=false 忽略，其余关键字或非法值一律拒绝；
 // - 支持本文件内 $ref（按 JSON Pointer 转义解析）：共享引用允许，目标缺失、
 //   外部引用与循环引用拒绝并给出引用链；引用节点只含 $ref；
-// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或嵌套组合，
-//   结果取各分支接受集合的交集（同名字段递归相交、number∩integer 取
-//   integer、必填合并、各分支额外字段限制同时生效）；空交集或现有规则
-//   无法表达时定位原因并拒绝，不扩展规则种类；
+// - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或任意深度
+//   嵌套组合（嵌套 allOf 展平为全部对象叶分支）；按所选操作最终请求正文的
+//   整体接受集合求各分支交集，结论与分支顺序、嵌套分组、本文件内引用无关；
+//   同名字段（对象内部与数组元素）递归相交、number∩integer 取 integer、
+//   必填合并、各分支额外字段限制同时生效；区分字段禁止出现、整体空交集与
+//   非空但无法表达，后两者定位原因并拒绝，不扩展规则种类；
 // - 未被场景选中的操作与不可达定义不参与转换（其中的错误不影响结果）；
 //   全部输入与所选可达定义有效后才输出，成功退出 0，失败退出 2
 //   （stderr 指明文件与操作或定义位置，stdout 为空）。
@@ -1133,14 +1135,25 @@ class ImportError extends Error {
   }
 }
 
-// allOf 交集为空的标记性错误：对象字段合并时，“可选字段的交集为空”在结果
-// 拒绝额外字段时可表达为“禁止该字段出现”，只有确实无法表达时才转为拒绝。
-class EmptyIntersection extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'EmptyIntersection';
-  }
-}
+// allOf 交集的三态结论（整体语义，必须对“全部”分支一次判定，不能逐对折叠）：
+// - nonempty  交集非空，且现有规则种类可以精确表达，rule 即交集规则；
+// - empty     交集为空（连一个可接受的值都没有），reason 说明首个空点，
+//             loc 是首个贡献该空点分支的“对象级”位置（数组元素归到其所在对象）；
+// - inexpressible 交集非空，但现有规则种类表达不了，rule 是其“近似规则”
+//             （用于在外层把 inexpressible 精确收窄为 empty），loc 是首个贡献
+//             不可表达点分支的对象级位置，reason 说明不可表达的原因。
+//
+// 之所以不能在两两合并的中途拒绝：可选字段的“非空但不可表达”只是中间现象，
+// 再叠加一个封闭空对象分支后，真实交集可能恰好为空对象 {}（可表达）。
+type Intersection =
+  | { readonly tag: 'nonempty'; readonly rule: NormRule }
+  | { readonly tag: 'empty'; readonly reason: string; readonly loc: string }
+  | {
+      readonly tag: 'inexpressible';
+      readonly rule: NormRule;
+      readonly reason: string;
+      readonly loc: string;
+    };
 
 // 转换过程中的规范化规则：与 BodyRule 同构，但 object 的必填名集合单独保存，
 // 便于 allOf 交集计算；输出时再展开为场景规则 JSON。
@@ -1274,13 +1287,14 @@ function dereference(
   return { target, where: `${where} -> ${ref as string}`, refChain: [...refChain, ref as string] };
 }
 
-// schema（或引用链尽头的 schema）-> 规范化规则
-function schemaToNorm(
+// 解析一层或多层 $ref 并做节点级基础校验（必须是对象、nullable 仅可 false），
+// 返回落定的 schema 节点与其（含引用链的）位置。
+function resolveSchemaNode(
   rawNode: unknown,
   ctx: ImportCtx,
   where: string,
   refChain: readonly string[],
-): NormRule {
+): { n: Record<string, unknown>; nodeWhere: string; chain: readonly string[] } {
   let node = rawNode;
   let nodeWhere = where;
   let chain = refChain;
@@ -1298,42 +1312,96 @@ function schemaToNorm(
     chain = ref.refChain;
   }
   const n = node as Record<string, unknown>;
-
   // nullable 仅允许 false（等同不声明，忽略）；true 属于非法值
   if (hasOwnKey(n, 'nullable') && n.nullable !== false) {
     importFail(ctx, `${nodeWhere}.nullable`, `仅支持 false（或不声明），收到 ${JSON.stringify(n.nullable)}`);
   }
+  return { n, nodeWhere, chain };
+}
+
+// 组合节点键校验（仅 allOf 与注释）并取出非空 allOf 数组
+function comboList(n: Record<string, unknown>, ctx: ImportCtx, nodeWhere: string): unknown[] {
+  for (const key of Object.keys(n)) {
+    if (key !== 'allOf' && !OPENAPI_ANNOTATION_KEYS.has(key)) {
+      importFail(
+        ctx,
+        nodeWhere,
+        `组合节点仅允许 allOf 及注释（title/description/example/nullable），含未支持的关键字 "${key}"`,
+      );
+    }
+  }
+  const list = n.allOf;
+  if (!Array.isArray(list) || list.length === 0) {
+    importFail(ctx, `${nodeWhere}.allOf`, '必须是非空数组');
+  }
+  return list as unknown[];
+}
+
+// 递归收集（可能嵌套的）allOf 子树的全部对象叶分支：组合节点只含 allOf 与
+// 注释，其子树展开后的叶分支即全部参与交集的分支。交集满足结合律，故展平不
+// 改变接受集合，也使成功/拒绝结论与分支顺序、嵌套分组无关。loc 保留每个叶分
+// 支的精确位置（含嵌套 allOf 下标与 $ref 链），用于来源定位。
+interface ObjectLeaf {
+  readonly rule: NormObject;
+  readonly loc: string;
+}
+
+function collectObjectLeaves(
+  list: readonly unknown[],
+  ctx: ImportCtx,
+  parentWhere: string,
+  chain: readonly string[],
+): ObjectLeaf[] {
+  const leaves: ObjectLeaf[] = [];
+  list.forEach((raw, i) => {
+    const branchWhere = `${parentWhere}.allOf[${i}]`;
+    const { n, nodeWhere, chain: ch } = resolveSchemaNode(raw, ctx, branchWhere, chain);
+    if (hasOwnKey(n, 'allOf')) {
+      leaves.push(...collectObjectLeaves(comboList(n, ctx, nodeWhere), ctx, nodeWhere, ch));
+      return;
+    }
+    const rule = buildSimpleNorm(n, ctx, nodeWhere, ch);
+    if (rule.kind !== 'object') {
+      importFail(ctx, nodeWhere, `仅支持纯对象 allOf 组合，该分支最终类型为 ${rule.kind}`);
+    }
+    leaves.push({ rule: rule as NormObject, loc: nodeWhere });
+  });
+  return leaves;
+}
+
+// schema（或引用链尽头的 schema）-> 规范化规则
+function schemaToNorm(
+  rawNode: unknown,
+  ctx: ImportCtx,
+  where: string,
+  refChain: readonly string[],
+): NormRule {
+  const { n, nodeWhere, chain } = resolveSchemaNode(rawNode, ctx, where, refChain);
 
   if (hasOwnKey(n, 'allOf')) {
-    for (const key of Object.keys(n)) {
-      if (key !== 'allOf' && !OPENAPI_ANNOTATION_KEYS.has(key)) {
-        importFail(
-          ctx,
-          nodeWhere,
-          `组合节点仅允许 allOf 及注释（title/description/example/nullable），含未支持的关键字 "${key}"`,
-        );
-      }
-    }
-    const list = n.allOf;
-    if (!Array.isArray(list) || list.length === 0) {
-      importFail(ctx, `${nodeWhere}.allOf`, '必须是非空数组');
-    }
-    const branches = (list as unknown[]).map((branch, i) =>
-      schemaToNorm(branch, ctx, `${nodeWhere}.allOf[${i}]`, chain),
+    const leaves = collectObjectLeaves(comboList(n, ctx, nodeWhere), ctx, nodeWhere, chain);
+    const result = intersectObjects(
+      leaves.map((l) => ({ rule: l.rule, loc: l.loc })),
+      nodeWhere,
     );
-    for (let i = 0; i < branches.length; i += 1) {
-      const branch = branches[i] as NormRule;
-      if (branch.kind !== 'object') {
-        importFail(
-          ctx,
-          `${nodeWhere}.allOf[${i}]`,
-          `仅支持纯对象 allOf 组合，该分支最终类型为 ${branch.kind}`,
-        );
-      }
+    // 整体空交集 与 非空但无法表达 都拒绝；reason 含冲突字段/元素与失败理由，
+    // loc 指向贡献该结论的叶分支（可定位的操作或定义位置）
+    if (result.tag === 'empty' || result.tag === 'inexpressible') {
+      importFail(ctx, result.loc, result.reason);
     }
-    return mergeObjectNorms(branches as NormObject[], ctx, nodeWhere);
+    return result.rule;
   }
 
+  return buildSimpleNorm(n, ctx, nodeWhere, chain);
+}
+
+// 非组合（非 allOf）schema -> 规范化规则
+function buildSimpleNorm(
+  n: Record<string, unknown>,
+  ctx: ImportCtx,
+  nodeWhere: string,
+  chain: readonly string[],
+): NormRule {
   const type = n.type;
   if (
     typeof type !== 'string' ||
@@ -1415,64 +1483,46 @@ function schemaToNorm(
   return { kind: type as 'string' | 'number' | 'integer' | 'boolean' };
 }
 
-// 两个规范化规则的交集；交集为空抛 EmptyIntersection，现有规则种类无法表达
-// 时抛 ImportError。
-function intersectNorms(a: NormRule, b: NormRule, ctx: ImportCtx, where: string): NormRule {
-  if (a.kind === 'object' && b.kind === 'object') {
-    return mergeObjectNorms([a, b], ctx, where);
-  }
-  if (a.kind === 'array' && b.kind === 'array') {
-    try {
-      return { kind: 'array', items: intersectNorms(a.items, b.items, ctx, `${where}.items`) };
-    } catch (e) {
-      if (e instanceof EmptyIntersection) {
-        throw new ImportError(
-          importErrorMessage(
-            ctx,
-            where,
-            `数组元素规则交集为空（${e.message}），交集结果仅含空数组，现有规则种类无法表达`,
-          ),
-        );
-      }
-      throw e;
-    }
-  }
-  if (a.kind === 'object' || a.kind === 'array' || b.kind === 'object' || b.kind === 'array') {
-    throw new EmptyIntersection(`类型 ${a.kind} 与 ${b.kind} 没有共同接受的值`);
-  }
+// 标量类型交集：相同类型取自身；number ∩ integer 取 integer；其余组合为空。
+// 结果与顺序无关。
+function scalarIntersection(
+  a: NormRule,
+  b: NormRule,
+): { kind: 'string' | 'number' | 'integer' | 'boolean' } | null {
   if (a.kind === b.kind) {
-    return a;
+    return a as { kind: 'string' | 'number' | 'integer' | 'boolean' };
   }
-  // number 与 integer 相交取 integer；其余标量组合交集为空
   if (
     (a.kind === 'number' && b.kind === 'integer') ||
     (a.kind === 'integer' && b.kind === 'number')
   ) {
     return { kind: 'integer' };
   }
-  throw new EmptyIntersection(`类型 ${a.kind} 与 ${b.kind} 没有共同接受的值`);
+  return null;
 }
 
-// 纯对象 allOf 的交集：结果接受集合 = 各分支接受集合的交集。
-// - 字段可出现的条件：在每个分支中都已声明，或该分支允许额外字段；
-//   必填字段若被某分支禁止出现，则交集为空；
-// - 同名字段递归相交（number∩integer 取 integer）；必填取并集；
-// - 结果的 additionalProperties 为各分支的合取（任一分支拒绝则拒绝）；
-// - 可选字段交集为空且结果拒绝额外字段时，不声明该字段即“禁止出现”，
-//   集合语义不变；结果允许额外字段时无法表达，拒绝。
-function mergeObjectNorms(
-  branches: readonly NormObject[],
-  ctx: ImportCtx,
-  where: string,
-): NormObject {
-  const addl = branches.every((b) => b.addl);
-  const props = new Map<string, NormRule>();
-  const required = new Set<string>();
+// 参与交集的一个规则分支：rule 是其规范化规则，loc 是该规则在文档中的精确
+// 来源位置（对象取 allOf 叶分支位置、字段取 ...properties["名"]、元素取 ...items），
+// 用于在拒绝时给出可定位的操作或定义位置。
+interface RuleBranch {
+  readonly rule: NormRule;
+  readonly loc: string;
+}
+
+// 多个对象分支（可能来自嵌套 allOf）接受集合的交集。
+// 必须对“全部分支同时”判定，结论与分支顺序、嵌套分组无关；不可在两两折叠的
+// 中途因某个中间交集不可表达就拒绝——再叠加分支后真实交集可能变为可表达
+// （例如 string 与 integer 两支本不可表达，第三支是封闭空对象后，交集恰为
+// 只接受空对象的封闭对象）。
+function intersectObjects(flat: readonly RuleBranch[], where: string): Intersection {
+  const objs = flat.map((b) => b.rule as NormObject);
+  // 结果的 additionalProperties 为各分支的合取（任一分支拒绝则拒绝）
+  const addl = objs.every((o) => o.addl);
 
   const names: string[] = [];
   const seen = new Set<string>();
-  for (const branch of branches) {
-    for (const name of branch.props.keys()) {
+  for (const o of objs) {
+    for (const name of o.props.keys()) {
       if (!seen.has(name)) {
         seen.add(name);
         names.push(name);
@@ -1480,64 +1530,181 @@ function mergeObjectNorms(
     }
   }
 
+  const props = new Map<string, NormRule>();
+  const required = new Set<string>();
+  // 非空但无法表达时的首个原因与位置（可能随后被收窄为空交集）
+  let inex: { reason: string; loc: string } | undefined;
+
+  const noteInexpressible = (reason: string, loc: string): void => {
+    if (inex === undefined) {
+      inex = { reason, loc };
+    }
+  };
+
   for (const name of names) {
-    const fieldWhere = `${where}.properties[${JSON.stringify(name)}]`;
-    const isRequired = branches.some((b) => b.required.has(name));
-    const permitted = branches.every((b) => b.props.has(name) || b.addl);
-    if (!permitted) {
-      // 该字段在交集中禁止出现：不声明即可表达（此时必有分支 addl=false，
-      // 结果 addl 必为 false）
-      if (isRequired) {
-        throw new EmptyIntersection(
-          `字段 ${JSON.stringify(name)} 在部分分支中为必填，但被另一分支禁止出现（未声明且 additionalProperties 为 false），交集为空`,
-        );
+    const isRequired = objs.some((o) => o.required.has(name));
+
+    // 真正约束该字段取值的声明分支（附精确来源位置）；以及首个禁止它出现的分支
+    // （未声明且该分支 additionalProperties 为 false）
+    const declarers: RuleBranch[] = [];
+    let forbiddener: RuleBranch | undefined;
+    for (let i = 0; i < flat.length; i += 1) {
+      const o = objs[i];
+      const sub = o.props.get(name);
+      if (sub !== undefined) {
+        declarers.push({ rule: sub, loc: `${flat[i].loc}.properties[${JSON.stringify(name)}]` });
+      } else if (!o.addl && forbiddener === undefined) {
+        forbiddener = flat[i];
       }
+    }
+
+    if (forbiddener !== undefined) {
+      if (isRequired) {
+        return {
+          tag: 'empty',
+          reason:
+            `字段 ${JSON.stringify(name)} 在部分分支中为必填，但被另一分支禁止出现` +
+            '（未声明且 additionalProperties 为 false），交集为空',
+          loc: forbiddener.loc,
+        };
+      }
+      // 可选且被禁止：结果中不声明该字段即“禁止出现”。其余声明分支的取值交集
+      // 为何都无关紧要——该字段根本不能出现（声明分支中的非法 schema 仍在
+      // schemaToNorm 阶段被拒绝，不会走到这里）。
       continue;
     }
-    let merged: NormRule | undefined;
-    for (const branch of branches) {
-      const sub = branch.props.get(name);
-      if (sub === undefined) {
-        continue;
-      }
-      if (merged === undefined) {
-        merged = sub;
-        continue;
-      }
-      try {
-        merged = intersectNorms(merged, sub, ctx, fieldWhere);
-      } catch (e) {
-        if (e instanceof EmptyIntersection) {
-          if (isRequired) {
-            throw new EmptyIntersection(
-              `必填字段 ${JSON.stringify(name)} 的各分支规则交集为空：${e.message}`,
-            );
-          }
-          if (addl) {
-            throw new ImportError(
-              importErrorMessage(
-                ctx,
-                fieldWhere,
-                `各分支规则交集为空（${e.message}），且所有分支都允许额外字段，现有规则种类无法表达“禁止该字段出现”`,
-              ),
-            );
-          }
-          // 可选字段交集为空且结果拒绝额外字段：不声明该字段即“禁止出现”
-          merged = undefined;
-          break;
-        }
-        throw e;
-      }
+
+    // 没有任何分支声明它：各分支仅以“允许额外字段”放行，交集对它无约束
+    if (declarers.length === 0) {
+      continue;
     }
-    if (merged !== undefined) {
-      props.set(name, merged);
+
+    const sub = intersectRules(declarers, `${where}.properties[${JSON.stringify(name)}]`);
+
+    if (sub.tag === 'empty') {
+      if (isRequired) {
+        return {
+          tag: 'empty',
+          reason: `必填字段 ${JSON.stringify(name)} 的各分支规则交集为空：${sub.reason}`,
+          loc: sub.loc,
+        };
+      }
+      if (!addl) {
+        // 可选字段交集为空、结果又拒绝额外字段：不声明即“禁止出现”，可表达
+        continue;
+      }
+      // 所有分支都允许额外字段时，无法表达“仅该字段禁止出现、其他字段任意”
+      noteInexpressible(
+        `可选字段 ${JSON.stringify(name)} 的各分支规则交集为空（${sub.reason}），` +
+          '且所有分支都允许额外字段，现有规则种类无法表达“仅禁止该字段出现”',
+        sub.loc,
+      );
+      continue;
+    }
+
+    if (sub.tag === 'inexpressible') {
+      // 子级非空但不可表达：本字段可选时外层封闭也许能补救，故带近似规则继续，
+      // 先记录原因；必填字段的不可表达在外层封闭也无法补救，最终仍会拒绝。
+      noteInexpressible(
+        `${isRequired ? '必填' : '可选'}字段 ${JSON.stringify(name)} 的各分支规则交集非空但无法表达：${sub.reason}`,
+        sub.loc,
+      );
+      props.set(name, sub.rule);
       if (isRequired) {
         required.add(name);
       }
+      continue;
+    }
+
+    props.set(name, sub.rule);
+    if (isRequired) {
+      required.add(name);
     }
   }
 
-  return { kind: 'object', props, required, addl };
+  const merged: NormObject = { kind: 'object', props, required, addl };
+  if (inex !== undefined) {
+    return { tag: 'inexpressible', rule: merged, reason: inex.reason, loc: inex.loc };
+  }
+  return { tag: 'nonempty', rule: merged };
+}
+
+// 多个规则分支（标量/数组/对象）的交集，三态返回，结论与顺序、分组无关。
+function intersectRules(flat: readonly RuleBranch[], where: string): Intersection {
+  const first = flat[0].rule;
+  const isComposite = (k: NormRule['kind']): boolean => k === 'object' || k === 'array';
+
+  // 含对象/数组时，全部分支必须是同一种结构类型；对象/数组与标量、对象与数组
+  // 相交都为空。纯标量分支（如 number 与 integer）不在此拒绝，交给下方的
+  // 标量交集处理（number ∩ integer 取 integer，并非为空）。
+  if (isComposite(first.kind)) {
+    for (let i = 1; i < flat.length; i += 1) {
+      if (flat[i].rule.kind !== first.kind) {
+        return {
+          tag: 'empty',
+          reason: `类型 ${first.kind} 与 ${flat[i].rule.kind} 没有共同接受的值`,
+          loc: flat[i].loc,
+        };
+      }
+    }
+    if (first.kind === 'object') {
+      return intersectObjects(flat, where);
+    }
+
+    // first.kind === 'array'
+    // 数组只接受“每个元素都在元素交集内”的序列，空数组总被接受：
+    // - 元素交集可表达 -> 非空，items 取交集（空数组也接受）；
+    // - 元素交集为空 -> 真实交集仅含空数组，现有规则种类无法表达；
+    // - 元素交集非空但不可表达 -> 同样无法在不扩展规则种类的前提下表达。
+    const itemBranches: RuleBranch[] = flat.map((b) => ({
+      rule: (b.rule as Extract<NormRule, { kind: 'array' }>).items,
+      loc: `${b.loc}.items`,
+    }));
+    const itemRes = intersectRules(itemBranches, `${where}.items`);
+    if (itemRes.tag === 'empty') {
+      return {
+        tag: 'inexpressible',
+        rule: { kind: 'array', items: itemBranches[0].rule },
+        reason: `数组元素规则交集为空（${itemRes.reason}），交集仅含空数组，现有规则种类无法表达`,
+        loc: itemRes.loc,
+      };
+    }
+    if (itemRes.tag === 'inexpressible') {
+      return {
+        tag: 'inexpressible',
+        rule: { kind: 'array', items: itemRes.rule },
+        reason: `数组元素规则交集非空但无法表达：${itemRes.reason}`,
+        loc: itemRes.loc,
+      };
+    }
+    return { tag: 'nonempty', rule: { kind: 'array', items: itemRes.rule } };
+  }
+
+  // 全为标量（若混入对象/数组，首分支为标量而其后出现复合类型，交集为空）
+  for (let i = 1; i < flat.length; i += 1) {
+    if (isComposite(flat[i].rule.kind)) {
+      return {
+        tag: 'empty',
+        reason: `类型 ${first.kind} 与 ${flat[i].rule.kind} 没有共同接受的值`,
+        loc: flat[i].loc,
+      };
+    }
+  }
+
+  // 标量：顺序无关地求类型交集（number ∩ integer 取 integer）；遇空即整体为空
+  let acc: NormRule = first;
+  for (let i = 1; i < flat.length; i += 1) {
+    const hit = scalarIntersection(acc, flat[i].rule);
+    if (hit === null) {
+      return {
+        tag: 'empty',
+        reason: `类型 ${acc.kind} 与 ${flat[i].rule.kind} 没有共同接受的值`,
+        loc: flat[i].loc,
+      };
+    }
+    acc = hit;
+  }
+  return { tag: 'nonempty', rule: acc };
 }
 
 // 规范化规则 -> 场景规则 JSON（object 显式写出 fields 与 additionalProperties；

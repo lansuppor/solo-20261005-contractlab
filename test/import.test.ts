@@ -7,6 +7,12 @@
 //   以及缺失目标 / 外部引用 / 循环引用（引用链定位）/ 引用节点带额外字段；
 // - 纯对象 allOf：同名字段递归相交（number∩integer 取 integer）、必填并集、
 //   各分支额外字段限制（禁止出现的字段被丢弃）、空交集与无法表达的拒绝；
+// - 嵌套 allOf 整体交集：叶分支展平后对“全部分支”一次判定，结论与分支顺序、
+//   嵌套分组、本文件内 $ref 无关（成功接受集合一致、失败一致）；中间两支
+//   string∩integer 本不可表达时，再叠加封闭空对象分支后真实交集为只接受空对象
+//   的封闭对象，必须成功；删除该分支才以“非空但无法表达”拒绝；必填冲突（整体
+//   空交集）定位到禁止分支；字段最终被禁止也不忽略其中的非法值/未知关键字；
+//   对象交集位于数组元素时遵循同一规则；成功输出用真实 serve 核对允许/拒绝正文；
 // - 操作选择与 requestBody 错误矩阵、schema 错误矩阵；
 // - 未选中操作与不可达定义不参与转换；
 // - 成功输出可直接用于真实 serve 与 compare；
@@ -429,6 +435,199 @@ test('allOf 拒绝：非对象分支、空交集与无法表达的情形', { tim
 });
 
 // ---------------------------------------------------------------------------
+// 嵌套 allOf：整体交集的顺序/分组/引用不变性、必填冲突、最终无法表达与定位
+// ---------------------------------------------------------------------------
+
+// 任务原例：三个“开放”对象分支都声明可选 box；box 前两支开放、x 分别为
+// string / integer，第三支 box 不声明内部字段且拒绝额外字段。
+function boxBranch(x: unknown): unknown {
+  return {
+    type: 'object',
+    additionalProperties: true,
+    properties: { box: { type: 'object', additionalProperties: true, properties: { x } } },
+  };
+}
+const BOX_B1 = boxBranch({ type: 'string' });
+const BOX_B2 = boxBranch({ type: 'integer' });
+const BOX_B3 = {
+  type: 'object',
+  additionalProperties: true,
+  properties: { box: { type: 'object', additionalProperties: false, properties: {} } },
+};
+const BOX_EXPECTED = {
+  type: 'object',
+  fields: { box: { type: 'object', fields: {}, additionalProperties: false } },
+  additionalProperties: true,
+};
+
+// 数组元素版：box 为数组，元素是同样的三分支对象
+const ARR_BRANCHES = [
+  { type: 'object', additionalProperties: true, properties: { box: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { x: { type: 'string' } } } } } },
+  { type: 'object', additionalProperties: true, properties: { box: { type: 'array', items: { type: 'object', additionalProperties: true, properties: { x: { type: 'integer' } } } } } },
+  { type: 'object', additionalProperties: true, properties: { box: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {} } } } },
+];
+const ARR_EXPECTED = {
+  type: 'object',
+  fields: {
+    box: { type: 'array', items: { type: 'object', fields: {}, additionalProperties: false } },
+  },
+  additionalProperties: true,
+};
+
+test('嵌套 allOf：三分支顺序、嵌套分组、$ref 均不改变成功结论与接受集合', { timeout: 60_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+
+  // 同一份三分支交集的多种等价写法（flat 全排列 + 各种嵌套分组 + 本文件内 $ref）
+  const variants: Array<{ name: string; schema: unknown; components?: unknown }> = [
+    ...[
+      [BOX_B1, BOX_B2, BOX_B3],
+      [BOX_B1, BOX_B3, BOX_B2],
+      [BOX_B2, BOX_B1, BOX_B3],
+      [BOX_B2, BOX_B3, BOX_B1],
+      [BOX_B3, BOX_B1, BOX_B2],
+      [BOX_B3, BOX_B2, BOX_B1],
+    ].map((branches, i) => ({ name: `flat 排列 ${i}`, schema: { allOf: branches } })),
+    { name: '前两支先成组', schema: { allOf: [{ allOf: [BOX_B1, BOX_B2] }, BOX_B3] } },
+    { name: '后两支先成组', schema: { allOf: [BOX_B1, { allOf: [BOX_B2, BOX_B3] }] } },
+    { name: '两侧都成组', schema: { allOf: [{ allOf: [BOX_B1] }, { allOf: [BOX_B2, BOX_B3] }] } },
+    { name: '三层嵌套', schema: { allOf: [{ allOf: [{ allOf: [BOX_B1] }, BOX_B2] }, BOX_B3] } },
+    {
+      name: '本文件内 $ref',
+      schema: {
+        allOf: [
+          { $ref: '#/components/schemas/Box1' },
+          { $ref: '#/components/schemas/Box2' },
+          { $ref: '#/components/schemas/Box3' },
+        ],
+      },
+      components: { schemas: { Box1: BOX_B1, Box2: BOX_B2, Box3: BOX_B3 } },
+    },
+    {
+      name: '嵌套分组混合 $ref',
+      schema: {
+        allOf: [
+          { allOf: [{ $ref: '#/components/schemas/Box1' }, { $ref: '#/components/schemas/Box2' }] },
+          { $ref: '#/components/schemas/Box3' },
+        ],
+      },
+      components: { schemas: { Box1: BOX_B1, Box2: BOX_B2, Box3: BOX_B3 } },
+    },
+  ];
+
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/a')]));
+  for (const v of variants) {
+    const api = await writeConfig(
+      dir,
+      `api-${v.name.replace(/[^\p{L}\p{N}]+/gu, '_')}.json`,
+      spec({ '/a': { post: { requestBody: jsonBody(v.schema) } } }, v.components),
+    );
+    const result = await runImport(api, config);
+    assert.equal(result.code, 0, `${v.name}：应成功，stderr:\n${result.stderr}`);
+    assert.deepEqual(
+      parseOutput(result.stdout).endpoints[0].requestBody,
+      BOX_EXPECTED,
+      `${v.name}：接受集合（输出规则）必须与其他等价写法一致`,
+    );
+  }
+
+  // 数组元素版同样成功（flat 与嵌套各一）
+  for (const [i, schema] of [
+    { allOf: ARR_BRANCHES },
+    { allOf: [{ allOf: [ARR_BRANCHES[0], ARR_BRANCHES[1]] }, ARR_BRANCHES[2]] },
+  ].entries()) {
+    const api = await writeConfig(dir, `api-arr-${i}.json`, spec({ '/a': { post: { requestBody: jsonBody(schema) } } }));
+    const result = await runImport(api, config);
+    assert.equal(result.code, 0, `数组元素版 ${i}：应成功，stderr:\n${result.stderr}`);
+    assert.deepEqual(parseOutput(result.stdout).endpoints[0].requestBody, ARR_EXPECTED);
+  }
+});
+
+test('嵌套 allOf：删除第三支则非空但无法表达，退出 2 且定位文件/操作/字段', { timeout: 60_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/a')]));
+
+  // 只剩前两支：box.x 的 string∩integer 为空且各方都允许额外字段，无法表达；
+  // flat 与“两层嵌套”都必须拒绝（旧实现会在嵌套内层直接拒绝三分支版）。
+  for (const [i, schema] of [
+    { allOf: [BOX_B1, BOX_B2] },
+    { allOf: [{ allOf: [BOX_B1, BOX_B2] }] },
+  ].entries()) {
+    const api = await writeConfig(dir, `api-two-${i}.json`, spec({ '/a': { post: { requestBody: jsonBody(schema) } } }));
+    const result = await runImport(api, config);
+    assert.equal(result.code, 2, `两分支版 ${i}：应退出 2\nstdout:\n${result.stdout}`);
+    assert.equal(result.stdout, '', '失败时 stdout 必须为空');
+    assert.ok(result.stderr.includes(api), 'stderr 应指明输入文件');
+    assert.ok(result.stderr.includes('paths["/a"].post.requestBody'), `stderr 应定位操作：\n${result.stderr}`);
+    assert.ok(result.stderr.includes('"box"'), `stderr 应指明冲突字段 box：\n${result.stderr}`);
+    assert.ok(/无法表达/.test(result.stderr), `stderr 应说明无法表达：\n${result.stderr}`);
+  }
+});
+
+test('嵌套 allOf：必填字段被另一分支禁止（整体空交集）退出 2 并定位禁止分支', { timeout: 60_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const api = await writeConfig(dir, 'api.json', spec({
+    '/a': {
+      post: {
+        requestBody: jsonBody({
+          allOf: [
+            { type: 'object', additionalProperties: false, properties: { x: { type: 'string' } }, required: ['x'] },
+            // 嵌套分组内的封闭空对象禁止 x 出现
+            { allOf: [{ type: 'object', additionalProperties: false, properties: {} }] },
+          ],
+        }),
+      },
+    },
+  }));
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/a')]));
+  const result = await runImport(api, config);
+  assert.equal(result.code, 2);
+  assert.equal(result.stdout, '');
+  assert.ok(result.stderr.includes(api));
+  assert.ok(/交集为空/.test(result.stderr), `应判为整体空交集：\n${result.stderr}`);
+  assert.ok(result.stderr.includes('"x"'), `应指出冲突字段 x：\n${result.stderr}`);
+  // 定位到贡献该结论的嵌套叶分支（allOf[1].allOf[0]）
+  assert.ok(result.stderr.includes('allOf[1].allOf[0]'), `应定位到嵌套叶分支：\n${result.stderr}`);
+});
+
+test('嵌套 allOf：字段最终被禁止也不忽略其中的非法 schema（非法值/未知关键字仍拒绝）', { timeout: 60_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/a')]));
+
+  const cases: Array<{ name: string; schema: unknown; expect: RegExp }> = [
+    // x 虽被第二支封闭分支“禁止出现”，但第一支 x 的类型非法，仍须拒绝
+    {
+      name: '被禁止字段含非法类型',
+      schema: {
+        allOf: [
+          { type: 'object', additionalProperties: true, properties: { x: { type: 'null' } } },
+          { type: 'object', additionalProperties: false, properties: {} },
+        ],
+      },
+      expect: /\.type/,
+    },
+    // 同上：未知关键字也不能因字段最终消失而忽略
+    {
+      name: '被禁止字段含未知关键字',
+      schema: {
+        allOf: [
+          { type: 'object', additionalProperties: true, properties: { x: { type: 'string', format: 'email' } } },
+          { type: 'object', additionalProperties: false, properties: {} },
+        ],
+      },
+      expect: /未支持的关键字 "format"/,
+    },
+  ];
+
+  for (const c of cases) {
+    const api = await writeConfig(dir, `api-${c.name}.json`, spec({ '/a': { post: { requestBody: jsonBody(c.schema) } } }));
+    const result = await runImport(api, config);
+    assert.equal(result.code, 2, `${c.name}：应退出 2\nstdout:\n${result.stdout}`);
+    assert.equal(result.stdout, '', `${c.name}：失败时 stdout 必须为空`);
+    assert.ok(c.expect.test(result.stderr), `${c.name}：stderr 应定位非法点：\n${result.stderr}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 操作选择与 requestBody 错误
 // ---------------------------------------------------------------------------
 
@@ -676,6 +875,99 @@ test('成功输出可用于真实 serve 与 compare', { timeout: 120_000 }, asyn
     const report = JSON.parse(bad.body) as { problems: Array<{ pointer: string }> };
     const pointers = report.problems.map((p) => p.pointer).sort();
     assert.deepEqual(pointers, ['/extra', '/id']);
+  } finally {
+    await server.close();
+  }
+});
+
+test('嵌套三分支成功输出用于真实 serve：核对 box 允许/拒绝的正文', { timeout: 120_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  // 任务原例（用一种嵌套分组写法，验证展平后的真实接受集合）
+  const schema = {
+    allOf: [
+      { allOf: [BOX_B1, BOX_B2] },
+      BOX_B3,
+    ],
+  };
+  const api = await writeConfig(dir, 'api.json', spec({ '/api/box': { post: { requestBody: jsonBody(schema) } } }));
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/api/box')]));
+
+  const imported = await runImport(api, config);
+  assert.equal(imported.code, 0, `导入应成功，stderr:\n${imported.stderr}`);
+  const outFile = await writeText(dir, 'out.json', imported.stdout);
+
+  // 输出自比较必然兼容，可直接给 compare 使用
+  const cmp = await runCompare(outFile, outFile);
+  assert.equal(cmp.code, 0, `输出应能被 compare 接受，stderr:\n${cmp.stderr}`);
+
+  const server = await startServer(outFile);
+  const post = (body: string) =>
+    sendRequest(server.port, {
+      method: 'POST',
+      path: '/api/box',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+  try {
+    // 允许：省略 box
+    for (const body of ['{}', '{"other":1}', '{"box":{}}', '{"box":{},"z":true}']) {
+      const r = await post(body);
+      assert.equal(r.status, SCENE_STATUS, `应接受 ${body}，实际：${r.status} ${r.body}`);
+      assert.equal(r.body, SCENE_BODY);
+    }
+
+    // 拒绝：box 中任何字段（x 取 string / integer 都不行；其他字段也被第三支拒绝）
+    const rejected: Array<{ body: string; pointers: string[] }> = [
+      { body: '{"box":{"x":"s"}}', pointers: ['/box/x'] },
+      { body: '{"box":{"x":1}}', pointers: ['/box/x'] },
+      { body: '{"box":{"y":1}}', pointers: ['/box/y'] },
+      { body: '{"box":{"x":"s","y":1}}', pointers: ['/box/x', '/box/y'] },
+    ];
+    for (const c of rejected) {
+      const r = await post(c.body);
+      assert.equal(r.status, 400, `${c.body} 应被 400 拒绝，实际：${r.status} ${r.body}`);
+      const report = JSON.parse(r.body) as { problems: Array<{ pointer: string }> };
+      assert.deepEqual(report.problems.map((p) => p.pointer).sort(), c.pointers);
+    }
+  } finally {
+    await server.close();
+  }
+});
+
+test('数组元素三分支成功输出用于真实 serve：元素仅接受空对象', { timeout: 120_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const api = await writeConfig(dir, 'api.json', spec({
+    '/api/arr': { post: { requestBody: jsonBody({ allOf: ARR_BRANCHES }) } },
+  }));
+  const config = await writeConfig(dir, 'scenes.json', sceneWith([postEndpoint('/api/arr')]));
+
+  const imported = await runImport(api, config);
+  assert.equal(imported.code, 0, `导入应成功，stderr:\n${imported.stderr}`);
+  const outFile = await writeText(dir, 'out.json', imported.stdout);
+  const server = await startServer(outFile);
+  const post = (body: string) =>
+    sendRequest(server.port, {
+      method: 'POST',
+      path: '/api/arr',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+  try {
+    for (const body of ['{}', '{"box":[]}', '{"box":[{},{}]}', '{"box":[{}],"extra":0}']) {
+      const r = await post(body);
+      assert.equal(r.status, SCENE_STATUS, `应接受 ${body}，实际：${r.status} ${r.body}`);
+    }
+    const rejected: Array<{ body: string; pointer: string }> = [
+      { body: '{"box":[{"x":"s"}]}', pointer: '/box/0/x' },
+      { body: '{"box":[{"x":1}]}', pointer: '/box/0/x' },
+      { body: '{"box":[{},{"y":2}]}', pointer: '/box/1/y' },
+    ];
+    for (const c of rejected) {
+      const r = await post(c.body);
+      assert.equal(r.status, 400, `${c.body} 应被 400 拒绝，实际：${r.status} ${r.body}`);
+      const report = JSON.parse(r.body) as { problems: Array<{ pointer: string }> };
+      assert.deepEqual(report.problems.map((p) => p.pointer), [c.pointer]);
+    }
   } finally {
     await server.close();
   }
