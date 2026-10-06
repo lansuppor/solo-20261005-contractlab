@@ -202,6 +202,7 @@ export function sceneResponse(): { status: number; headers: Record<string, never
 export interface RuleJson {
   readonly type: string;
   readonly nullable?: boolean;
+  readonly enum?: readonly unknown[];
   readonly fields?: { readonly [name: string]: RuleJson & { readonly required?: boolean } };
   readonly additionalProperties?: boolean;
   readonly items?: RuleJson;
@@ -212,22 +213,28 @@ function isPlainJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+// 标量类型的取值是否通过枚举候选（数字按数值相等，0 与 -0 等价，不做类型转换）
+function enumAccepts(rule: RuleJson, value: unknown): boolean {
+  return rule.enum === undefined || rule.enum.some((candidate) => candidate === value);
+}
+
 export function accepts(rule: RuleJson, value: unknown): boolean {
-  // nullable:true 在原接受集合上加入 null；null 被接受时不产生子节点差异
+  // nullable:true 在原接受集合上加入 null；null 被接受时不产生子节点差异；
+  // 有枚举时可空不越过枚举：null 仍须列入候选才被接受
   if (value === null && rule.nullable === true) {
-    return true;
+    return enumAccepts(rule, null);
   }
   switch (rule.type) {
     case 'string':
-      return typeof value === 'string';
+      return typeof value === 'string' && enumAccepts(rule, value);
     case 'boolean':
-      return typeof value === 'boolean';
+      return typeof value === 'boolean' && enumAccepts(rule, value);
     case 'null':
       return value === null;
     case 'number':
-      return typeof value === 'number' && Number.isFinite(value);
+      return typeof value === 'number' && Number.isFinite(value) && enumAccepts(rule, value);
     case 'integer':
-      return typeof value === 'number' && Number.isInteger(value);
+      return typeof value === 'number' && Number.isInteger(value) && enumAccepts(rule, value);
     case 'array':
       return Array.isArray(value) && value.every((item) => accepts(rule.items as RuleJson, item));
     case 'object': {

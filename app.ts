@@ -14,7 +14,9 @@
 // - POST 接口可附加可选的 requestBody 正文结构规则：请求完整接收后先校验
 //   媒体类型与 JSON 结构，不符时返回 400 差异报告，不发送场景响应、不消费序列；
 //   校验通过才按“完整接收”顺序预留响应项。任意规则节点可附布尔 nullable：
-//   true 在原接受集合上加入 null（必填字段仍不得缺失，空正文不等于 null）。
+//   true 在原接受集合上加入 null（必填字段仍不得缺失，空正文不等于 null）；
+//   标量节点可附非空 enum 候选数组：接受集合为“类型及可空集合”与枚举集合的
+//   交集（可空不越过枚举；object/array 节点禁止 enum）。
 // - 管理入口 GET /__contractlab/requests 查询本次进程内的请求记录（一致快照、
 //   不推进序列），POST /__contractlab/requests/clear 清空记录；记录只存在内存中，
 //   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）的请求一律不记录。
@@ -77,11 +79,19 @@ type HttpMethod = 'GET' | 'POST';
 // 任意规则节点（根、字段、数组元素）可附布尔 "nullable"：省略或 false 行为不变，
 // true 在原接受集合上加入 null（type:null 本就只接受 null）。必填字段即使可空也
 // 不能缺失；null 被接受时不产生子节点差异，非 null 值仍须通过全部原约束。
+// 标量节点（string/number/integer/boolean/null）可附非空 "enum" 候选数组：
+// 每项须符合节点类型与可空约定（null 项要求 nullable:true 或 type:null），
+// 顺序与重复值不影响语义（数字按数值相等，0 与 -0 等价，不做类型转换）；
+// 有 enum 时接受集合为“类型及可空集合”与枚举集合的交集（可空不越过枚举）。
+// object / array 节点禁止 enum。
 // 字段规则 = 任意规则 + 可选 "required": true（缺省为可缺省）；
 // object 的 fields / additionalProperties 可省略（默认无字段声明、拒绝未声明字段）；
 // array 必须声明 items。
 
 type ScalarKind = 'string' | 'number' | 'integer' | 'boolean' | 'null';
+
+// 枚举候选值：标量字面量（含 null，仅当节点可空或 type:null 时允许）
+type EnumValue = string | number | boolean | null;
 
 type BodyRule =
   | {
@@ -91,7 +101,12 @@ type BodyRule =
       readonly nullable: boolean;
     }
   | { readonly kind: 'array'; readonly items: BodyRule; readonly nullable: boolean }
-  | { readonly kind: ScalarKind; readonly nullable: boolean };
+  | {
+      readonly kind: ScalarKind;
+      readonly nullable: boolean;
+      // 非空候选数组（已按数值相等去重）；undefined 表示无枚举限制
+      readonly enum: readonly EnumValue[] | undefined;
+    };
 
 interface FieldRule {
   readonly rule: BodyRule;
@@ -239,6 +254,61 @@ const SCALAR_KINDS: ReadonlySet<string> = new Set([
   'null',
 ]);
 
+// 枚举项是否满足节点类型（不做类型转换；number 限有限数字、integer 限整数）
+function enumItemConforms(kind: ScalarKind, item: unknown): boolean {
+  switch (kind) {
+    case 'string':
+      return typeof item === 'string';
+    case 'number':
+      return typeof item === 'number' && Number.isFinite(item);
+    case 'integer':
+      return Number.isInteger(item);
+    case 'boolean':
+      return typeof item === 'boolean';
+    case 'null':
+      return item === null;
+  }
+}
+
+// 校验并规范化枚举候选（场景配置与 OpenAPI 导入共用语义）：非空数组、逐项符合
+// 节点类型与可空约定（null 项要求 nullable:true 或 type:null）、按数值相等去重
+// （0 与 -0 等价；顺序与重复值不影响语义）。失败返回可定位的 where 与原因。
+function enumValuesOrError(
+  enumRaw: unknown,
+  kind: ScalarKind,
+  nullable: boolean,
+  where: string,
+): { errorWhere: string; message: string } | { values: EnumValue[] } {
+  if (!Array.isArray(enumRaw) || enumRaw.length === 0) {
+    return { errorWhere: where, message: '必须是非空数组（至少一个候选值）' };
+  }
+  // Set 按 SameValueZero 去重：0 与 -0 视为同一候选
+  const seen = new Set<unknown>();
+  const values: EnumValue[] = [];
+  for (let i = 0; i < enumRaw.length; i += 1) {
+    const item = enumRaw[i];
+    const itemWhere = `${where}[${i}]`;
+    if (item === null) {
+      if (!nullable && kind !== 'null') {
+        return {
+          errorWhere: itemWhere,
+          message: '为 null：接受 null 要求节点为 nullable:true 或 type:"null"',
+        };
+      }
+    } else if (!enumItemConforms(kind, item)) {
+      return {
+        errorWhere: itemWhere,
+        message: `必须是 ${kind}（与节点类型一致，不做类型转换），收到 ${JSON.stringify(item)}`,
+      };
+    }
+    if (!seen.has(item)) {
+      seen.add(item);
+      values.push(item as EnumValue);
+    }
+  }
+  return { values };
+}
+
 function validateBodyRule(raw: unknown, where: string): BodyRule {
   if (!isPlainObject(raw)) {
     throw new ConfigError(`${where} 必须是对象（含 "type" 字段）`);
@@ -255,6 +325,9 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
     throw new ConfigError(
       `${where}.type 必须是 "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"，收到 ${JSON.stringify(type)}`,
     );
+  } else {
+    // enum 仅允许在标量节点上；object / array 节点声明 enum 按未知字段拒绝
+    allowed.add('enum');
   }
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) {
@@ -268,6 +341,17 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
     throw new ConfigError(`${where}.nullable 必须是布尔值，收到 ${JSON.stringify(nullableRaw)}`);
   }
   const nullable = nullableRaw === true;
+
+  // 标量节点可附非空 enum：每项须符合节点类型与可空约定；有枚举时接受集合为
+  // “类型及可空集合”与枚举集合的交集（可空不越过枚举，null 须列入枚举才被接受）
+  let enumValues: readonly EnumValue[] | undefined;
+  if (raw.enum !== undefined) {
+    const result = enumValuesOrError(raw.enum, type as ScalarKind, nullable, `${where}.enum`);
+    if ('errorWhere' in result) {
+      throw new ConfigError(`${result.errorWhere} ${result.message}`);
+    }
+    enumValues = result.values;
+  }
 
   if (type === 'object') {
     const fieldsRaw = raw.fields;
@@ -295,7 +379,7 @@ function validateBodyRule(raw: unknown, where: string): BodyRule {
     return { kind: 'array', items: validateBodyRule(raw.items, `${where}.items`), nullable };
   }
 
-  return { kind: type as ScalarKind, nullable };
+  return { kind: type as ScalarKind, nullable, enum: enumValues };
 }
 
 // 字段规则 = 任意规则 + 可选 "required"（仅允许出现在 object 的 fields 条目中）
@@ -596,9 +680,16 @@ function escapePointerSegment(segment: string): string {
   return segment.replace(/~/g, '~0').replace(/\//g, '~1');
 }
 
+// 枚举差异的期望描述：列全候选值（JSON 形式，数字 0 与 -0 都写作 0）
+function enumExpectedText(enumValues: readonly EnumValue[]): string {
+  return `枚举 ${JSON.stringify(enumValues)} 之一`;
+}
+
 // 结构比对：父节点类型不符时只报告该节点，不再深入制造子节点错误；
 // 字段缺失（hasOwnProperty 为假）与合法的 JSON null 分开判断。
-// 可空规则：null 被直接接受，不产生任何子节点差异；非 null 继续检查全部原约束。
+// 可空规则：null 被接受时不产生任何子节点差异；非 null 继续检查全部原约束。
+// 枚举规则：接受集合为“类型及可空集合”与枚举集合的交集——可空不越过枚举
+// （null 须列入枚举才被接受）；类型错误只报类型差异，不重复报枚举差异。
 function checkRule(
   rule: BodyRule,
   value: unknown,
@@ -606,6 +697,14 @@ function checkRule(
   problems: StructureProblem[],
 ): void {
   if (value === null && rule.nullable) {
+    // 可空不越过枚举：有枚举时 null 仍须在候选集合中
+    if (rule.kind === 'object' || rule.kind === 'array') {
+      return;
+    }
+    if (rule.enum === undefined || rule.enum.includes(null)) {
+      return;
+    }
+    problems.push({ pointer, expected: enumExpectedText(rule.enum), actual: 'null' });
     return;
   }
   switch (rule.kind) {
@@ -613,8 +712,9 @@ function checkRule(
     case 'boolean':
       if (typeof value !== rule.kind) {
         problems.push({ pointer, expected: rule.kind, actual: jsonTypeOf(value) });
+        return;
       }
-      return;
+      break;
     case 'null':
       if (value !== null) {
         problems.push({ pointer, expected: 'null', actual: jsonTypeOf(value) });
@@ -623,13 +723,15 @@ function checkRule(
     case 'number':
       if (typeof value !== 'number' || !Number.isFinite(value)) {
         problems.push({ pointer, expected: 'number', actual: jsonTypeOf(value) });
+        return;
       }
-      return;
+      break;
     case 'integer':
       if (!Number.isInteger(value)) {
         problems.push({ pointer, expected: 'integer', actual: jsonTypeOf(value) });
+        return;
       }
-      return;
+      break;
     case 'array': {
       if (!Array.isArray(value)) {
         problems.push({ pointer, expected: 'array', actual: jsonTypeOf(value) });
@@ -672,6 +774,15 @@ function checkRule(
       }
       return;
     }
+  }
+  // 标量枚举：类型检查已通过才核对候选集合（类型错误不重复报枚举错误）；
+  // 数字按数值相等（0 与 -0 等价），不做类型转换
+  if (rule.enum !== undefined && !rule.enum.includes(value as EnumValue)) {
+    problems.push({
+      pointer,
+      expected: enumExpectedText(rule.enum),
+      actual: JSON.stringify(value),
+    });
   }
 }
 
@@ -808,9 +919,14 @@ interface BodyViolation {
   readonly value: unknown;
 }
 
-// 生成被规则接受的最小 JSON 值：object 只含必填字段，array 取空数组。
+// 生成被规则接受的最小 JSON 值：object 只含必填字段，array 取空数组；
+// 枚举节点任选一候选（优先非 null 项——“类型收紧”反例需要非 null 样本）。
 // 字段名可能是 "" 或 "__proto__"，一律用无原型对象按自有字段构造。
 function sampleValue(rule: BodyRule): unknown {
+  if (rule.kind !== 'object' && rule.kind !== 'array' && rule.enum !== undefined) {
+    const nonNull = rule.enum.find((v) => v !== null);
+    return nonNull === undefined ? null : nonNull;
+  }
   switch (rule.kind) {
     case 'string':
       return 'contractlab';
@@ -833,6 +949,29 @@ function sampleValue(rule: BodyRule): unknown {
       return obj;
     }
   }
+}
+
+// 规则是否接受 null：type:null 或 nullable:true；有枚举时 null 还须列入候选
+// （可空不越过枚举）。object / array 节点没有枚举。
+function ruleAcceptsNullValue(rule: BodyRule): boolean {
+  if (!rule.nullable && rule.kind !== 'null') {
+    return false;
+  }
+  if (rule.kind === 'object' || rule.kind === 'array') {
+    return true;
+  }
+  return rule.enum === undefined || rule.enum.includes(null);
+}
+
+// 规则的非 null 接受集合是否非空：枚举仅含 null 项的标量规则只接受 null
+function hasNonNullAcceptedValues(rule: BodyRule): boolean {
+  if (rule.kind === 'null') {
+    return false;
+  }
+  if (rule.kind === 'object' || rule.kind === 'array') {
+    return true;
+  }
+  return rule.enum === undefined || rule.enum.some((v) => v !== null);
 }
 
 // 在 object 规则的最小样本上补一个字段（字段值本身须被该字段规则接受）
@@ -878,24 +1017,158 @@ function freshFieldName(
   }
 }
 
+// 非 null 值是否被标量规则接受：先过类型约束，再过枚举候选（如有）
+function scalarValueAccepted(
+  rule: Extract<BodyRule, { kind: ScalarKind }>,
+  value: unknown,
+): boolean {
+  switch (rule.kind) {
+    case 'string':
+      if (typeof value !== 'string') {
+        return false;
+      }
+      break;
+    case 'boolean':
+      if (typeof value !== 'boolean') {
+        return false;
+      }
+      break;
+    case 'number':
+      if (typeof value !== 'number' || !Number.isFinite(value)) {
+        return false;
+      }
+      break;
+    case 'integer':
+      if (!Number.isInteger(value)) {
+        return false;
+      }
+      break;
+    case 'null':
+      return false; // 本函数只处理非 null 值
+  }
+  return rule.enum === undefined || rule.enum.includes(value as EnumValue);
+}
+
+// 标量规则的简述（用于原因消息）：类型 + 枚举候选（如有）
+function scalarRuleLabel(rule: Extract<BodyRule, { kind: ScalarKind }>): string {
+  return rule.enum === undefined ? rule.kind : `${rule.kind}（${enumExpectedText(rule.enum)}）`;
+}
+
+// 生成一个属于指定类型、但不在给定枚举中的值（类型取值无限，必然找得到）
+function freshValueOutsideEnum(
+  kind: 'string' | 'number' | 'integer',
+  enumValues: readonly EnumValue[],
+): string | number {
+  if (kind === 'string') {
+    for (let i = 0; ; i += 1) {
+      const candidate = i === 0 ? 'contractlab' : `contractlab_${i}`;
+      if (!enumValues.includes(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  for (let i = 0; ; i += 1) {
+    if (!enumValues.includes(i)) {
+      return i;
+    }
+  }
+}
+
+// 标量旧规则 ⊆ 标量新规则的精确判定（双方都不是 null 类型；null 接受性已由
+// 调用方比较）。枚举按集合语义处理：
+// - 旧有枚举：旧的非 null 接受集合就是枚举的非 null 项，逐一核对新规则；
+// - 旧无枚举、新有枚举：旧的接受集合是整个类型取值（boolean 有限，逐一核对；
+//   string/number/integer 无限，构造不在新枚举中的见证值）；
+// - 双方均无枚举：仅同名兼容，外加 integer 放宽为 number。
+function collectScalarViolations(
+  oldRule: Extract<BodyRule, { kind: ScalarKind }>,
+  newRule: Extract<BodyRule, { kind: ScalarKind }>,
+  pointer: string,
+  out: BodyViolation[],
+): void {
+  if (oldRule.enum !== undefined) {
+    for (const value of oldRule.enum) {
+      if (value === null) {
+        continue; // null 的接受性已由调用方比较
+      }
+      if (!scalarValueAccepted(newRule, value)) {
+        out.push({
+          pointer,
+          value,
+          message: `枚举收紧：旧规则接受的枚举值 ${JSON.stringify(value)} 不被新规则（${scalarRuleLabel(newRule)}）接受`,
+        });
+      }
+    }
+    return;
+  }
+
+  if (newRule.enum !== undefined) {
+    // 旧规则接受整个类型集合，新规则只接受枚举候选
+    if (oldRule.kind === 'boolean') {
+      for (const value of [false, true]) {
+        if (!scalarValueAccepted(newRule, value)) {
+          out.push({
+            pointer,
+            value,
+            message: `新规则引入枚举限制（${enumExpectedText(newRule.enum)}），旧规则允许的值 ${JSON.stringify(value)} 不在候选中`,
+          });
+        }
+      }
+      return;
+    }
+    if (oldRule.kind === 'string' || oldRule.kind === 'number' || oldRule.kind === 'integer') {
+      // 类型取值无限而枚举有限：构造旧规则接受、但不在新枚举中的见证值
+      const witness = freshValueOutsideEnum(oldRule.kind, newRule.enum);
+      out.push({
+        pointer,
+        value: witness,
+        message: `新规则引入枚举限制（${enumExpectedText(newRule.enum)}），旧规则允许的值 ${JSON.stringify(witness)} 不在候选中`,
+      });
+      return;
+    }
+    return; // oldRule.kind === 'null' 不会到达（调用方已处理）
+  }
+
+  // 双方均无枚举：仅同名兼容，外加 integer 放宽为 number
+  const compatible =
+    oldRule.kind === newRule.kind || (oldRule.kind === 'integer' && newRule.kind === 'number');
+  if (!compatible) {
+    // number -> integer 时样本必须是非整数，否则 0 会被新规则接受
+    const value =
+      oldRule.kind === 'number' && newRule.kind === 'integer' ? 0.5 : sampleValue(oldRule);
+    out.push({
+      pointer,
+      value,
+      message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${newRule.kind}`,
+    });
+  }
+}
+
 // 递归判定 L(oldRule) ⊆ L(newRule)；把发现的每个反例（连同完整正文样本）推入 out。
 // 不变式：value 必被 oldRule 接受、被 newRule 拒绝；pointer 用 RFC 6901 定位差异。
 // 可空（nullable:true 或 type:null）规则的接受集合含 null：先单独比较 null 的
 // 接受性，再比较双方的非 null 部分——可空不能掩盖非 null 约束的变化。
+// 枚举（enum）规则按集合语义比较：接受集合为“类型及可空集合”与枚举集合的交集，
+// 枚举增删、枚举与非枚举规则交叉（如 number 枚举全为整数时兼容非枚举 integer）
+// 都精确判定；可空不越过枚举（null 须列入枚举才算被接受）。
 function collectViolations(
   oldRule: BodyRule,
   newRule: BodyRule,
   pointer: string,
   out: BodyViolation[],
 ): void {
-  const oldAcceptsNull = oldRule.nullable || oldRule.kind === 'null';
-  const newAcceptsNull = newRule.nullable || newRule.kind === 'null';
+  const oldAcceptsNull = ruleAcceptsNullValue(oldRule);
+  const newAcceptsNull = ruleAcceptsNullValue(newRule);
   if (oldAcceptsNull && !newAcceptsNull) {
     // null 本身就是完整反例；嵌套位置由外层调用方包上必要的父对象与必填字段
     out.push({ pointer, value: null, message: '旧规则接受 null，新规则不接受 null' });
   }
   // type:null 的旧规则只接受 null（上面已比较），没有非 null 值需要再比
   if (oldRule.kind === 'null') {
+    return;
+  }
+  // 枚举仅含 null 项的旧规则同样只接受 null：可比较的只有 null，上面已处理
+  if (!hasNonNullAcceptedValues(oldRule)) {
     return;
   }
   // 新规则只接受 null：旧规则的任意非 null 样本都是反例
@@ -909,19 +1182,16 @@ function collectViolations(
   }
 
   if (newRule.kind !== 'object' && newRule.kind !== 'array') {
-    // 标量（双方都不是 null 类型）：仅同名兼容，外加 integer 放宽为 number；其余组合两集合相交为空或有差异
-    const compatible =
-      oldRule.kind === newRule.kind || (oldRule.kind === 'integer' && newRule.kind === 'number');
-    if (!compatible) {
-      // number -> integer 时样本必须是非整数，否则 0 会被新规则接受
-      const value =
-        oldRule.kind === 'number' && newRule.kind === 'integer' ? 0.5 : sampleValue(oldRule);
+    // 新规则是标量：旧规则为对象/数组时任何样本都被拒绝
+    if (oldRule.kind === 'object' || oldRule.kind === 'array') {
       out.push({
         pointer,
-        value,
+        value: sampleValue(oldRule),
         message: `类型收紧：旧规则接受 ${kindLabel(oldRule)}，新规则只接受 ${newRule.kind}`,
       });
+      return;
     }
+    collectScalarViolations(oldRule, newRule, pointer, out);
     return;
   }
 
@@ -1166,10 +1436,11 @@ async function runCompare(oldArg: string, newArg: string): Promise<never> {
 //   且带 schema，否则拒绝；
 // - schema 支持 object/array/string/number/integer/boolean、递归
 //   properties/required/items、布尔 additionalProperties（缺省按 OpenAPI
-//   语义为允许，并在输出中显式写出）与布尔 nullable（true 在转换结果的
-//   接受集合上加入 null，false 或省略不变，非布尔值拒绝）；无 type 的
-//   allOf 组合节点仍只允许 nullable:false 或省略；title/description/example
-//   可忽略，其余关键字或非法值一律拒绝；
+//   语义为允许，并在输出中显式写出）、布尔 nullable（true 在转换结果的
+//   接受集合上加入 null，false 或省略不变，非布尔值拒绝）与标量 enum
+//   （非空候选数组，逐项符合类型与可空约定；object/array schema 与 allOf
+//   组合节点禁止 enum）；无 type 的 allOf 组合节点仍只允许 nullable:false
+//   或省略；title/description/example 可忽略，其余关键字或非法值一律拒绝；
 // - 支持本文件内 $ref（按 JSON Pointer 转义解析）：共享引用允许，目标缺失、
 //   外部引用与循环引用拒绝并给出引用链；引用节点只含 $ref；
 // - 支持纯对象 allOf：组合节点仅含 allOf 与上述注释，分支可引用或任意深度
@@ -1215,6 +1486,16 @@ type Intersection =
 // 便于 allOf 交集计算；输出时再展开为场景规则 JSON。
 // nullable 表示该规则额外接受 null；kind 为 null 的规则仅由“交集仅剩 null”
 // 产生（输入 schema 不支持 type:null），只接受 null。
+// 标量规则可带 enum 候选（非空、已去重）：接受集合为“类型及可空集合”与枚举
+// 集合的交集，与场景规则语义一致。
+type NormScalarKind = 'string' | 'number' | 'integer' | 'boolean';
+
+interface NormScalar {
+  readonly kind: NormScalarKind;
+  readonly nullable: boolean;
+  readonly enum: readonly EnumValue[] | undefined;
+}
+
 type NormRule =
   | {
       readonly kind: 'object';
@@ -1224,10 +1505,7 @@ type NormRule =
       readonly nullable: boolean;
     }
   | { readonly kind: 'array'; readonly items: NormRule; readonly nullable: boolean }
-  | {
-      readonly kind: 'string' | 'number' | 'integer' | 'boolean';
-      readonly nullable: boolean;
-    }
+  | NormScalar
   | { readonly kind: 'null' };
 
 type NormObject = Extract<NormRule, { kind: 'object' }>;
@@ -1485,7 +1763,7 @@ function buildSimpleNorm(
       ? ['properties', 'required', 'additionalProperties']
       : type === 'array'
         ? ['items']
-        : [];
+        : ['enum']; // enum 仅允许在标量 schema 上；object/array 与组合节点一律拒绝
   for (const key of Object.keys(n)) {
     if (key !== 'type' && !OPENAPI_ANNOTATION_KEYS.has(key) && !structural.includes(key)) {
       importFail(ctx, nodeWhere, `含未支持的关键字 "${key}"`);
@@ -1503,6 +1781,22 @@ function buildSimpleNorm(
       );
     }
     nullable = n.nullable as boolean;
+  }
+
+  // 基础标量 schema 可声明非空 enum：逐项符合类型与可空约定，语义与场景规则一致
+  // （object/array schema 与 allOf 组合节点上的 enum 已在上方按未支持关键字拒绝）
+  let enumValues: readonly EnumValue[] | undefined;
+  if (hasOwnKey(n, 'enum')) {
+    const result = enumValuesOrError(
+      n.enum,
+      type as ScalarKind,
+      nullable,
+      `${nodeWhere}.enum`,
+    );
+    if ('errorWhere' in result) {
+      importFail(ctx, result.errorWhere, result.message);
+    }
+    enumValues = result.values;
   }
 
   if (type === 'array') {
@@ -1560,29 +1854,45 @@ function buildSimpleNorm(
     return { kind: 'object', props, required: new Set(requiredList), addl: addlRaw !== false, nullable };
   }
 
-  return { kind: type as 'string' | 'number' | 'integer' | 'boolean', nullable };
+  return { kind: type as NormScalarKind, nullable, enum: enumValues };
 }
 
 // 标量类型交集：相同类型取自身；number ∩ integer 取 integer；其余组合为空。
-// 结果与顺序无关。nullable 不在此合并——交集的 null 接受性由 intersectRules
-// 按“全部分支都接受 null”统一判定。
-function scalarIntersection(
-  a: NormRule,
-  b: NormRule,
-): { kind: 'string' | 'number' | 'integer' | 'boolean'; nullable: boolean } | null {
-  if (a.kind === b.kind) {
-    return { kind: a.kind, nullable: false } as {
-      kind: 'string' | 'number' | 'integer' | 'boolean';
-      nullable: boolean;
-    };
+// 结果与顺序无关。nullable 与枚举不在此合并——交集的 null 接受性由
+//  intersectRules 按“全部分支都接受 null”统一判定，枚举由 intersectEnumValues 求交。
+function scalarKindIntersection(a: NormScalarKind, b: NormScalarKind): NormScalarKind | null {
+  if (a === b) {
+    return a;
   }
-  if (
-    (a.kind === 'number' && b.kind === 'integer') ||
-    (a.kind === 'integer' && b.kind === 'number')
-  ) {
-    return { kind: 'integer', nullable: false };
+  if ((a === 'number' && b === 'integer') || (a === 'integer' && b === 'number')) {
+    return 'integer';
   }
   return null;
+}
+
+// 枚举候选交集（在类型交集 kind 上）：双方都带枚举取共同候选；只有一方带枚举时，
+// 该方候选须符合另一方的类型约束（如 number 枚举 [1, 0.5] ∩ integer 取 [1]）。
+// 返回 null 表示交集为空（各分支没有共同接受的非 null 值）；
+// 返回 undefined 表示双方都没有枚举限制。null 项不在此处理——交集的 null 接受性
+// 由 intersectRules 按“全部分支都接受 null”统一判定后再列入候选。
+function intersectEnumValues(
+  a: readonly EnumValue[] | undefined,
+  b: readonly EnumValue[] | undefined,
+  kind: NormScalarKind,
+): readonly EnumValue[] | undefined | null {
+  let values: readonly EnumValue[] | undefined;
+  if (a !== undefined && b !== undefined) {
+    values = a.filter((v) => b.includes(v) && enumItemConforms(kind, v));
+  } else {
+    const single = a !== undefined ? a : b;
+    if (single !== undefined) {
+      values = single.filter((v) => enumItemConforms(kind, v));
+    }
+  }
+  if (values !== undefined && values.length === 0) {
+    return null;
+  }
+  return values;
 }
 
 // 参与交集的一个规则分支：rule 是其规范化规则，loc 是该规则在文档中的精确
@@ -1714,9 +2024,19 @@ function intersectObjects(flat: readonly RuleBranch[], where: string): Intersect
   return { tag: 'nonempty', rule: merged };
 }
 
-// 规则是否接受 null：nullable 为 true，或基类型就是 null（交集“仅剩 null”的产物）
+// 规则是否接受 null：nullable 为 true，或基类型就是 null（交集“仅剩 null”的产物）；
+// 带枚举的标量规则还要求 null 列入候选（可空不越过枚举）
 function normAcceptsNull(rule: NormRule): boolean {
-  return rule.kind === 'null' || rule.nullable;
+  if (rule.kind === 'null') {
+    return true;
+  }
+  if (!rule.nullable) {
+    return false;
+  }
+  if (rule.kind === 'object' || rule.kind === 'array') {
+    return true;
+  }
+  return rule.enum === undefined || rule.enum.includes(null);
 }
 
 // 多个规则分支（标量/数组/对象）的交集，三态返回，结论与顺序、分组无关。
@@ -1729,10 +2049,17 @@ function intersectRules(flat: readonly RuleBranch[], where: string): Intersectio
   const nonNull = intersectNonNull(flat, where);
   if (nonNull.tag === 'nonempty') {
     const rule = nonNull.rule;
-    return {
-      tag: 'nonempty',
-      rule: rule.kind === 'null' ? rule : { ...rule, nullable: allNull },
-    };
+    if (rule.kind === 'null') {
+      return { tag: 'nonempty', rule };
+    }
+    if (rule.kind === 'object' || rule.kind === 'array') {
+      return { tag: 'nonempty', rule: { ...rule, nullable: allNull } };
+    }
+    // 标量：交集接受 null 且结果带枚举时，null 必须列入候选（可空不越过枚举）；
+    // allNull 保证每个带枚举的分支都含 null 项，故补回 null 不改变接受集合
+    const enumValues =
+      allNull && rule.enum !== undefined ? [...rule.enum, null] : rule.enum;
+    return { tag: 'nonempty', rule: { ...rule, nullable: allNull, enum: enumValues } };
   }
   if (nonNull.tag === 'inexpressible') {
     return nonNull;
@@ -1814,20 +2141,32 @@ function intersectNonNull(flat: readonly RuleBranch[], where: string): Intersect
     }
   }
 
-  // 标量：顺序无关地求类型交集（number ∩ integer 取 integer）；遇空即整体为空
-  let acc: NormRule = first;
+  // 标量：顺序无关地求类型交集（number ∩ integer 取 integer）与枚举交集；
+  // 类型或枚举候选相交为空即整体非 null 交集为空
+  let accKind: NormScalarKind = (first as NormScalar).kind;
+  let accEnum = (first as NormScalar).enum;
   for (let i = 1; i < flat.length; i += 1) {
-    const hit = scalarIntersection(acc, flat[i].rule);
-    if (hit === null) {
+    const next = flat[i].rule as NormScalar;
+    const kindHit = scalarKindIntersection(accKind, next.kind);
+    if (kindHit === null) {
       return {
         tag: 'empty',
-        reason: `类型 ${acc.kind} 与 ${flat[i].rule.kind} 没有共同接受的值`,
+        reason: `类型 ${accKind} 与 ${next.kind} 没有共同接受的值`,
         loc: flat[i].loc,
       };
     }
-    acc = hit;
+    const enumHit = intersectEnumValues(accEnum, next.enum, kindHit);
+    if (enumHit === null) {
+      return {
+        tag: 'empty',
+        reason: '枚举候选的交集为空，各分支没有共同接受的非 null 值',
+        loc: flat[i].loc,
+      };
+    }
+    accKind = kindHit;
+    accEnum = enumHit;
   }
-  return { tag: 'nonempty', rule: acc };
+  return { tag: 'nonempty', rule: { kind: accKind, nullable: false, enum: accEnum } };
 }
 
 // 规范化规则 -> 场景规则 JSON（object 显式写出 fields 与 additionalProperties；
@@ -1864,6 +2203,9 @@ function normToRuleJson(rule: NormRule): Record<string, unknown> {
       const out: Record<string, unknown> = { type: rule.kind };
       if (rule.nullable) {
         out.nullable = true;
+      }
+      if (rule.enum !== undefined) {
+        out.enum = [...rule.enum];
       }
       return out;
     }
