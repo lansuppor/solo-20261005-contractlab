@@ -716,3 +716,45 @@ test('超出正文上限：413、不创建记录、不消费序列', { timeout: 
   assert.equal(after.length, 1);
   assert.equal(after[0].sequencePosition, 0);
 });
+
+test('开头 BOM 与空白在记录中原样保留（utf-8 正文无损）', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const file = await writeConfig(dir, 'scenes.json', config());
+  const server = await startServer(file);
+  t.after(server.close);
+  const port = server.port;
+  await clearRecords(port);
+
+  // BOM + 前导空白 + 合法 JSON：校验解码时 BOM 被剥离，结构合法 -> 场景响应；
+  // 但记录必须保留含 BOM 与空白的原始字节，不得剥离、不得重写 JSON
+  const text = '\uFEFF  {"id":1}';
+  const bytes = Buffer.from(text, 'utf8');
+  const raw = Buffer.concat([
+    Buffer.from(
+      [
+        'POST /api/echo HTTP/1.1',
+        'Host: 127.0.0.1',
+        'Content-Type: application/json',
+        `Content-Length: ${bytes.byteLength}`,
+        'Connection: close',
+        '',
+      ].join('\r\n') + '\r\n',
+      'utf8',
+    ),
+    bytes,
+  ]);
+  const reply = await rawRequest(port, raw);
+  assert.equal(reply.status, 200);
+  reply.socket.resume();
+
+  const records = await getRecords(port);
+  assert.equal(records.length, 1);
+  const rec = records[0];
+  assert.equal(rec.request.body.encoding, 'utf-8');
+  assert.equal(rec.request.body.content, text, '开头 BOM 与空白必须原样保留');
+  assert.equal(rec.request.bodyBytes, bytes.byteLength, 'bodyBytes 含 BOM 三字节');
+  assert.ok(
+    Buffer.from(rec.request.body.content, 'utf8').equals(bytes),
+    'utf-8 记录必须能无损还原原始字节（含 BOM）',
+  );
+});
