@@ -41,7 +41,9 @@
 //   （每条只尝试一次、不跟随重定向、每条有覆盖完整收发的总超时），
 //   仅比较实际响应的状态码与正文和记录中的计划响应；可选 --strategy
 //   比较策略按“方法 + 字面路径”为接口选择正文 JSON 语义比较（忽略键序、
-//   排版与指定的 RFC 6901 忽略指针），未选中的接口仍按原始字节比较；
+//   排版与指定的 RFC 6901 忽略指针；可为互不嵌套的数组位置指定元素自有
+//   字段作业务键对齐，按键配对后顺序不影响结论），未选中的接口仍按
+//   原始字节比较；
 //   报告写 stdout，不监听、不修改文件。
 
 import http from 'node:http';
@@ -3253,19 +3255,45 @@ async function loadReplaySnapshotFromFile(snapshotPath: string): Promise<ReplayR
 // 两侧都无目标时无影响；祖先类型不同仍照常报告）。重复或父子重叠的
 // 忽略项不改变结果。
 //
+// 接口还可附 align 数组业务键对齐：为互不嵌套的数组位置（RFC 6901 指针，
+// 支持根、~0/~1 转义）各指定一个元素自有字段作键（字段名支持空名与
+// __proto__）。重复位置、嵌套位置或非法配置整份拒绝。位置在某一侧不存在
+// 允许；存在时须为数组，元素须为对象，键须存在且为字符串、有限数字或布尔
+// （严格按类型比较、0 与 -0 等价、不转换、null 不能作键），同一数组内唯一。
+// 两侧数组按键配对，顺序不影响结论；同键元素递归比较全部未忽略差异，其他
+// 数组仍按下标。只在一侧出现的键报告整个元素，不深入；数组本身缺失按原
+// 节点差异处理。对齐数组内的忽略指针以计划原下标定位，再作用于配对元素
+// （包括缺失元素）；新增键不能被其他下标的忽略项遮蔽，忽略整数组或祖先仍
+// 生效；忽略不改变配对身份，也不豁免键完整性与唯一性校验。
+//
 // 策略、整份快照与所选记录的计划正文全部校验通过后才连接：所选计划正文须为
-// UTF-8 JSON（仅可剥离单个开头 BOM，空正文非法），忽略规则不豁免解析；
-// 失败退出 2、stderr 定位文件与字段、stdout 为空且不发任何请求。
+// UTF-8 JSON（仅可剥离单个开头 BOM，空正文非法），计划侧对齐位置存在时须为
+// 合法对齐数组，忽略规则不豁免解析与对齐校验；失败退出 2、stderr 定位文件、
+// 记录与正文位置、stdout 为空且不发任何请求。实际完整响应中的对齐数组类型、
+// 元素或键非法记 different（说明位置与原因）并继续，不算通信失败；非 UTF-8
+// 或非 JSON 仍按解析差异处理。
 //
 // JSON 语义（不依赖媒体类型）：对象只看自有字段，忽略键顺序与排版；数组按
-// 原下标比较（顺序有意义，多出或缺失的元素在其下标报告，不另报长度）；
-// 标量不转换类型，数字按解析数值比较（0 与 -0 等价），缺失与 null 不同。
-// 状态码始终精确比较，不比较响应头。
+// 原下标比较（顺序有意义，多出或缺失的元素在其下标报告，不另报长度），
+// 配置对齐的位置按键配对；标量不转换类型，数字按解析数值比较（0 与 -0
+// 等价），缺失与 null 不同。状态码始终精确比较，不比较响应头。
+
+// 数组业务键对齐：一个对齐位置（规范化指针 -> 元素键字段名）
+interface AlignSpec {
+  // 规范化位置指针（RFC 6901，根为 ""）
+  readonly pointer: string;
+  // 已解码的指针段（根指针为空数组）
+  readonly segments: readonly string[];
+  // 元素自有键字段名（可为空名或 "__proto__"）
+  readonly key: string;
+}
 
 // 一个接口的 JSON 语义比较策略
 interface JsonCompareEndpoint {
   // 规范化后的忽略指针集合（RFC 6901，根为 ""）；重复与父子重叠不影响结果
   readonly ignore: ReadonlySet<string>;
+  // 对齐位置（规范化指针 -> 对齐规格）；位置互不嵌套；空映射表示不对齐
+  readonly align: ReadonlyMap<string, AlignSpec>;
 }
 
 // 比较策略：键为 "METHOD /literal/path"（路径不含查询串）
@@ -3274,6 +3302,11 @@ type JsonCompareStrategy = ReadonlyMap<string, JsonCompareEndpoint>;
 // 由解析出的指针段构造规范化指针文本（根为 ""），用于忽略集合的去重与查找
 function canonicalPointer(segments: readonly string[]): string {
   return segments.length === 0 ? '' : `/${segments.map(escapePointerSegment).join('/')}`;
+}
+
+// 段序列 a 是否为 b 的前缀（含相等；相等情形由调用方按重复位置先行拒绝）
+function isPrefixSegments(a: readonly string[], b: readonly string[]): boolean {
+  return a.length <= b.length && a.every((segment, i) => segment === b[i]);
 }
 
 function parseStrategyEndpoint(
@@ -3287,11 +3320,11 @@ function parseStrategyEndpoint(
     throw new ConfigError(`${where} 必须是对象`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== 'method' && key !== 'path' && key !== 'ignore') {
+    if (key !== 'method' && key !== 'path' && key !== 'ignore' && key !== 'align') {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
-  const { method, path: routePath, ignore } = raw;
+  const { method, path: routePath, ignore, align } = raw;
   if (method !== 'GET' && method !== 'POST') {
     throw new ConfigError(
       `${where}.method 必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`,
@@ -3315,12 +3348,53 @@ function parseStrategyEndpoint(
     });
   }
 
+  // 数组业务键对齐：互不嵌套的数组位置各指定一个元素自有字段作键；
+  // 重复位置、嵌套位置或非法配置整份拒绝
+  const alignMap = new Map<string, AlignSpec>();
+  if (align !== undefined) {
+    if (!Array.isArray(align)) {
+      throw new ConfigError(`${where}.align 必须是数组（元素为含 pointer 与 key 的对象）`);
+    }
+    align.forEach((entry, j) => {
+      const entryWhere = `${where}.align[${j}]`;
+      if (!isPlainObject(entry)) {
+        throw new ConfigError(`${entryWhere} 必须是对象（含 pointer 与 key）`);
+      }
+      for (const key of Object.keys(entry)) {
+        if (key !== 'pointer' && key !== 'key') {
+          throw new ConfigError(`${entryWhere} 含未知字段 "${key}"`);
+        }
+      }
+      // 位置为 RFC 6901 指针：支持根（""）、空字段名、__proto__ 与 ~0/~1 转义
+      const segments = parseJsonPointer(entry.pointer, `${entryWhere}.pointer`, '对齐位置指针');
+      if (typeof entry.key !== 'string') {
+        throw new ConfigError(
+          `${entryWhere}.key 必须是字符串（元素自有字段名，可为空名或 "__proto__"），收到 ${JSON.stringify(entry.key)}`,
+        );
+      }
+      const canonical = canonicalPointer(segments);
+      if (alignMap.has(canonical)) {
+        throw new ConfigError(
+          `${entryWhere}.pointer ${JSON.stringify(entry.pointer)} 与同一接口的另一个对齐位置重复`,
+        );
+      }
+      for (const existing of alignMap.values()) {
+        if (isPrefixSegments(existing.segments, segments) || isPrefixSegments(segments, existing.segments)) {
+          throw new ConfigError(
+            `${entryWhere}.pointer ${JSON.stringify(entry.pointer)} 与对齐位置 ${JSON.stringify(existing.pointer)} 互相嵌套：对齐位置必须互不嵌套`,
+          );
+        }
+      }
+      alignMap.set(canonical, { pointer: canonical, segments, key: entry.key });
+    });
+  }
+
   const key = `${method as string} ${routePath}`;
   if (seen.has(key)) {
     throw new ConfigError(`${where} 与其他接口重复（方法 + 路径必须唯一）：${key}`);
   }
   seen.add(key);
-  endpoints.set(key, { ignore: ignoreSet });
+  endpoints.set(key, { ignore: ignoreSet, align: alignMap });
 }
 
 function parseCompareStrategy(raw: unknown): JsonCompareStrategy {
@@ -3399,21 +3473,194 @@ interface BodyDifference {
   readonly actual: unknown;
 }
 
-// 递归列出全部未忽略的独立正文差异：节点缺失或类型不同只报该节点，不再深入
+// ---------------------------------------------------------------------------
+// 数组业务键对齐（策略 align，可选）
+// ---------------------------------------------------------------------------
+
+// 对齐数组元素键：字符串、有限数字或布尔（null 不能作键，不做类型转换）
+type AlignKeyValue = string | number | boolean;
+
+// 一个已校验元素在对齐数组中的位置与键
+interface AlignKeyEntry {
+  readonly index: number;
+  readonly key: AlignKeyValue;
+}
+
+// 对齐校验问题：正文中的 RFC 6901 位置（根为 ""）与原因
+interface AlignProblem {
+  readonly pointer: string;
+  readonly reason: string;
+}
+
+// 键比较严格按类型：字符串/数字/布尔互不转换；数字 0 与 -0 等价（String(-0) 为 "0"）
+function alignCompositeKey(key: AlignKeyValue): string {
+  return `${typeof key}:${String(key)}`;
+}
+
+// 校验对齐数组并建立 键 -> 元素 映射（忽略不豁免键完整性与唯一性校验）：
+// 元素须为对象，键字段须存在且为字符串、有限数字或布尔值，同一数组内唯一。
+// 失败返回首个可定位问题（位置 + 原因）。
+function buildAlignKeyMap(
+  arr: readonly unknown[],
+  keyField: string,
+  arrayPointer: string,
+): { readonly map: Map<string, AlignKeyEntry> } | { readonly problem: AlignProblem } {
+  const map = new Map<string, AlignKeyEntry>();
+  for (let i = 0; i < arr.length; i += 1) {
+    const element = arr[i];
+    const elementPointer = `${arrayPointer}/${i}`;
+    if (!isPlainObject(element)) {
+      return {
+        problem: { pointer: elementPointer, reason: `对齐数组元素必须是对象，收到 ${jsonTypeOf(element)}` },
+      };
+    }
+    // 自有字段：空字段名与 "__proto__" 都是普通字段
+    if (!Object.prototype.hasOwnProperty.call(element, keyField)) {
+      return {
+        problem: { pointer: elementPointer, reason: `对齐数组元素缺少键字段 ${JSON.stringify(keyField)}` },
+      };
+    }
+    const key: unknown = element[keyField];
+    const valid =
+      typeof key === 'string' ||
+      typeof key === 'boolean' ||
+      (typeof key === 'number' && Number.isFinite(key));
+    if (!valid) {
+      return {
+        problem: {
+          pointer: `${elementPointer}/${escapePointerSegment(keyField)}`,
+          reason: `对齐键必须是字符串、有限数字或布尔值（null 不能作键、不做类型转换），收到 ${jsonTypeOf(key)}`,
+        },
+      };
+    }
+    const composite = alignCompositeKey(key as AlignKeyValue);
+    const existing = map.get(composite);
+    if (existing !== undefined) {
+      return {
+        problem: {
+          pointer: elementPointer,
+          reason: `对齐键 ${JSON.stringify(key)} 在同一数组内重复（另见下标 ${existing.index}）`,
+        },
+      };
+    }
+    map.set(composite, { index: i, key: key as AlignKeyValue });
+  }
+  return { map };
+}
+
+// 校验一侧正文在某个对齐位置上的值：位置不存在返回 null（允许）；存在时须为
+// 数组且元素/键合法——合法返回键映射，否则返回可定位问题。
+function checkAlignTarget(
+  root: unknown,
+  spec: AlignSpec,
+): { readonly keys: Map<string, AlignKeyEntry> } | { readonly problem: AlignProblem } | null {
+  const node = resolvePointer(root, spec.segments);
+  if (node === undefined) {
+    return null; // 位置不存在允许
+  }
+  if (!Array.isArray(node)) {
+    return {
+      problem: { pointer: spec.pointer, reason: `对齐位置存在但不是数组，收到 ${jsonTypeOf(node)}` },
+    };
+  }
+  const built = buildAlignKeyMap(node, spec.key, spec.pointer);
+  if ('problem' in built) {
+    return built;
+  }
+  return { keys: built.map };
+}
+
+// 对齐数组内的元素差异明细：业务键、存在侧在原始正文中的 RFC 6901 位置、
+// 计划与实际值及双方独立存在性标记——缺失不以 null 或字符串 "missing" 表示，
+// 由 *Exists 标记独立给出（该侧不存在时值字段为 null 且对应 *Pointer 省略）。
+interface AlignedDifference {
+  // 对齐数组位置（规范化指针，根为 ""）
+  readonly array: string;
+  readonly keyField: string;
+  readonly key: AlignKeyValue;
+  readonly plannedPointer?: string;
+  readonly actualPointer?: string;
+  readonly plannedExists: boolean;
+  readonly actualExists: boolean;
+  readonly planned: unknown;
+  readonly actual: unknown;
+}
+
+interface BodyDiffOut {
+  // 未忽略的普通差异（对齐数组之外，或对齐位置在某侧非法时的下标回退）
+  readonly differences: BodyDifference[];
+  // 对齐数组内的元素差异明细
+  readonly aligned: AlignedDifference[];
+}
+
+// 一次正文比较所需的全部上下文
+interface JsonDiffContext {
+  readonly ignore: ReadonlySet<string>;
+  readonly align: ReadonlyMap<string, AlignSpec>;
+  // 对齐位置 -> 该侧已校验的 键 -> 元素 映射（仅含位置存在且合法的一侧）
+  readonly plannedKeys: ReadonlyMap<string, Map<string, AlignKeyEntry>>;
+  readonly actualKeys: ReadonlyMap<string, Map<string, AlignKeyEntry>>;
+}
+
+// 当前递归位置所属的对齐元素（在对齐数组的配对元素内部时存在）
+interface AlignedElementContext {
+  readonly array: string;
+  readonly keyField: string;
+  readonly key: AlignKeyValue;
+}
+
+// 记录一处节点差异：对齐元素内部走 AlignedDifference（双方独立存在性标记，
+// 缺失侧值为 null、位置省略），其余保持原有 BodyDifference（缺失记 "missing"）
+function pushNodeDiff(
+  out: BodyDiffOut,
+  alignedCtx: AlignedElementContext | undefined,
+  plannedPath: readonly string[],
+  actualPath: readonly string[],
+  planned: unknown,
+  actual: unknown,
+  plannedExists: boolean,
+  actualExists: boolean,
+): void {
+  if (alignedCtx === undefined) {
+    out.differences.push({
+      pointer: canonicalPointer(plannedPath),
+      planned: plannedExists ? planned : MISSING_NODE,
+      actual: actualExists ? actual : MISSING_NODE,
+    });
+    return;
+  }
+  out.aligned.push({
+    array: alignedCtx.array,
+    keyField: alignedCtx.keyField,
+    key: alignedCtx.key,
+    ...(plannedExists ? { plannedPointer: canonicalPointer(plannedPath) } : {}),
+    ...(actualExists ? { actualPointer: canonicalPointer(actualPath) } : {}),
+    plannedExists,
+    actualExists,
+    planned: plannedExists ? planned : null,
+    actual: actualExists ? actual : null,
+  });
+}
+
+// 递归列出全部未忽略的独立正文差异：节点缺失或类型不同只报该节点，不再深入。
+// plannedPath / actualPath 分别跟踪两侧在原始正文中的位置（仅在对齐数组的
+// 配对元素内部才会不同）；忽略指针一律以计划侧位置（plannedPath）判定。
 function diffJsonValues(
   planned: unknown,
   actual: unknown,
-  ignore: ReadonlySet<string>,
-  path: readonly string[],
-  out: BodyDifference[],
+  ctx: JsonDiffContext,
+  plannedPath: readonly string[],
+  actualPath: readonly string[],
+  out: BodyDiffOut,
+  alignedCtx?: AlignedElementContext,
 ): void {
-  if (ignore.has(canonicalPointer(path))) {
+  if (ctx.ignore.has(canonicalPointer(plannedPath))) {
     return; // 忽略指针处的值、存在性与子树
   }
   const plannedType = jsonTypeOf(planned);
   const actualType = jsonTypeOf(actual);
   if (plannedType !== actualType) {
-    out.push({ pointer: canonicalPointer(path), planned, actual });
+    pushNodeDiff(out, alignedCtx, plannedPath, actualPath, planned, actual, true, true);
     return;
   }
   if (plannedType === 'object') {
@@ -3421,47 +3668,112 @@ function diffJsonValues(
     const p = planned as Record<string, unknown>;
     const a = actual as Record<string, unknown>;
     for (const key of Object.keys(p)) {
-      const childPath = [...path, key];
+      const childPlannedPath = [...plannedPath, key];
+      const childActualPath = [...actualPath, key];
       if (Object.prototype.hasOwnProperty.call(a, key)) {
-        diffJsonValues(p[key], a[key], ignore, childPath, out);
-      } else if (!ignore.has(canonicalPointer(childPath))) {
-        out.push({ pointer: canonicalPointer(childPath), planned: p[key], actual: MISSING_NODE });
+        diffJsonValues(p[key], a[key], ctx, childPlannedPath, childActualPath, out, alignedCtx);
+      } else if (!ctx.ignore.has(canonicalPointer(childPlannedPath))) {
+        pushNodeDiff(out, alignedCtx, childPlannedPath, childActualPath, p[key], undefined, true, false);
       }
     }
     for (const key of Object.keys(a)) {
       if (!Object.prototype.hasOwnProperty.call(p, key)) {
-        const childPath = [...path, key];
-        if (!ignore.has(canonicalPointer(childPath))) {
-          out.push({ pointer: canonicalPointer(childPath), planned: MISSING_NODE, actual: a[key] });
+        const childPlannedPath = [...plannedPath, key];
+        const childActualPath = [...actualPath, key];
+        if (!ctx.ignore.has(canonicalPointer(childPlannedPath))) {
+          pushNodeDiff(out, alignedCtx, childPlannedPath, childActualPath, undefined, a[key], false, true);
         }
       }
     }
     return;
   }
   if (plannedType === 'array') {
+    // 配置了对齐且两侧该位置都合法：按键配对，顺序不影响结论
+    const pointer = canonicalPointer(plannedPath);
+    const spec = ctx.align.get(pointer);
+    const plannedKeys = spec === undefined ? undefined : ctx.plannedKeys.get(pointer);
+    const actualKeys = spec === undefined ? undefined : ctx.actualKeys.get(pointer);
+    if (spec !== undefined && plannedKeys !== undefined && actualKeys !== undefined) {
+      diffAlignedArray(
+        planned as unknown[],
+        actual as unknown[],
+        spec,
+        plannedKeys,
+        actualKeys,
+        ctx,
+        plannedPath,
+        actualPath,
+        out,
+      );
+      return;
+    }
     // 按原下标比较：顺序有意义；多出或缺失的元素在其下标报告，不另报长度；
     // 被忽略的下标不参与比较，但不删除数组项、不移动其余下标
     const p = planned as unknown[];
     const a = actual as unknown[];
     const n = Math.max(p.length, a.length);
     for (let i = 0; i < n; i += 1) {
-      const childPath = [...path, String(i)];
-      if (ignore.has(canonicalPointer(childPath))) {
+      const childPlannedPath = [...plannedPath, String(i)];
+      const childActualPath = [...actualPath, String(i)];
+      if (ctx.ignore.has(canonicalPointer(childPlannedPath))) {
         continue;
       }
       if (i >= p.length) {
-        out.push({ pointer: canonicalPointer(childPath), planned: MISSING_NODE, actual: a[i] });
+        pushNodeDiff(out, alignedCtx, childPlannedPath, childActualPath, undefined, a[i], false, true);
       } else if (i >= a.length) {
-        out.push({ pointer: canonicalPointer(childPath), planned: p[i], actual: MISSING_NODE });
+        pushNodeDiff(out, alignedCtx, childPlannedPath, childActualPath, p[i], undefined, true, false);
       } else {
-        diffJsonValues(p[i], a[i], ignore, childPath, out);
+        diffJsonValues(p[i], a[i], ctx, childPlannedPath, childActualPath, out, alignedCtx);
       }
     }
     return;
   }
   // 标量不转换类型；数字按解析数值比较（0 与 -0 等价）
   if (planned !== actual) {
-    out.push({ pointer: canonicalPointer(path), planned, actual });
+    pushNodeDiff(out, alignedCtx, plannedPath, actualPath, planned, actual, true, true);
+  }
+}
+
+// 对齐数组按键配对比较：两侧数组按键配对，顺序不影响结论；同键元素递归比较
+// 全部未忽略差异；只在一侧出现的键报告整个元素，不深入。忽略指针以计划原
+// 下标定位（包括缺失元素）；仅实际侧存在的新键不能被其他下标的忽略项遮蔽；
+// 忽略不改变配对身份（与被忽略计划元素同键的实际元素仍属已配对）。
+function diffAlignedArray(
+  planned: readonly unknown[],
+  actual: readonly unknown[],
+  spec: AlignSpec,
+  plannedKeys: Map<string, AlignKeyEntry>,
+  actualKeys: Map<string, AlignKeyEntry>,
+  ctx: JsonDiffContext,
+  plannedPath: readonly string[],
+  actualPath: readonly string[],
+  out: BodyDiffOut,
+): void {
+  const arrayPointer = canonicalPointer(plannedPath);
+  // 计划侧按原下标顺序：配对或报告“仅计划侧存在”
+  for (const [composite, p] of plannedKeys) {
+    const childPlannedPath = [...plannedPath, String(p.index)];
+    if (ctx.ignore.has(canonicalPointer(childPlannedPath))) {
+      continue; // 被忽略的计划元素：配对身份不变，但不产生任何差异
+    }
+    const alignedCtx: AlignedElementContext = { array: arrayPointer, keyField: spec.key, key: p.key };
+    const a = actualKeys.get(composite);
+    if (a === undefined) {
+      // 键仅计划侧存在：报告整个元素，不深入
+      pushNodeDiff(out, alignedCtx, childPlannedPath, childPlannedPath, planned[p.index], undefined, true, false);
+    } else {
+      const childActualPath = [...actualPath, String(a.index)];
+      diffJsonValues(planned[p.index], actual[a.index], ctx, childPlannedPath, childActualPath, out, alignedCtx);
+    }
+  }
+  // 实际侧按原下标顺序：报告“仅实际侧存在”的新键（不被其他下标的忽略项遮蔽）
+  for (const [composite, a] of actualKeys) {
+    if (plannedKeys.has(composite)) {
+      continue; // 已配对（含与被忽略计划元素配对）
+    }
+    const childActualPath = [...actualPath, String(a.index)];
+    const alignedCtx: AlignedElementContext = { array: arrayPointer, keyField: spec.key, key: a.key };
+    pushNodeDiff(out, alignedCtx, childActualPath, childActualPath, undefined, actual[a.index], false, true);
   }
 }
 
@@ -3561,6 +3873,12 @@ type ReplayResultEntry =
       readonly differences: { readonly status: boolean; readonly body: boolean };
       // 仅 JSON 语义比较模式：两侧均可解析时列出全部未忽略的独立正文差异
       readonly bodyDifferences?: readonly BodyDifference[];
+      // 仅 JSON 语义比较模式且配置了对齐：对齐数组内的元素差异明细
+      // （业务键、存在侧原正文位置、计划/实际值、双方独立存在性标记）
+      readonly alignedDifferences?: readonly AlignedDifference[];
+      // 仅 JSON 语义比较模式且配置了对齐：实际完整响应中的对齐数组类型、
+      // 元素或键非法（位置 + 原因）；记正文差异并继续，不算通信失败
+      readonly alignmentErrors?: readonly AlignProblem[];
       // 仅 JSON 语义比较模式：实际响应正文非 UTF-8 或非 JSON 时的原因
       readonly bodyError?: string;
       readonly planned: ReturnType<typeof replayResponseJson>;
@@ -3609,24 +3927,47 @@ async function runReplay(
   }
 
   // 策略选中的记录：计划正文须为 UTF-8 JSON（仅可剥离单个开头 BOM，空正文
-  // 非法），忽略规则不豁免解析；与策略、快照一起全部校验通过后才连接
-  const jsonPlans: ({ readonly ignore: ReadonlySet<string>; readonly planned: unknown } | null)[] =
-    requests.map((request, i) => {
-      const endpoint = strategy?.get(`${request.method} ${request.path}`);
-      if (endpoint === undefined) {
-        return null;
+  // 非法），忽略规则不豁免解析；计划侧对齐位置存在时须为合法对齐数组
+  // （位置不存在允许）。与策略、快照一起全部校验通过后才连接
+  interface JsonPlan {
+    readonly endpoint: JsonCompareEndpoint;
+    readonly planned: unknown;
+    // 对齐位置 -> 计划侧已校验的 键 -> 元素 映射（仅含计划正文中存在的位置）
+    readonly plannedKeys: ReadonlyMap<string, Map<string, AlignKeyEntry>>;
+  }
+  const jsonPlans: (JsonPlan | null)[] = requests.map((request, i) => {
+    const endpoint = strategy?.get(`${request.method} ${request.path}`);
+    if (endpoint === undefined) {
+      return null;
+    }
+    const parsed = parseSemanticJson(request.plannedBody);
+    if (!parsed.ok) {
+      process.stderr.write(
+        `${APP_NAME}: replay 请求快照：请求记录快照文件 ${requestsFile} 校验失败：` +
+          `records[${i}].plannedResponse.body ${parsed.reason}` +
+          `（策略为 ${request.method} ${request.path} 选择 JSON 语义比较）\n`,
+      );
+      process.exit(2);
+    }
+    const plannedKeys = new Map<string, Map<string, AlignKeyEntry>>();
+    for (const spec of endpoint.align.values()) {
+      const checked = checkAlignTarget(parsed.value, spec);
+      if (checked === null) {
+        continue; // 位置不存在允许
       }
-      const parsed = parseSemanticJson(request.plannedBody);
-      if (!parsed.ok) {
+      if ('problem' in checked) {
         process.stderr.write(
           `${APP_NAME}: replay 请求快照：请求记录快照文件 ${requestsFile} 校验失败：` +
-            `records[${i}].plannedResponse.body ${parsed.reason}` +
-            `（策略为 ${request.method} ${request.path} 选择 JSON 语义比较）\n`,
+            `records[${i}].plannedResponse.body 的对齐位置 ${JSON.stringify(spec.pointer)}` +
+            `（键字段 ${JSON.stringify(spec.key)}）非法：正文位置 ${JSON.stringify(checked.problem.pointer)}：` +
+            `${checked.problem.reason}\n`,
         );
         process.exit(2);
       }
-      return { ignore: endpoint.ignore, planned: parsed.value };
-    });
+      plannedKeys.set(spec.pointer, checked.keys);
+    }
+    return { endpoint, planned: parsed.value, plannedKeys };
+  });
 
   // 按输入顺序保留原编号逐条重放：前一条结束才发下一条
   const results: ReplayResultEntry[] = [];
@@ -3664,6 +4005,8 @@ async function runReplay(
     // 差异（说明原因）并继续后续记录
     let bodyDiff: boolean;
     let bodyDifferences: BodyDifference[] | undefined;
+    let alignedDifferences: AlignedDifference[] | undefined;
+    let alignmentErrors: AlignProblem[] | undefined;
     let bodyError: string | undefined;
     const decoded = decodeUtf8Strict(response.body);
     const actual = decoded.ok ? parseSemanticJson(decoded.text) : decoded;
@@ -3671,11 +4014,45 @@ async function runReplay(
       bodyDiff = true;
       bodyError = `实际响应正文${actual.reason}，无法进行 JSON 语义比较`;
     } else {
-      const diffs: BodyDifference[] = [];
-      diffJsonValues(plan.planned, actual.value, plan.ignore, [], diffs);
-      bodyDiff = diffs.length > 0;
-      if (bodyDiff) {
-        bodyDifferences = diffs;
+      // 实际侧对齐校验：位置存在时须为合法对齐数组；非法记正文差异（说明位置
+      // 与原因）并继续，不算通信失败；该位置回退为按下标比较，其余位置不受影响
+      const actualKeys = new Map<string, Map<string, AlignKeyEntry>>();
+      const alignProblems: AlignProblem[] = [];
+      for (const spec of plan.endpoint.align.values()) {
+        const checked = checkAlignTarget(actual.value, spec);
+        if (checked === null) {
+          continue; // 位置不存在允许
+        }
+        if ('problem' in checked) {
+          alignProblems.push(checked.problem);
+        } else {
+          actualKeys.set(spec.pointer, checked.keys);
+        }
+      }
+      const out: BodyDiffOut = { differences: [], aligned: [] };
+      diffJsonValues(
+        plan.planned,
+        actual.value,
+        {
+          ignore: plan.endpoint.ignore,
+          align: plan.endpoint.align,
+          plannedKeys: plan.plannedKeys,
+          actualKeys,
+        },
+        [],
+        [],
+        out,
+      );
+      bodyDiff =
+        out.differences.length > 0 || out.aligned.length > 0 || alignProblems.length > 0;
+      if (out.differences.length > 0) {
+        bodyDifferences = out.differences;
+      }
+      if (out.aligned.length > 0) {
+        alignedDifferences = out.aligned;
+      }
+      if (alignProblems.length > 0) {
+        alignmentErrors = alignProblems;
       }
     }
     if (!statusDiff && !bodyDiff) {
@@ -3687,6 +4064,8 @@ async function runReplay(
         differences: { status: statusDiff, body: bodyDiff },
         // 差异项保留计划与实际正文的无损表示
         ...(bodyDifferences === undefined ? {} : { bodyDifferences }),
+        ...(alignedDifferences === undefined ? {} : { alignedDifferences }),
+        ...(alignmentErrors === undefined ? {} : { alignmentErrors }),
         ...(bodyError === undefined ? {} : { bodyError }),
         planned: {
           status: request.plannedStatus,
@@ -4826,7 +5205,8 @@ function helpText(): string {
     '  -p, --port <number>   目标端口：127.0.0.1 上的有效非零端口（必填）',
     '  -t, --timeout <ms>    每条请求的总超时（正整数毫秒，自开始连接覆盖完整收发）',
     '  -s, --strategy <file> 可选比较策略：按“方法 + 字面路径”为接口选择',
-    '                        响应正文 JSON 语义比较（可附 RFC 6901 忽略指针）；',
+    '                        响应正文 JSON 语义比较（可附 RFC 6901 忽略指针，',
+    '                        并可为互不嵌套的数组位置指定元素业务键对齐）；',
     '                        不提供时全部接口按正文原始字节比较',
     '                        本机重放快照中的请求（仅 GET/POST，禁止管理入口路径）：',
     '                        按输入顺序逐条发送，每条只尝试一次、不跟随重定向；',
