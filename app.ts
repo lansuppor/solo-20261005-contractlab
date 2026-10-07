@@ -4111,10 +4111,15 @@ async function runReplay(
 // 诊断范围（超出即整份拒绝，退出 2）：
 // - 接口必须是 POST、声明了非空 branches；
 // - 根 requestBody 必须是 object（可附 nullable）；
-// - 每个 when 指针必须是**单段** RFC 6901 指针，指向根对象**已声明的标量字段**
-//   （根指针 ""、多段指针、未声明字段、object/array 字段均拒绝）；其余字段仍
-//   完全按现有递归规则参与“合格正文”的构造与判定。空字段名、__proto__、
-//   ~0/~1 转义按原语义处理。
+// - 每个 when 指针可为多段，但每段都必须对应所在对象**已声明的自有字段**，
+//   中间节点必须是 object，终点必须是现有标量字段（根指针 ""、穿过数组或
+//   标量、未声明字段、object/array 终点均拒绝）；未被任何条件引用的字段、
+//   对象与数组仍完全按现有递归规则参与“合格正文”的构造与判定。
+//   各层空字段名、__proto__、~0/~1 转义按原语义处理。
+//
+// 共享祖先的条件作用于同一对象；可选祖先缺失、可空祖先为 null 时，深入它的
+// 条件均不匹配（不能把叶字段视为独立维度）；后代必填只在父对象存在且非 null
+// 时生效，叶值 null、祖先 null 与祖先缺失分开判定。
 //
 // 判定精确依据现有 type/enum/nullable/必填可选/额外字段语义：缺失与 null 分开、
 // 0 与 -0 等价、不转换类型；根可空时 JSON null 也参与兜底可达性判断。
@@ -4209,10 +4214,9 @@ function scalarConditionConflict(
   return null;
 }
 
-// 字段某一取值维度上的代表值。等值条件只能区分“指针处是否严格等于某常量”，
-// 故只需：各分支引用过的合格常量、null（若规则接受），以及一个与所有被引用
-// 常量都不同的合格“其余值”（枚举取未被引用的候选；无枚举时构造）。
-// 任意两个未被引用的合格值对全部条件不可区分，因此该有限域精确，不是抽样。
+// 标量维度的一个与全部被引用常量都不同的合格“其余值”（枚举取未被引用候选；
+// 无枚举时构造）。任意两个未被引用的合格值对全部等值条件不可区分，故该代表
+// 值与缺失、null 一起构成精确有限域，不是抽样；没有合格其余值时返回 undefined。
 function freshScalarValue(
   rule: Extract<BodyRule, { kind: ScalarKind }>,
   referenced: ReadonlySet<unknown>,
@@ -4242,52 +4246,95 @@ function freshScalarValue(
   }
 }
 
-interface ReachDim {
-  readonly name: string;
-  // 该字段“存在”时的代表值（必非空：标量规则总有至少一个接受值）
-  readonly values: readonly unknown[];
-  // 规则未标必填时字段还可以缺失；缺失与显式 null 是不同的维度取值
-  readonly optional: boolean;
+// 约束树节点：根对象或某个被条件经多段指针穿过的中间 object 字段。
+// 共享祖先的全部条件（作用于同一对象的字段指针）汇聚到同一节点，
+// 例如 /buyer/state 与 /buyer/flag 的 buyer 是同一节点，不能把叶字段视为
+// 互相独立的顶层维度。
+class ReachNode {
+  readonly objectRule: Extract<BodyRule, { kind: 'object' }>;
+  // 从根到本节点的对象字段名序列（根为空数组）
+  readonly path: readonly string[];
+  readonly parent: ReachNode | null;
+  // 本节点挂在父对象上的字段名（根为 null）
+  readonly fieldName: string | null;
+  // 本对象上被条件直接引用的标量子字段名 -> 该字段的标量规则
+  readonly scalarFields = new Map<string, Extract<BodyRule, { kind: ScalarKind }>>();
+  // 本对象上被条件穿过的 object 子字段名 -> 子节点
+  readonly children = new Map<string, ReachNode>();
+
+  constructor(
+    objectRule: Extract<BodyRule, { kind: 'object' }>,
+    path: readonly string[],
+    parent: ReachNode | null,
+    fieldName: string | null,
+  ) {
+    this.objectRule = objectRule;
+    this.path = path;
+    this.parent = parent;
+    this.fieldName = fieldName;
+  }
 }
 
-// 单支的条件分析：与字段规则一致时给出 字段名 -> 条件常量 的固定取值
-// （一支的全部条件都是“某标量字段等于某常量”）；矛盾时给出定位原因。
+// 钉值：某 RFC 6901 指针处必须严格等于某常量。以规范指针串为键，
+// 使不同分支在同一指针上的钉值可以比较/合并。
+interface ReachPin {
+  readonly pointer: string;
+  readonly segments: readonly string[];
+  readonly value: BranchConditionValue;
+}
+type PinMap = ReadonlyMap<string, ReachPin>;
+
+// 一支的条件分析：无矛盾时给出指针 -> 常量的钉值表；矛盾时给出按完整
+// RFC 6901 指针定位的原因。
 interface BranchAnalysis {
   readonly ok: boolean;
-  readonly pins?: ReadonlyMap<string, BranchConditionValue>;
+  readonly pins?: PinMap;
   readonly reasons?: readonly ReachReason[];
 }
 
-function analyzeBranchConditions(
-  branch: BranchSpec,
-  rootFields: ReadonlyMap<string, FieldRule>,
-): BranchAnalysis {
-  const pins = new Map<string, BranchConditionValue>();
-  const grouped = new Map<string, BranchConditionValue[]>();
+// 同一标量维度上的多个条件常量必须两两严格相等（0 与 -0 视为相等）。
+function distinctConstants(values: readonly BranchConditionValue[]): BranchConditionValue[] {
+  const distinct: BranchConditionValue[] = [];
+  for (const v of values) {
+    if (!distinct.some((d) => d === v)) {
+      distinct.push(v);
+    }
+  }
+  return distinct;
+}
+
+// 重建节点 + 叶字段名对应的规范 RFC 6901 指针
+function reachPointer(node: ReachNode, leafName: string): string {
+  return `/${[...node.path, leafName].map(escapePointerSegment).join('/')}`;
+}
+
+function analyzeBranchConditions(branch: BranchSpec, rootNode: ReachNode): BranchAnalysis {
+  // 以“所在节点 + 叶字段名”（即规范指针）为标量维度聚合一支的全部常量
+  const groups = new Map<string, {
+    node: ReachNode;
+    name: string;
+    values: BranchConditionValue[];
+  }>();
   for (const condition of branch.conditions) {
-    const name = condition.segments[0];
-    const list = grouped.get(name);
-    if (list === undefined) {
-      grouped.set(name, [condition.value]);
+    let node = rootNode;
+    for (let k = 0; k < condition.segments.length - 1; k += 1) {
+      node = node.children.get(condition.segments[k]) as ReachNode;
+    }
+    const name = condition.segments[condition.segments.length - 1];
+    const key = reachPointer(node, name);
+    const group = groups.get(key);
+    if (group === undefined) {
+      groups.set(key, { node, name, values: [condition.value] });
     } else {
-      list.push(condition.value);
+      group.values.push(condition.value);
     }
   }
 
   const reasons: ReachReason[] = [];
-  for (const [name, values] of grouped) {
-    const pointer = `/${escapePointerSegment(name)}`;
-    // 范围预检已保证字段存在且为标量规则
-    const scalarRule = (rootFields.get(name) as FieldRule).rule as Extract<BodyRule, { kind: ScalarKind }>;
-
-    // 同一指针上的多个常量必须两两严格相等（0 与 -0 视为相等）；
-    // null 与任何非 null 值互不相容。
-    const distinct: BranchConditionValue[] = [];
-    for (const v of values) {
-      if (!distinct.some((d) => d === v)) {
-        distinct.push(v);
-      }
-    }
+  const pins = new Map<string, ReachPin>();
+  for (const [pointer, group] of groups) {
+    const scalarRule = group.node.scalarFields.get(group.name) as Extract<BodyRule, { kind: ScalarKind }>;
+    const distinct = distinctConstants(group.values);
     if (distinct.length > 1) {
       reasons.push({
         pointer,
@@ -4299,7 +4346,11 @@ function analyzeBranchConditions(
     const value = distinct[0];
     const conflict = scalarConditionConflict(scalarRule, value);
     if (conflict === null) {
-      pins.set(name, value);
+      pins.set(pointer, {
+        pointer,
+        segments: [...group.node.path, group.name],
+        value,
+      });
       continue;
     }
     if (conflict.kind === 'type') {
@@ -4315,7 +4366,7 @@ function analyzeBranchConditions(
     } else {
       reasons.push({
         pointer,
-        message: '条件要求该字段为 JSON null，但字段规则不接受 null；字段缺失也不等于显式 null，不存在满足该条件的合格正文',
+        message: '条件要求该字段为 JSON null，但字段规则不接受 null；祖先或字段缺失也不等于显式 null，不存在满足该条件的合格正文',
       });
     }
   }
@@ -4323,73 +4374,133 @@ function analyzeBranchConditions(
   return reasons.length === 0 ? { ok: true, pins } : { ok: false, reasons };
 }
 
+// 标量维度：某对象节点上一个被条件引用的标量子字段的取值域。
+interface ReachDim {
+  readonly node: ReachNode;
+  readonly name: string;
+  // 字段“存在且非 null”时的代表值（钉值在求解时单独注入，不在此枚举）
+  readonly values: readonly unknown[];
+  // 显式 JSON null 是否为合格取值（与“缺失”不同）
+  readonly nullable: boolean;
+  // 字段是否可缺省
+  readonly optional: boolean;
+}
+
 // 在根对象规则与全部分支条件之上做精确的有限域可达性求解。
+//
+// 多段对象指针形成一棵约束树；每个被引用的标量字段是一个维度，取值域为
+// {缺失?，null?，各分支钉过的合格常量，一个合格其余值}。中间对象字段按布局
+// （缺失?/null?/存在）递归枚举；未被任何条件引用的字段、对象与数组都不在维度
+// 中，而以最小合格样本参与——后代必填只在父对象存在且非 null 时才生效。
+// 该有限域对等值条件与首支命中精确（不是抽样）：任意两个“其余值”对全部条件
+// 不可区分，未引用子树只影响合格性，其最小样本在任一布局下与合格性恒等。
 class ReachSolver {
-  private readonly dims: readonly ReachDim[];
   private readonly rootRule: Extract<BodyRule, { kind: 'object' }>;
   private readonly branches: readonly BranchSpec[];
+  private readonly rootNode: ReachNode;
+  private readonly dims: readonly ReachDim[];
 
-  constructor(
-    rootRule: Extract<BodyRule, { kind: 'object' }>,
-    branches: readonly BranchSpec[],
-  ) {
+  constructor(rootRule: Extract<BodyRule, { kind: 'object' }>, branches: readonly BranchSpec[]) {
     this.rootRule = rootRule;
     this.branches = branches;
+    this.rootNode = this.buildTree();
     this.dims = this.buildDims();
   }
 
-  private buildDims(): ReachDim[] {
-    // 字段首次被任何分支引用的顺序（配置顺序）
-    const names: string[] = [];
-    const referenced = new Map<string, Set<unknown>>();
+  // 按全部条件建立对象约束树（范围预检已保证字段链合法）。
+  private buildTree(): ReachNode {
+    const root = new ReachNode(this.rootRule, [], null, null);
     for (const branch of this.branches) {
       for (const condition of branch.conditions) {
-        const name = condition.segments[0];
-        if (!referenced.has(name)) {
-          referenced.set(name, new Set<unknown>());
-          names.push(name);
+        let node = root;
+        let objectRule = this.rootRule;
+        for (let k = 0; k < condition.segments.length; k += 1) {
+          const name = condition.segments[k];
+          const field = objectRule.fields.get(name) as FieldRule;
+          if (k === condition.segments.length - 1) {
+            node.scalarFields.set(name, field.rule as Extract<BodyRule, { kind: ScalarKind }>);
+          } else {
+            let child = node.children.get(name);
+            if (child === undefined) {
+              child = new ReachNode(
+                field.rule as Extract<BodyRule, { kind: 'object' }>,
+                [...node.path, name],
+                node,
+                name,
+              );
+              node.children.set(name, child);
+            }
+            node = child;
+            objectRule = field.rule as Extract<BodyRule, { kind: 'object' }>;
+          }
+        }
+      }
+    }
+    return root;
+  }
+
+  private buildDims(): ReachDim[] {
+    // 维度按首次被引用的顺序登记（分支/条件配置顺序），以规范指针去重
+    const order: Array<{ pointer: string; segments: readonly string[] }> = [];
+    const seen = new Set<string>();
+    for (const branch of this.branches) {
+      for (const condition of branch.conditions) {
+        if (!seen.has(condition.pointer)) {
+          seen.add(condition.pointer);
+          order.push({ pointer: condition.pointer, segments: condition.segments });
         }
       }
     }
 
-    const dims: ReachDim[] = [];
-    for (const name of names) {
-      const field = this.rootRule.fields.get(name) as FieldRule;
-      const scalarRule = field.rule as Extract<BodyRule, { kind: ScalarKind }>;
-      const ref = referenced.get(name) as Set<unknown>;
+    return order.map(({ pointer, segments }) => {
+      const node = this.nodeOf(segments);
+      const name = segments[segments.length - 1];
+      const scalarRule = node.scalarFields.get(name) as Extract<BodyRule, { kind: ScalarKind }>;
+      const field = node.objectRule.fields.get(name) as FieldRule;
+      const ref = new Set<unknown>();
       const values: unknown[] = [];
-      const seen = new Set<unknown>();
       const push = (v: unknown): void => {
-        if (v !== undefined && !seen.has(v)) {
-          seen.add(v);
+        if (!ref.has(v)) {
+          ref.add(v);
           values.push(v);
         }
       };
-      // 各分支引用过且合格的常量
+      // 各分支钉过且合格的常量
       for (const branch of this.branches) {
         for (const condition of branch.conditions) {
-          if (condition.segments[0] !== name) {
+          if (condition.pointer !== pointer) {
             continue;
           }
           if (scalarConditionConflict(scalarRule, condition.value) === null) {
             push(condition.value);
-            ref.add(condition.value);
           }
         }
       }
-      // null（与“缺失”不同的显式取值）
-      if (ruleAcceptsNullValue(scalarRule)) {
-        push(null);
+      // 一个与全部钉值不同的合格其余值（无则省略，如枚举候选已被全部钉住）
+      const rest = freshScalarValue(scalarRule, ref);
+      if (rest !== undefined) {
+        push(rest);
       }
-      // 一个与全部被引用常量都不同的合格值；没有时（如枚举候选已被全部引用）省略
-      push(freshScalarValue(scalarRule, ref));
-      dims.push({ name, values, optional: !field.required });
-    }
-    return dims;
+      return {
+        node,
+        name,
+        values,
+        nullable: ruleAcceptsNullValue(scalarRule),
+        optional: !field.required,
+      };
+    });
   }
 
-  // 一支条件是否被正文全部满足：取不到值（缺失/无法遍历）即不匹配；
-  // 严格相等、不做类型转换（resolvePointer 视空字段名与 __proto__ 为普通字段）
+  private nodeOf(segments: readonly string[]): ReachNode {
+    let node = this.rootNode;
+    for (let k = 0; k < segments.length - 1; k += 1) {
+      node = node.children.get(segments[k]) as ReachNode;
+    }
+    return node;
+  }
+
+  // 一支条件是否被正文全部满足：沿指针取值，取不到（祖先缺失、祖先为 null、
+  // 在标量/数组上深入、字段缺失）即不匹配；严格相等、不做类型转换。
   private satisfies(conditions: readonly BranchCondition[], value: unknown): boolean {
     for (const condition of conditions) {
       const actual = resolvePointer(value, condition.segments);
@@ -4409,10 +4520,11 @@ class ReachSolver {
     return null;
   }
 
-  // 从必填字段最小样本开始构造根对象（字段名含空名/__proto__ 时用无原型对象）
-  private baseObject(): Record<string, unknown> {
+  // 某节点对象的最小合格样本：含全部必填字段（含未引用的对象/数组/标量字段，
+  // 递归取最小合格值）；字段名可能为 "" 或 "__proto__"，用无原型对象。
+  private baseObject(node: ReachNode): Record<string, unknown> {
     const obj: Record<string, unknown> = Object.create(null);
-    for (const [name, field] of this.rootRule.fields) {
+    for (const [name, field] of node.objectRule.fields) {
       if (field.required) {
         obj[name] = sampleValue(field.rule);
       }
@@ -4420,77 +4532,194 @@ class ReachSolver {
     return obj;
   }
 
-  // 按维度递归枚举合格正文，返回第一个让 predicate 成立的值；全部不成立返回 NO_WITNESS。
-  // pins 固定某些字段（某支的等值条件），其余维度取代表值——域对等值条件精确。
+  private allNodes(): readonly ReachNode[] {
+    const out: ReachNode[] = [];
+    const walk = (node: ReachNode): void => {
+      out.push(node);
+      for (const child of node.children.values()) {
+        walk(child);
+      }
+    };
+    walk(this.rootNode);
+    return out;
+  }
+
+  // 按钉值表与谓词枚举合格根对象，返回第一个满足谓词者；都不满足返回 NO_WITNESS。
   private findObject(
-    pins: ReadonlyMap<string, BranchConditionValue>,
+    pins: PinMap,
     predicate: (value: unknown) => boolean,
   ): Record<string, unknown> | typeof NO_WITNESS {
-    const dims = this.dims.filter((dim) => !pins.has(dim.name));
-    const base = this.baseObject();
-    for (const [name, value] of pins) {
-      base[name] = value;
+    // 每个约束节点一个持久工作对象（节点“存在”布局时挂到父对象对应字段上）
+    const work = new Map<ReachNode, Record<string, unknown>>();
+    for (const node of this.allNodes()) {
+      work.set(node, this.baseObject(node));
     }
+    const rootObj = work.get(this.rootNode) as Record<string, unknown>;
+
+    // 中间对象节点（不含根），按深度从小到大枚举/物化（父先于子）
+    const innerNodes = this.allNodes().slice(1);
+    innerNodes.sort((a, b) => a.path.length - b.path.length);
+    // 每节点布局数：可选多一个“缺失”，可空多一个“null”，恒有“存在”。
+    // 必填不可空：仅存在；必填可空：null/存在；可选不可空：缺失/存在；
+    // 可选可空：缺失/null/存在。
+    const layouts = innerNodes.map((node) => {
+      const field = (node.parent as ReachNode).objectRule.fields.get(node.fieldName as string) as FieldRule;
+      return (field.required ? 0 : 1) + (ruleAcceptsNullValue(field.rule) ? 1 : 0) + 1;
+    });
+    const state = innerNodes.map(() => 0);
+    const existsLayout = (idx: number): number => layouts[idx] - 1;
+    const nullLayout = (idx: number): number => {
+      const node = innerNodes[idx];
+      const field = (node.parent as ReachNode).objectRule.fields.get(node.fieldName as string) as FieldRule;
+      // null 布局紧挨在存在之前（可缺失时最前为缺失）
+      return ruleAcceptsNullValue(field.rule) ? layouts[idx] - 2 : -1;
+    };
+
+    // 按当前布局把全部中间节点自顶向下物化到父对象，并登记“存在且祖先链存在”
+    // 的活动节点。每轮都显式删除/写入，避免上一轮的陈旧挂载在父对象重新存在时
+    // 复活。
+    const active = new Set<ReachNode>();
+    const materialize = (): void => {
+      active.clear();
+      for (let idx = 0; idx < innerNodes.length; idx += 1) {
+        const node = innerNodes[idx];
+        const parentObj = work.get(node.parent as ReachNode) as Record<string, unknown>;
+        const name = node.fieldName as string;
+        const layout = state[idx];
+        if (layout === existsLayout(idx)) {
+          parentObj[name] = work.get(node) as Record<string, unknown>;
+          if (node.parent === this.rootNode || active.has(node.parent)) {
+            active.add(node);
+          }
+        } else if (layout === nullLayout(idx)) {
+          parentObj[name] = null;
+        } else {
+          delete parentObj[name];
+        }
+      }
+    };
+
+    const chainActive = (node: ReachNode): boolean => {
+      let cur: ReachNode | null = node;
+      while (cur !== this.rootNode && cur !== null) {
+        if (!active.has(cur)) {
+          return false;
+        }
+        cur = cur.parent;
+      }
+      return true;
+    };
+
+    // 钉值涉及的节点（叶对象自身或其祖先）必须取“存在”布局
+    const pinnedNodePaths: Array<readonly string[]> = [];
+    for (const pin of pins.values()) {
+      pinnedNodePaths.push(pin.segments.slice(0, -1));
+    }
+    const nodeForcedExists = (node: ReachNode): boolean =>
+      pinnedNodePaths.some(
+        (p) => p.length >= node.path.length && node.path.every((seg, i) => seg === p[i]),
+      );
 
     const problems: StructureProblem[] = [];
-    const visit = (index: number): Record<string, unknown> | typeof NO_WITNESS => {
-      if (index === dims.length) {
-        problems.length = 0;
-        checkRule(this.rootRule, base, '', problems);
-        if (problems.length === 0 && predicate(base)) {
-          return base;
-        }
-        return NO_WITNESS;
+    const check = (): Record<string, unknown> | typeof NO_WITNESS => {
+      materialize();
+      problems.length = 0;
+      checkRule(this.rootRule, rootObj, '', problems);
+      if (problems.length === 0 && predicate(rootObj)) {
+        return rootObj;
       }
-      const dim = dims[index];
-      if (dim.optional) {
-        // 可选字段先尝试缺失（缺失与显式 null 分开）
-        delete base[dim.name];
-        const found = visit(index + 1);
-        if (found !== NO_WITNESS) {
-          return found;
-        }
+      return NO_WITNESS;
+    };
+
+    // 标量维度状态：0 起；可选时首态为缺失，可空时紧接 null，之后依次 values。
+    const dimCount = (dim: ReachDim): number =>
+      (dim.optional ? 1 : 0) + (dim.nullable ? 1 : 0) + dim.values.length;
+    const missingState = (dim: ReachDim): number => (dim.optional ? 0 : -1);
+    const nullState = (dim: ReachDim): number => (dim.nullable ? (dim.optional ? 1 : 0) : -1);
+    const valueOffset = (dim: ReachDim): number => (dim.optional ? 1 : 0) + (dim.nullable ? 1 : 0);
+
+    const pinAt = (dim: ReachDim): BranchConditionValue | undefined =>
+      pins.get(reachPointer(dim.node, dim.name))?.value;
+
+    const enumDims = (dimIdx: number): Record<string, unknown> | typeof NO_WITNESS => {
+      if (dimIdx === this.dims.length) {
+        return check();
       }
-      for (const value of dim.values) {
-        base[dim.name] = value;
-        const found = visit(index + 1);
+      const dim = this.dims[dimIdx];
+      const obj = work.get(dim.node) as Record<string, unknown>;
+      const pinned = pinAt(dim);
+      // 祖先链不“存在”：该维取值无意义（叶字段不可达），只走一态；
+      // 钉值也不会写入，谓词（首支命中）自会排除需要该条件成立的情形。
+      if (!chainActive(dim.node)) {
+        return enumDims(dimIdx + 1);
+      }
+      if (pinned !== undefined) {
+        obj[dim.name] = pinned;
+        return enumDims(dimIdx + 1);
+      }
+      for (let s = 0; s < dimCount(dim); s += 1) {
+        if (s === missingState(dim)) {
+          delete obj[dim.name];
+        } else if (s === nullState(dim)) {
+          obj[dim.name] = null;
+        } else {
+          obj[dim.name] = dim.values[s - valueOffset(dim)];
+        }
+        const found = enumDims(dimIdx + 1);
         if (found !== NO_WITNESS) {
           return found;
         }
       }
       return NO_WITNESS;
     };
-    return visit(0);
+
+    const enumInner = (idx: number): Record<string, unknown> | typeof NO_WITNESS => {
+      if (idx === innerNodes.length) {
+        // 全部中间节点布局已定：先物化并登记活动节点，标量维度再据此判定
+        // 其祖先链是否“存在”。
+        materialize();
+        return enumDims(0);
+      }
+      const node = innerNodes[idx];
+      const forcedExists = nodeForcedExists(node);
+      for (let layout = 0; layout < layouts[idx]; layout += 1) {
+        // 钉值在该节点（或其后代）上时，缺失/null 布局不可能满足谓词，直接跳过
+        if (forcedExists && layout !== existsLayout(idx)) {
+          continue;
+        }
+        state[idx] = layout;
+        const found = enumInner(idx + 1);
+        if (found !== NO_WITNESS) {
+          return found;
+        }
+      }
+      return NO_WITNESS;
+    };
+
+    return enumInner(0);
   }
 
-  // 找一份合格正文：根可空时先尝试 JSON null（分支字段指针在 null 上取不到值，
-  // 任何分支都不命中 null），再在对象域上求解；pins 非空时只能是对象正文。
-  // 找到返回该 JSON 值（可能就是 null），找不到返回 NO_WITNESS。
-  findWitness(
-    pins: ReadonlyMap<string, BranchConditionValue>,
-    predicate: (value: unknown) => boolean,
-  ): Witness {
+  // 找一份合格正文：根可空且无钉值时先尝试 JSON null（任何字段指针在 null 上
+  // 都取不到值、不命中分支），再在对象域上求解；有钉值时只能是对象正文。
+  findWitness(pins: PinMap, predicate: (value: unknown) => boolean): Witness {
     if (pins.size === 0 && ruleAcceptsNullValue(this.rootRule)) {
       if (predicate(null)) {
         return null;
       }
     }
-    const obj = this.findObject(pins, predicate);
-    return obj;
+    return this.findObject(pins, predicate);
   }
 
-  // 合并两支的固定取值；同名字段常量不同（严格相等）则不存在共同正文
-  private mergePins(
-    a: ReadonlyMap<string, BranchConditionValue>,
-    b: ReadonlyMap<string, BranchConditionValue>,
-  ): Map<string, BranchConditionValue> | null {
+  // 两支钉值是否相容：同一规范指针上常量严格相等（0 与 -0 视为相等）才存在
+  // 同时满足两支的正文；不同指针恒相容（含共享祖先下的兄弟字段、不同祖先）。
+  private mergePins(a: PinMap, b: PinMap): Map<string, ReachPin> | null {
     const merged = new Map(a);
-    for (const [name, value] of b) {
-      const existing = merged.get(name);
-      if (existing !== undefined && existing !== value) {
+    for (const [key, pin] of b) {
+      const existing = merged.get(key);
+      if (existing !== undefined && existing.value !== pin.value) {
         return null;
       }
-      merged.set(name, value);
+      merged.set(key, pin);
     }
     return merged;
   }
@@ -4505,7 +4734,7 @@ class ReachSolver {
   }
 
   solve(routePath: string): { branches: BranchReach[]; fallback: FallbackReach } {
-    const analyses = this.branches.map((branch) => analyzeBranchConditions(branch, this.rootRule.fields));
+    const analyses = this.branches.map((branch) => analyzeBranchConditions(branch, this.rootNode));
 
     const branchResults: BranchReach[] = [];
     for (let i = 0; i < this.branches.length; i += 1) {
@@ -4534,7 +4763,7 @@ class ReachSolver {
         if (merged === null) {
           continue;
         }
-        // 同时满足 i 与 j、且 j 之前所有分支都不命中的合格正文
+        // 同时满足 i 与 j、且 j 之前所有分支都不命中（首支恰为 j）的合格正文
         const witness = this.findWitness(merged, (value) => this.firstMatch(value) === j);
         if (witness !== NO_WITNESS) {
           coveredBy.push(this.branches[j].id);
@@ -4556,16 +4785,17 @@ class ReachSolver {
     if (fallbackBody !== NO_WITNESS) {
       fallback = { status: 'reachable', example: this.example(fallbackBody, routePath) };
     } else {
+      const noWitness = NO_WITNESS;
       const coveredBy = this.branches
         .map((branch, j) => {
           const analysis = analyses[j];
           if (!analysis.ok || analysis.pins === undefined) {
-            return NO_WITNESS;
+            return noWitness;
           }
           const witness = this.findWitness(analysis.pins, (value) => this.firstMatch(value) === j);
-          return witness !== NO_WITNESS ? branch.id : NO_WITNESS;
+          return witness !== noWitness ? branch.id : noWitness;
         })
-        .filter((id): id is string => id !== NO_WITNESS);
+        .filter((id): id is string => id !== noWitness);
       fallback = {
         status: 'covered',
         coveredBy,
@@ -4610,31 +4840,43 @@ function selectReachEndpoint(
     );
   }
 
-  // when 指针范围预检：单段、指向根对象已声明的标量字段（其他字段仍按递归规则处理）
-  const rootFields = endpoint.bodyRule.fields;
+  // when 指针范围预检：可为多段，但每段都必须是“所在对象已声明的自有字段”，
+  // 中间节点必须为 object，终点必须是现有标量规则。根指针、穿过数组或标量、
+  // 未声明字段、对象/数组终点都整份拒绝（其他未引用字段仍按递归规则处理）。
   for (let b = 0; b < endpoint.branches.length; b += 1) {
     const branch = endpoint.branches[b];
     for (const condition of branch.conditions) {
       const condWhere = `${where}.branches[${b}].when[${JSON.stringify(condition.pointer)}]`;
-      if (condition.segments.length !== 1) {
+      if (condition.segments.length === 0) {
         throw new ReachError(
-          `${condWhere} 指针 ${JSON.stringify(condition.pointer)} 含 ${condition.segments.length} 段：` +
-            'reach 仅支持单段 RFC 6901 指针（指向根对象的已声明标量字段），根指针与深层指针超出诊断范围',
+          `${condWhere} 是根指针 ""：reach 的条件指针必须指向对象字段（至少一段），根指针超出诊断范围`,
         );
       }
-      const name = condition.segments[0];
-      const field = rootFields.get(name);
-      if (!field) {
-        throw new ReachError(
-          `${condWhere} 指向根对象未声明字段 ${JSON.stringify(name)}：` +
-            'reach 仅诊断指向已声明字段的条件（未声明字段仍按 additionalProperties 等现有规则处理）',
-        );
-      }
-      if (field.rule.kind === 'object' || field.rule.kind === 'array') {
-        throw new ReachError(
-          `${condWhere} 指向字段 ${JSON.stringify(name)}，其规则类型为 "${field.rule.kind}"：` +
-            'reach 仅支持指向标量字段的条件，对象/数组字段超出诊断范围',
-        );
+      let objectRule: Extract<BodyRule, { kind: 'object' }> = endpoint.bodyRule;
+      for (let k = 0; k < condition.segments.length; k += 1) {
+        const name = condition.segments[k];
+        const isLast = k === condition.segments.length - 1;
+        const field = objectRule.fields.get(name);
+        if (!field) {
+          throw new ReachError(
+            `${condWhere} 的第 ${k} 段 ${JSON.stringify(name)} 不是所在对象的已声明字段：` +
+              'reach 仅诊断沿已声明自有字段的条件（未声明字段仍按 additionalProperties 等现有规则处理）',
+          );
+        }
+        if (!isLast) {
+          if (field.rule.kind !== 'object') {
+            throw new ReachError(
+              `${condWhere} 的第 ${k} 段 ${JSON.stringify(name)} 规则类型为 "${field.rule.kind}"：` +
+                'reach 的多段指针只能穿过 object 字段（穿过数组或标量超出诊断范围）',
+            );
+          }
+          objectRule = field.rule;
+        } else if (field.rule.kind === 'object' || field.rule.kind === 'array') {
+          throw new ReachError(
+            `${condWhere} 的终点字段 ${JSON.stringify(name)} 规则类型为 "${field.rule.kind}"：` +
+              'reach 仅支持终点为标量字段的条件，对象/数组终点超出诊断范围',
+          );
+        }
       }
     }
   }

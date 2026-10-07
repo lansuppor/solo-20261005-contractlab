@@ -465,7 +465,7 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
         responses: [resp('X')],
         branches: [{ id: 'r', when: { '': 'x' }, responses: [resp('X')] }],
       },
-      // 多段指针
+      // 多段指针穿过数组
       {
         method: 'POST',
         path: '/deep',
@@ -477,6 +477,20 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
         responses: [resp('X')],
         branches: [{ id: 'd', when: { '/tags/0': 'x' }, responses: [resp('X')] }],
       },
+      // 多段指针穿过对象再穿数组（中间 object 合法，数组段拒绝）
+      {
+        method: 'POST',
+        path: '/deep2',
+        requestBody: {
+          type: 'object',
+          fields: {
+            m: { type: 'object', fields: { tags: { type: 'array', items: { type: 'string' } } }, additionalProperties: false },
+          },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'd', when: { '/m/tags/0': 'x' }, responses: [resp('X')] }],
+      },
       // 根指针（条件值合法，但根指针为零段，超出范围）
       {
         method: 'POST',
@@ -485,7 +499,7 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
         responses: [resp('X')],
         branches: [{ id: 'r', when: { '': 'x' }, responses: [resp('X')] }],
       },
-      // 指向未声明字段
+      // 单段指向未声明字段
       {
         method: 'POST',
         path: '/undeclared',
@@ -493,7 +507,31 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
         responses: [resp('X')],
         branches: [{ id: 'u', when: { '/missing': 'x' }, responses: [resp('X')] }],
       },
-      // 指向 object 字段
+      // 多段指针的中间段指向未声明字段
+      {
+        method: 'POST',
+        path: '/undeclared-mid',
+        requestBody: {
+          type: 'object',
+          fields: { m: { type: 'object', fields: { z: { type: 'string' } }, additionalProperties: false } },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'u', when: { '/m/nope/z': 'x' }, responses: [resp('X')] }],
+      },
+      // 多段指针穿过标量字段
+      {
+        method: 'POST',
+        path: '/through-scalar',
+        requestBody: {
+          type: 'object',
+          fields: { k: { type: 'string' }, m: { type: 'object', fields: { z: { type: 'string' } }, additionalProperties: false } },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'u', when: { '/k/z': 'x' }, responses: [resp('X')] }],
+      },
+      // 单段终点为 object 字段
       {
         method: 'POST',
         path: '/obj-field',
@@ -505,6 +543,42 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
         responses: [resp('X')],
         branches: [{ id: 'o', when: { '/box': null }, responses: [resp('X')] }],
       },
+      // 多段终点为 object 字段
+      {
+        method: 'POST',
+        path: '/obj-end',
+        requestBody: {
+          type: 'object',
+          fields: { m: { type: 'object', fields: { box: { type: 'object', fields: {} } }, additionalProperties: false } },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'o', when: { '/m/box': null }, responses: [resp('X')] }],
+      },
+      // 终点为 array 字段
+      {
+        method: 'POST',
+        path: '/arr-end',
+        requestBody: {
+          type: 'object',
+          fields: { m: { type: 'object', fields: { tags: { type: 'array', items: { type: 'string' } } }, additionalProperties: false } },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'a', when: { '/m/tags': null }, responses: [resp('X')] }],
+      },
+      // 多段指针沿 object 链指向已声明标量字段：在范围内，不应拒绝
+      {
+        method: 'POST',
+        path: '/nested-ok',
+        requestBody: {
+          type: 'object',
+          fields: { m: { type: 'object', fields: { z: { type: 'string' } }, additionalProperties: false } },
+          additionalProperties: false,
+        },
+        responses: [resp('X')],
+        branches: [{ id: 'n', when: { '/m/z': 'x' }, responses: [resp('X')] }],
+      },
     ],
   };
   const scopeFile = await writeConfig(dir, 'scope.json', outOfScope);
@@ -513,10 +587,15 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
     { name: 'GET 路径', path: '/g', expect: /不存在 POST 接口/ },
     { name: '无分支接口', path: '/no-branches', expect: /未声明 branches/ },
     { name: '标量根规则', path: '/scalar-root', expect: /根 requestBody 为 object/ },
-    { name: '多段指针', path: '/deep', expect: /单段/ },
-    { name: '根指针', path: '/root-ptr', expect: /单段/ },
+    { name: '穿过多段数组', path: '/deep', expect: /只能穿过 object/ },
+    { name: '对象后穿数组', path: '/deep2', expect: /只能穿过 object/ },
+    { name: '根指针', path: '/root-ptr', expect: /根指针/ },
     { name: '未声明字段', path: '/undeclared', expect: /未声明字段/ },
-    { name: 'object 字段', path: '/obj-field', expect: /标量字段/ },
+    { name: '中间段未声明字段', path: '/undeclared-mid', expect: /未声明字段/ },
+    { name: '穿过标量字段', path: '/through-scalar', expect: /只能穿过 object/ },
+    { name: 'object 终点', path: '/obj-field', expect: /标量字段/ },
+    { name: '多段 object 终点', path: '/obj-end', expect: /标量字段/ },
+    { name: 'array 终点', path: '/arr-end', expect: /标量字段/ },
     { name: '路径不存在', path: '/no-such', expect: /不存在 POST 接口/ },
   ];
   for (const c of cases) {
@@ -525,6 +604,12 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
     assert.equal(r.stdout, '', `${c.name} stdout 必须为空`);
     assert.ok(c.expect.test(r.stderr), `${c.name} stderr 应可定位，实际：${r.stderr}`);
   }
+
+  // 沿 object 链的多段指针在范围内：正常输出报告、退出 0（该支可达、兜底可达）
+  const nestedOk = await runReach(scopeFile, '/nested-ok');
+  assert.equal(nestedOk.code, 0, nestedOk.stderr);
+  const nestedReport = JSON.parse(nestedOk.stdout) as ReachReport;
+  assert.equal(nestedReport.branches[0]?.status, 'reachable');
 
   // 参数错误
   const missingPath = await runCli(['reach', '--config', scopeFile]);
@@ -569,6 +654,314 @@ test('范围与输入错误：退出 2、stderr 可定位、stdout 为空', { ti
   assert.equal(invalid.code, 2, '整份场景严格校验失败时不得输出报告');
   assert.equal(invalid.stdout, '');
   assert.ok(invalid.stderr.includes('invalid.json'));
+});
+
+// ---------------------------------------------------------------------------
+// 场景七：题述 buyer 例——祖先形态变化（可选可空 -> 后支可达；必填不可空 -> 共同遮挡）
+// ---------------------------------------------------------------------------
+
+function buyerConfig(ancestor: { required?: boolean; nullable?: boolean }): unknown {
+  return {
+    endpoints: [
+      {
+        method: 'POST',
+        path: '/orders',
+        requestBody: {
+          type: 'object',
+          fields: {
+            buyer: {
+              type: 'object',
+              ...(ancestor.required ? { required: true } : {}),
+              ...(ancestor.nullable ? { nullable: true } : {}),
+              fields: { state: { type: 'string', enum: ['a', 'b'], required: true } },
+              additionalProperties: false,
+            },
+            flag: { type: 'boolean' },
+          },
+          additionalProperties: false,
+        },
+        responses: [resp('FB')],
+        branches: [
+          { id: 'buyer-a', when: { '/buyer/state': 'a' }, responses: [resp('BR-A')] },
+          { id: 'buyer-b', when: { '/buyer/state': 'b' }, responses: [resp('BR-B')] },
+          { id: 'flag', when: { '/flag': true }, responses: [resp('BR-FLAG')] },
+        ],
+      },
+    ],
+  };
+}
+
+test('祖先可选可空：buyer 缺失/null 的 flag:true 正文使后支可达；样例真实命中', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const file = await writeConfig(dir, 'scenes.json', buyerConfig({}));
+  const server = await startServer(file);
+  t.after(server.close);
+
+  const result = await runReach(file, '/orders');
+  assert.equal(result.code, 0, result.stderr);
+  const report = JSON.parse(result.stdout) as ReachReport;
+  const byId = new Map(report.branches.map((b) => [b.id, b]));
+
+  for (const id of ['buyer-a', 'buyer-b', 'flag']) {
+    const branch = byId.get(id) as ReachReport['branches'][number];
+    assert.equal(branch.status, 'reachable', `${id} 应可达`);
+    await assertExampleSelects(server, branch.example as RawRequest, { kind: 'branch', id });
+  }
+  // 后支样例正是 buyer 缺失的 {"flag":true}
+  assert.equal((byId.get('flag') as ReachReport['branches'][number]).example?.body, '{"flag":true}');
+
+  // buyer 缺失 + flag:true：真实服务选 flag
+  const missing = await probe(server, '/orders', '{"flag":true}');
+  assert.deepEqual(missing.selection, { kind: 'branch', id: 'flag' });
+
+  // buyer 为 null + flag:true（此配置 buyer 不可空）：真实服务 400，不进分支
+  const buyerNull = await probe(server, '/orders', '{"buyer":null,"flag":true}');
+  assert.equal(buyerNull.status, 400);
+  assert.equal(buyerNull.selection, null);
+
+  // buyer 存在但 state 不匹配枚举时不可能合格；state a/b + flag true 分别先命中前两支
+  const aFlag = await probe(server, '/orders', '{"buyer":{"state":"a"},"flag":true}');
+  assert.deepEqual(aFlag.selection, { kind: 'branch', id: 'buyer-a' });
+  const bFlag = await probe(server, '/orders', '{"buyer":{"state":"b"},"flag":true}');
+  assert.deepEqual(bFlag.selection, { kind: 'branch', id: 'buyer-b' });
+});
+
+test('祖先必填不可空：后支被前两支经共享祖先并集共同遮挡；样例补全 buyer', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const file = await writeConfig(dir, 'scenes.json', buyerConfig({ required: true }));
+  const server = await startServer(file);
+  t.after(server.close);
+
+  const result = await runReach(file, '/orders');
+  assert.equal(result.code, 1, '存在 covered 分支，退出 1');
+  const report = JSON.parse(result.stdout) as ReachReport;
+  const byId = new Map(report.branches.map((b) => [b.id, b]));
+
+  const a = byId.get('buyer-a') as ReachReport['branches'][number];
+  const b = byId.get('buyer-b') as ReachReport['branches'][number];
+  assert.equal(a.status, 'reachable');
+  assert.equal(b.status, 'reachable');
+  for (const branch of [a, b]) {
+    await assertExampleSelects(server, branch.example as RawRequest, { kind: 'branch', id: branch.id });
+  }
+
+  const flag = byId.get('flag') as ReachReport['branches'][number];
+  assert.equal(flag.status, 'covered');
+  assert.deepEqual(flag.coveredBy, ['buyer-a', 'buyer-b']);
+  assert.equal('example' in flag, false, '不可达分支不给样例');
+
+  // 真实核对：缺 buyer 的 flag:true 现在 400（buyer 必填）；带 buyer 必先命中前两支
+  const noBuyer = await probe(server, '/orders', '{"flag":true}');
+  assert.equal(noBuyer.status, 400);
+  assert.equal(noBuyer.selection, null);
+  const aFlag = await probe(server, '/orders', '{"buyer":{"state":"a"},"flag":true}');
+  assert.deepEqual(aFlag.selection, { kind: 'branch', id: 'buyer-a' });
+  const bFlag = await probe(server, '/orders', '{"buyer":{"state":"b"},"flag":true}');
+  assert.deepEqual(bFlag.selection, { kind: 'branch', id: 'buyer-b' });
+});
+
+test('祖先可选且可空：buyer:null + flag:true 使后支可达；null 祖先上深层条件不匹配', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const file = await writeConfig(dir, 'scenes.json', buyerConfig({ nullable: true }));
+  const server = await startServer(file);
+  t.after(server.close);
+
+  const result = await runReach(file, '/orders');
+  assert.equal(result.code, 0, result.stderr);
+  const report = JSON.parse(result.stdout) as ReachReport;
+  const byId = new Map(report.branches.map((b) => [b.id, b]));
+  assert.equal((byId.get('flag') as ReachReport['branches'][number]).status, 'reachable');
+
+  // buyer:null + flag:true：buyer 显式 null 合法，深层指针取不到值，只命中 flag
+  const buyerNull = await probe(server, '/orders', '{"buyer":null,"flag":true}');
+  assert.equal(buyerNull.status, 200);
+  assert.deepEqual(buyerNull.selection, { kind: 'branch', id: 'flag' });
+  assert.equal(buyerNull.respBody, 'BR-FLAG');
+
+  // 仅 buyer:null（无 flag）：深层两支都不匹配，落兜底
+  const onlyNull = await probe(server, '/orders', '{"buyer":null}');
+  assert.deepEqual(onlyNull.selection, { kind: 'fallback' });
+});
+
+// ---------------------------------------------------------------------------
+// 场景八：多层共享祖先 + 必填兄弟字段补全 + 祖先内叶字段遮挡 vs 顶层叶字段逃逸
+// ---------------------------------------------------------------------------
+
+test('多层共享祖先：深层叶字段被并集遮挡、样例补全各层必填兄弟；顶层兄弟字段可达', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const config: unknown = {
+    endpoints: [
+      {
+        method: 'POST',
+        path: '/deep',
+        requestBody: {
+          type: 'object',
+          fields: {
+            top: { type: 'integer', required: true },
+            a: {
+              type: 'object',
+              fields: {
+                sib: { type: 'integer', required: true },
+                b: {
+                  type: 'object',
+                  required: true,
+                  fields: {
+                    state: { type: 'string', enum: ['a', 'b'], required: true },
+                    f: { type: 'boolean' },
+                  },
+                  additionalProperties: false,
+                },
+              },
+              additionalProperties: false,
+            },
+            other: { type: 'boolean' },
+          },
+          additionalProperties: false,
+        },
+        responses: [resp('FB')],
+        branches: [
+          { id: 'xa', when: { '/a/b/state': 'a' }, responses: [resp('XA')] },
+          { id: 'xb', when: { '/a/b/state': 'b' }, responses: [resp('XB')] },
+          { id: 'inner-f', when: { '/a/b/f': true }, responses: [resp('IF')] },
+          { id: 'top-other', when: { '/other': true }, responses: [resp('TO')] },
+        ],
+      },
+    ],
+  };
+  const file = await writeConfig(dir, 'scenes.json', config);
+  const server = await startServer(file);
+  t.after(server.close);
+
+  const result = await runReach(file, '/deep');
+  assert.equal(result.code, 1, 'inner-f 被遮挡，退出 1');
+  const report = JSON.parse(result.stdout) as ReachReport;
+  const byId = new Map(report.branches.map((b) => [b.id, b]));
+
+  // xa/xb 可达：样例补全 top、a.sib，且含必要祖先 a/b
+  for (const id of ['xa', 'xb']) {
+    const branch = byId.get(id) as ReachReport['branches'][number];
+    assert.equal(branch.status, 'reachable');
+    const body = JSON.parse(branch.example?.body as string);
+    assert.equal(body.top, 0, '补全顶层必填兄弟 top');
+    assert.equal(body.a.sib, 0, '补全中间层必填兄弟 a.sib');
+    assert.ok(body.a.b && typeof body.a.b === 'object', '补全必要祖先 a.b');
+    await assertExampleSelects(server, branch.example as RawRequest, { kind: 'branch', id });
+  }
+
+  // inner-f 钉的是共享祖先 a.b 内的叶字段：a.b 必填且 state 必填枚举 a/b，
+  // 任何满足它的正文必先命中 xa/xb —— 共同遮挡
+  const innerF = byId.get('inner-f') as ReachReport['branches'][number];
+  assert.equal(innerF.status, 'covered');
+  assert.deepEqual(innerF.coveredBy, ['xa', 'xb']);
+  assert.equal('example' in innerF, false);
+
+  // 顶层 other 不在 a.b 祖先内：a 可选，{top,other:true} 逃出深层遮挡
+  const topOther = byId.get('top-other') as ReachReport['branches'][number];
+  assert.equal(topOther.status, 'reachable');
+  const otherBody = JSON.parse(topOther.example?.body as string);
+  assert.equal(otherBody.other, true);
+  assert.equal(Object.prototype.hasOwnProperty.call(otherBody, 'a'), false, '样例不带可选祖先 a');
+  await assertExampleSelects(server, topOther.example as RawRequest, { kind: 'branch', id: 'top-other' });
+
+  // 真实核对 inner-f 的两类满足正文分别先命中 xa/xb
+  const hitA = await probe(server, '/deep', '{"top":1,"a":{"sib":2,"b":{"state":"a","f":true}}}');
+  assert.deepEqual(hitA.selection, { kind: 'branch', id: 'xa' });
+  const hitB = await probe(server, '/deep', '{"top":1,"a":{"sib":2,"b":{"state":"b","f":true}}}');
+  assert.deepEqual(hitB.selection, { kind: 'branch', id: 'xb' });
+
+  // 兜底可达：a 缺失时没有深层分支，other 也不带
+  assert.equal(report.fallback.status, 'reachable');
+  const fbBody = JSON.parse(report.fallback.example?.body as string);
+  assert.deepEqual(fbBody, { top: 0 });
+  await assertExampleSelects(server, report.fallback.example as RawRequest, { kind: 'fallback' });
+});
+
+// ---------------------------------------------------------------------------
+// 场景九：深层特殊字段名、深层矛盾定位、叶 null 与祖先 null 分开
+// ---------------------------------------------------------------------------
+
+test('深层特殊字段名、深层矛盾定位、叶 null 与祖先缺失/null 分开', { timeout: 30_000 }, async (t) => {
+  const dir = await makeTempDir(t);
+  const fields: Record<string, unknown> = Object.create(null);
+  // 根空名字段，其下 __proto__ 为枚举字符串（内层对象也须无原型并赋值，
+  // 不能在对象字面量中写 __proto__——那会设置原型而非自有字段）
+  const emptyFields: Record<string, unknown> = Object.create(null);
+  emptyFields.__proto__ = { type: 'string', enum: ['p', 'q'] };
+  fields[''] = {
+    type: 'object',
+    fields: emptyFields,
+    additionalProperties: false,
+  };
+  // a 可空：其下标量 s 不可空；深层 z 为 integer
+  fields.a = {
+    type: 'object',
+    nullable: true,
+    fields: {
+      s: { type: 'string', enum: ['x', 'y'] },
+      deep: { type: 'object', fields: { z: { type: 'integer', required: true } }, additionalProperties: false },
+    },
+    additionalProperties: false,
+  };
+  const config: unknown = {
+    endpoints: [
+      {
+        method: 'POST',
+        path: '/e',
+        requestBody: { type: 'object', fields, additionalProperties: false },
+        responses: [resp('FB')],
+        branches: [
+          { id: 'empty-proto', when: { '//__proto__': 'p' }, responses: [resp('EP')] },
+          { id: 'both', when: { '/a/s': 'x', '/a/deep/z': 5 }, responses: [resp('BOTH')] },
+          { id: 'leaf-null', when: { '/a/s': null }, responses: [resp('LN')] },
+          { id: 'bad-type', when: { '/a/deep/z': 1.5 }, responses: [resp('BT')] },
+        ],
+      },
+    ],
+  };
+  const file = await writeConfig(dir, 'scenes.json', config);
+  const server = await startServer(file);
+  t.after(server.close);
+
+  const result = await runReach(file, '/e');
+  assert.equal(result.code, 1);
+  const report = JSON.parse(result.stdout) as ReachReport;
+  const byId = new Map(report.branches.map((b) => [b.id, b]));
+
+  // 空名祖先下的 __proto__ 叶字段：指针 //__proto__，样例真实命中
+  const ep = byId.get('empty-proto') as ReachReport['branches'][number];
+  assert.equal(ep.status, 'reachable');
+  assert.equal(ep.example?.body, '{"":{"__proto__":"p"}}');
+  await assertExampleSelects(server, ep.example as RawRequest, { kind: 'branch', id: 'empty-proto' });
+
+  // 一支钉两个共享祖先 a 下的叶字段：样例补全 a、a.deep 与必填 z
+  const both = byId.get('both') as ReachReport['branches'][number];
+  assert.equal(both.status, 'reachable');
+  const bothBodyObj = JSON.parse(both.example?.body as string);
+  assert.equal(bothBodyObj.a.s, 'x');
+  assert.equal(bothBodyObj.a.deep.z, 5);
+  await assertExampleSelects(server, both.example as RawRequest, { kind: 'branch', id: 'both' });
+
+  // 叶 s 不可空：/a/s == null 矛盾（祖先 a 缺失或为 null 也不等于叶为 null）
+  const leafNull = byId.get('leaf-null') as ReachReport['branches'][number];
+  assert.equal(leafNull.status, 'contradictory');
+  assert.ok(leafNull.reasons?.some((r) => r.pointer === '/a/s'));
+
+  // 深层类型矛盾按完整多段指针定位
+  const badType = byId.get('bad-type') as ReachReport['branches'][number];
+  assert.equal(badType.status, 'contradictory');
+  assert.ok(badType.reasons?.some((r) => r.pointer === '/a/deep/z' && r.message.includes('integer')));
+
+  // 真实服务：叶为 null 400；祖先 a 缺失/为 null 时深层条件不命中（落兜底，不报错）
+  const leafNullReq = await probe(server, '/e', '{"a":{"s":null}}');
+  assert.equal(leafNullReq.status, 400);
+  const aMissing = await probe(server, '/e', '{}');
+  assert.deepEqual(aMissing.selection, { kind: 'fallback' });
+  const aNull = await probe(server, '/e', '{"a":null}');
+  assert.equal(aNull.status, 200);
+  assert.deepEqual(aNull.selection, { kind: 'fallback' });
+
+  // 兜底可达
+  assert.equal(report.fallback.status, 'reachable');
 });
 
 test('现有命令与服务行为不受影响：help 含 reach；无参数仍显示帮助', { timeout: 20_000 }, async () => {
