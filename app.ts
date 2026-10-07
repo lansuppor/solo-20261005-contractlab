@@ -40,6 +40,9 @@
 //   按输入顺序把每条记录的原始请求逐条重放到 127.0.0.1 的指定端口
 //   （每条只尝试一次、不跟随重定向、每条有覆盖完整收发的总超时），
 //   仅比较实际响应的状态码与正文原始字节和记录中的计划响应；
+//   可选 --strategy 比较策略文件按“方法 + 字面路径”选择改用 JSON 语义
+//   比较正文的接口（忽略排版、键顺序与指定的 RFC 6901 忽略指针），
+//   其余接口仍按字节比较，状态码始终精确比较；
 //   报告写 stdout，不监听、不修改文件。
 
 import http from 'node:http';
@@ -3061,6 +3064,12 @@ async function runVerify(requestsArg: string, configArg: string): Promise<never>
 // 参数与全部记录（含可发送的头名称和值）有效后才连接；参数或快照失败退出 2，
 // stderr 给原因，stdout 为空且不发任何请求。
 //
+// 可选 --strategy 比较策略：按“方法 + 去掉查询串后的字面路径”选择改用 JSON
+// 语义比较正文的接口（可附 RFC 6901 忽略指针），其余接口仍按字节比较。
+// 策略、整份快照及所选记录的计划正文全部校验后才连接：所选计划正文须为
+// UTF-8 JSON（仅可剥离单个开头 BOM，空正文非法，忽略规则不豁免解析），
+// 失败退出 2、stderr 定位文件与字段、stdout 为空且零请求。
+//
 // 每条请求的总超时自开始连接覆盖完整收发，持续来数据也不延长；连接失败、
 // 超时或响应中途断开记通信失败，关闭连接后继续下一条（部分响应不算完整）。
 
@@ -3081,6 +3090,289 @@ const REPLAY_STRIP_HEADERS: ReadonlySet<string> = new Set([
   'proxy-authorization',
 ]);
 
+// ---------------------------------------------------------------------------
+// JSON 语义比较策略（replay --strategy）
+// ---------------------------------------------------------------------------
+//
+// 策略文件为 UTF-8 JSON：{"endpoints":[{"method":"GET","path":"/api/order",
+// "ignore":["/meta/updatedAt"]}]}。按“方法 + 去掉查询串后的字面路径”选择改用
+// JSON 语义比较的接口；ignore 为可选的 RFC 6901 忽略指针数组（"" 表示根，
+// 支持空字段名、__proto__ 与 ~0/~1 转义）。重复接口、非法策略或指针整份拒绝；
+// 重复或父子重叠的忽略项允许且不改变结果（集合语义）。
+
+class StrategyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'StrategyError';
+  }
+}
+
+function strategyFail(where: string, message: string): never {
+  throw new StrategyError(where === '' ? message : `${where} ${message}`);
+}
+
+// 一个被策略选中的接口：忽略指针以转义后的 RFC 6901 指针字符串存放（根为 ""）
+interface JsonStrategyEndpoint {
+  readonly ignore: ReadonlySet<string>;
+}
+
+interface JsonCompareStrategy {
+  // 键：「方法 + 空格 + 字面路径」（与接口标识一致；路径不含查询串）
+  readonly endpoints: ReadonlyMap<string, JsonStrategyEndpoint>;
+}
+
+// RFC 6901 指针校验（语法）："" 为根；否则以 "/" 开头，段内仅允许 ~0/~1 转义。
+// 合法指针的“反转义再转义”是恒等变换，故校验通过后直接保留原字符串。
+function parseStrategyPointer(raw: unknown, where: string): string {
+  if (typeof raw !== 'string') {
+    strategyFail(where, `必须是 RFC 6901 指针字符串，收到 ${JSON.stringify(raw)}`);
+  }
+  if (raw === '') {
+    return '';
+  }
+  if (!raw.startsWith('/')) {
+    strategyFail(
+      where,
+      `的指针 ${JSON.stringify(raw)} 非法：非根指针必须以 "/" 开头（根指针为 ""）`,
+    );
+  }
+  const segments = raw.slice(1).split('/');
+  for (let i = 0; i < segments.length; i += 1) {
+    const segment = segments[i] as string;
+    for (let j = 0; j < segment.length; j += 1) {
+      if (segment[j] === '~') {
+        const next = segment[j + 1];
+        if (next !== '0' && next !== '1') {
+          strategyFail(
+            where,
+            `的指针 ${JSON.stringify(raw)} 非法：第 ${i} 段含非法转义（仅支持 ~0 与 ~1）`,
+          );
+        }
+        j += 1;
+      }
+    }
+  }
+  return raw;
+}
+
+function validateCompareStrategy(raw: unknown): JsonCompareStrategy {
+  if (!isPlainObject(raw)) {
+    strategyFail('', '策略顶层必须是 JSON 对象（含 endpoints）');
+  }
+  for (const key of Object.keys(raw)) {
+    if (key !== 'endpoints') {
+      strategyFail('', `含未知字段 ${JSON.stringify(key)}`);
+    }
+  }
+  const { endpoints } = raw;
+  if (!Array.isArray(endpoints) || endpoints.length === 0) {
+    strategyFail('endpoints', '必须是非空数组（每项选择一个按 JSON 语义比较的接口）');
+  }
+  const map = new Map<string, JsonStrategyEndpoint>();
+  const firstSeen = new Map<string, number>();
+  for (let index = 0; index < (endpoints as unknown[]).length; index += 1) {
+    const entry = (endpoints as unknown[])[index];
+    const where = `endpoints[${index}]`;
+    if (!isPlainObject(entry)) {
+      strategyFail(where, '必须是对象');
+    }
+    for (const key of Object.keys(entry)) {
+      if (key !== 'method' && key !== 'path' && key !== 'ignore') {
+        strategyFail(where, `含未知字段 ${JSON.stringify(key)}`);
+      }
+    }
+    const { method, path: entryPath, ignore } = entry;
+    if (method !== 'GET' && method !== 'POST') {
+      strategyFail(`${where}.method`, `必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`);
+    }
+    if (typeof entryPath !== 'string') {
+      strategyFail(`${where}.path`, '必须是字符串');
+    }
+    // 与场景接口同一套字面路径规则（不含查询串、不支持路径模板）
+    try {
+      validatePath(entryPath as string, where);
+    } catch (e) {
+      throw new StrategyError(describeError(e));
+    }
+    const key = `${method} ${entryPath}`;
+    const previous = firstSeen.get(key);
+    if (previous !== undefined) {
+      strategyFail(where, `与 endpoints[${previous}] 重复（${key}）：同一接口只能配置一次`);
+    }
+    firstSeen.set(key, index);
+    const ignoreSet = new Set<string>();
+    if (ignore !== undefined) {
+      if (!Array.isArray(ignore)) {
+        strategyFail(`${where}.ignore`, '必须是数组（RFC 6901 指针字符串）');
+      }
+      for (let j = 0; j < ignore.length; j += 1) {
+        // 重复或父子重叠的忽略项不改变结果：按集合收纳即可
+        ignoreSet.add(parseStrategyPointer(ignore[j], `${where}.ignore[${j}]`));
+      }
+    }
+    map.set(key, { ignore: ignoreSet });
+  }
+  return { endpoints: map };
+}
+
+// 读取 -> 解析 -> 校验；任何一步失败都抛出含文件路径与可定位原因的错误
+async function loadCompareStrategyFromFile(strategyPath: string): Promise<JsonCompareStrategy> {
+  let text: string;
+  try {
+    text = await readFile(strategyPath, 'utf8');
+  } catch (e) {
+    throw new Error(`读取比较策略文件 ${strategyPath} 失败：${describeError(e)}`);
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`比较策略文件 ${strategyPath} 不是合法 JSON：${describeError(e)}`);
+  }
+
+  try {
+    return validateCompareStrategy(raw);
+  } catch (e) {
+    throw new Error(`比较策略文件 ${strategyPath} 校验失败：${describeError(e)}`);
+  }
+}
+
+// JSON 语义比较的正文解析：仅可剥离单个开头 BOM；空正文非法。
+// 忽略规则不豁免解析——即使忽略根指针，正文仍须先通过本解析。
+function parseJsonBodyText(
+  text: string,
+): { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly reason: string } {
+  const stripped = text.startsWith('\uFEFF') ? text.slice(1) : text;
+  if (stripped === '') {
+    return { ok: false, reason: '空正文（JSON 语义比较要求非空 JSON 正文）' };
+  }
+  try {
+    return { ok: true, value: JSON.parse(stripped) };
+  } catch (e) {
+    return { ok: false, reason: describeError(e) };
+  }
+}
+
+// 严格 UTF-8 解码；失败返回 undefined（调用方按“非 UTF-8”处理）
+function decodeUtf8Strict(body: Buffer): string | undefined {
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(body);
+  } catch {
+    return undefined;
+  }
+}
+
+// JSON 语义比较的一处正文差异。两侧均可解析时：RFC 6901 位置 + 计划/实际值
+// （"missing" 表示该侧缺失，与 JSON null 区分）；实际正文无法解析时：
+// 只有 message（原因），不逐项比较。
+type JsonBodyDifference =
+  | {
+      readonly pointer: string;
+      readonly planned: unknown;
+      readonly actual: unknown;
+    }
+  | {
+      readonly pointer: string;
+      readonly message: string;
+    };
+
+// 递归列出全部未忽略的独立差异：
+// - 对象只看自有字段，键顺序与排版无关；缺失字段指向该字段本身；
+// - 数组按原下标比较（顺序有意义），多出/缺失元素在其下标报告，不另报长度；
+// - 标量不做类型转换，数字按解析数值比较（0 与 -0 等价），缺失不同于 null；
+// - 节点缺失或类型不同只报该节点，不再深入；
+// - 忽略指针处的值、存在性与子树整体跳过（不删除数组项、不移动下标）；
+//   两侧都无目标时无影响，祖先类型不同仍报告（忽略只作用于指针恰好处）。
+function diffJsonValues(
+  planned: unknown,
+  actual: unknown,
+  pointer: string,
+  ignore: ReadonlySet<string>,
+  out: JsonBodyDifference[],
+): void {
+  if (ignore.has(pointer)) {
+    return;
+  }
+  const plannedType = jsonTypeOf(planned);
+  const actualType = jsonTypeOf(actual);
+  if (plannedType !== actualType) {
+    out.push({ pointer, planned, actual });
+    return;
+  }
+  if (plannedType === 'object') {
+    const p = planned as Record<string, unknown>;
+    const a = actual as Record<string, unknown>;
+    for (const key of Object.keys(p)) {
+      const child = `${pointer}/${escapePointerSegment(key)}`;
+      if (ignore.has(child)) {
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(a, key)) {
+        out.push({ pointer: child, planned: p[key], actual: 'missing' });
+      } else {
+        diffJsonValues(p[key], a[key], child, ignore, out);
+      }
+    }
+    for (const key of Object.keys(a)) {
+      if (Object.prototype.hasOwnProperty.call(p, key)) {
+        continue;
+      }
+      const child = `${pointer}/${escapePointerSegment(key)}`;
+      if (ignore.has(child)) {
+        continue;
+      }
+      out.push({ pointer: child, planned: 'missing', actual: a[key] });
+    }
+    return;
+  }
+  if (plannedType === 'array') {
+    const p = planned as unknown[];
+    const a = actual as unknown[];
+    const upper = Math.max(p.length, a.length);
+    for (let i = 0; i < upper; i += 1) {
+      const child = `${pointer}/${i}`;
+      if (ignore.has(child)) {
+        continue;
+      }
+      if (i >= p.length) {
+        out.push({ pointer: child, planned: 'missing', actual: a[i] });
+      } else if (i >= a.length) {
+        out.push({ pointer: child, planned: p[i], actual: 'missing' });
+      } else {
+        diffJsonValues(p[i], a[i], child, ignore, out);
+      }
+    }
+    return;
+  }
+  // 标量：严格相等、不做类型转换；数字 === 按解析数值比较（0 与 -0 相等）
+  if (planned !== actual) {
+    out.push({ pointer, planned, actual });
+  }
+}
+
+// JSON 语义比较的计划侧数据：已解析的计划正文与忽略指针集合
+interface JsonComparePlan {
+  readonly plannedJson: unknown;
+  readonly ignore: ReadonlySet<string>;
+}
+
+// 计划值（已解析）与实际响应正文字节的 JSON 语义比较
+function diffPlannedJsonBody(plan: JsonComparePlan, actualBody: Buffer): JsonBodyDifference[] {
+  const text = decodeUtf8Strict(actualBody);
+  if (text === undefined) {
+    return [{ pointer: '', message: '实际响应正文不是合法 UTF-8，无法按 JSON 语义比较' }];
+  }
+  const parsed = parseJsonBodyText(text);
+  if (!parsed.ok) {
+    return [{ pointer: '', message: `实际响应正文不是合法 JSON：${parsed.reason}` }];
+  }
+  const out: JsonBodyDifference[] = [];
+  diffJsonValues(plan.plannedJson, parsed.value, '', plan.ignore, out);
+  return out;
+}
+
+
 // 一条待重放的请求：共享快照校验之上再经重放专用校验
 interface ReplayRequest {
   readonly id: number;
@@ -3092,6 +3384,8 @@ interface ReplayRequest {
   readonly body: Buffer;
   readonly plannedStatus: number;
   readonly plannedBody: string;
+  // 策略命中时存在：改用 JSON 语义比较正文（计划正文已解析并校验）
+  readonly jsonCompare?: JsonComparePlan;
 }
 
 // target 须为以 "/" 开头的合法 HTTP 请求目标：不含空白与控制字符，
@@ -3154,7 +3448,12 @@ function filterReplayHeaders(
   return out;
 }
 
-function parseReplayRecord(raw: unknown, index: number, seen: Set<number>): ReplayRequest {
+function parseReplayRecord(
+  raw: unknown,
+  index: number,
+  seen: Set<number>,
+  strategy?: JsonCompareStrategy,
+): ReplayRequest {
   const where = `records[${index}]`;
   // 先完整经历与 verify 相同的快照校验（含 target/path 一致性与正文无损性）
   const base = parseSnapshotRecord(raw, index, seen);
@@ -3196,6 +3495,22 @@ function parseReplayRecord(raw: unknown, index: number, seen: Set<number>): Repl
     );
   }
 
+  // JSON 语义比较：策略按“方法 + 去掉查询串后的字面路径”命中时，计划正文
+  // 须为 UTF-8 JSON（仅可剥离单个开头 BOM，空正文非法，忽略规则不豁免解析）；
+  // 未命中的记录不解析计划正文，仍按字节比较
+  let jsonCompare: JsonComparePlan | undefined;
+  const selected = strategy?.endpoints.get(`${base.method} ${base.path}`);
+  if (selected !== undefined) {
+    const parsed = parseJsonBodyText(body as string);
+    if (!parsed.ok) {
+      snapshotFail(
+        `${prWhere}.body`,
+        `JSON 语义比较策略要求计划正文为合法 JSON（仅可剥离单个开头 BOM）：${parsed.reason}`,
+      );
+    }
+    jsonCompare = { plannedJson: parsed.value, ignore: selected.ignore };
+  }
+
   return {
     id: base.id,
     method: base.method,
@@ -3204,16 +3519,20 @@ function parseReplayRecord(raw: unknown, index: number, seen: Set<number>): Repl
     body: base.body,
     plannedStatus: status as number,
     plannedBody: body as string,
+    jsonCompare,
   };
 }
 
-function parseReplaySnapshot(raw: unknown): ReplayRequest[] {
+function parseReplaySnapshot(raw: unknown, strategy?: JsonCompareStrategy): ReplayRequest[] {
   const seen = new Set<number>();
-  return snapshotRecordsOf(raw).map((rec, i) => parseReplayRecord(rec, i, seen));
+  return snapshotRecordsOf(raw).map((rec, i) => parseReplayRecord(rec, i, seen, strategy));
 }
 
 // 读取 -> 解析 -> 校验并重建；任何一步失败都抛出含文件路径与可定位原因的错误
-async function loadReplaySnapshotFromFile(snapshotPath: string): Promise<ReplayRequest[]> {
+async function loadReplaySnapshotFromFile(
+  snapshotPath: string,
+  strategy?: JsonCompareStrategy,
+): Promise<ReplayRequest[]> {
   let text: string;
   try {
     text = await readFile(snapshotPath, 'utf8');
@@ -3229,7 +3548,7 @@ async function loadReplaySnapshotFromFile(snapshotPath: string): Promise<ReplayR
   }
 
   try {
-    return parseReplaySnapshot(raw);
+    return parseReplaySnapshot(raw, strategy);
   } catch (e) {
     throw new Error(`请求记录快照文件 ${snapshotPath} 校验失败：${describeError(e)}`);
   }
@@ -3327,8 +3646,10 @@ type ReplayResultEntry =
   | {
       readonly id: number;
       readonly outcome: 'different';
-      // 差异点：状态码不同 / 正文原始字节不同（可同时为真）
+      // 差异点：状态码不同 / 正文不同（可同时为真；正文按字节或 JSON 语义比较）
       readonly differences: { readonly status: boolean; readonly body: boolean };
+      // 仅 JSON 语义比较模式：全部未忽略的独立正文差异（或无法解析的原因）
+      readonly bodyDifferences?: readonly JsonBodyDifference[];
       readonly planned: ReturnType<typeof replayResponseJson>;
       readonly response: ReturnType<typeof replayResponseJson>;
     }
@@ -3338,6 +3659,8 @@ interface ReplayReport {
   readonly requestsFile: string;
   readonly port: number;
   readonly timeoutMs: number;
+  // 仅提供 --strategy 时存在：JSON 语义比较策略文件
+  readonly strategyFile?: string;
   readonly total: number;
   readonly same: number;
   readonly different: number;
@@ -3345,13 +3668,30 @@ interface ReplayReport {
   readonly results: readonly ReplayResultEntry[];
 }
 
-async function runReplay(requestsArg: string, port: number, timeoutMs: number): Promise<never> {
+async function runReplay(
+  requestsArg: string,
+  port: number,
+  timeoutMs: number,
+  strategyArg?: string,
+): Promise<never> {
   const requestsFile = path.resolve(requestsArg);
+  const strategyFile = strategyArg !== undefined ? path.resolve(strategyArg) : undefined;
 
-  // 参数与全部记录有效后才连接：任何快照错误都不发任何请求
+  // 策略、整份快照及所选记录的计划正文全部校验后才连接：
+  // 任何输入失败都不发任何请求
+  let strategy: JsonCompareStrategy | undefined;
+  if (strategyFile !== undefined) {
+    try {
+      strategy = await loadCompareStrategyFromFile(strategyFile);
+    } catch (e) {
+      process.stderr.write(`${APP_NAME}: replay 比较策略：${describeError(e)}\n`);
+      process.exit(2);
+    }
+  }
+
   let requests: ReplayRequest[];
   try {
-    requests = await loadReplaySnapshotFromFile(requestsFile);
+    requests = await loadReplaySnapshotFromFile(requestsFile, strategy);
   } catch (e) {
     process.stderr.write(`${APP_NAME}: replay 请求快照：${describeError(e)}\n`);
     process.exit(2);
@@ -3366,9 +3706,18 @@ async function runReplay(requestsArg: string, port: number, timeoutMs: number): 
       continue;
     }
     const { response } = exchange;
-    // 仅比较状态码与正文原始字节；计划正文按 UTF-8 编码
+    // 状态码始终精确比较；正文按字节或（策略命中时）JSON 语义比较
     const statusDiff = response.status !== request.plannedStatus;
-    const bodyDiff = !response.body.equals(Buffer.from(request.plannedBody, 'utf8'));
+    let bodyDiff: boolean;
+    let bodyDifferences: JsonBodyDifference[] | undefined;
+    if (request.jsonCompare !== undefined) {
+      // 实际完整响应非 UTF-8 或非 JSON：记正文差异（说明原因）并继续后续记录
+      bodyDifferences = diffPlannedJsonBody(request.jsonCompare, response.body);
+      bodyDiff = bodyDifferences.length > 0;
+    } else {
+      // 计划正文按 UTF-8 编码后与正文原始字节比较
+      bodyDiff = !response.body.equals(Buffer.from(request.plannedBody, 'utf8'));
+    }
     if (!statusDiff && !bodyDiff) {
       results.push({ id: request.id, outcome: 'same', response: replayResponseJson(response) });
     } else {
@@ -3376,6 +3725,7 @@ async function runReplay(requestsArg: string, port: number, timeoutMs: number): 
         id: request.id,
         outcome: 'different',
         differences: { status: statusDiff, body: bodyDiff },
+        bodyDifferences,
         planned: {
           status: request.plannedStatus,
           body: { encoding: 'utf-8', content: request.plannedBody },
@@ -3392,6 +3742,7 @@ async function runReplay(requestsArg: string, port: number, timeoutMs: number): 
     requestsFile,
     port,
     timeoutMs,
+    strategyFile,
     total: results.length,
     same,
     different,
@@ -3886,7 +4237,7 @@ function helpText(): string {
     '  node app.ts compare --old <file> --new <file>',
     '  node app.ts import --openapi <file> --config <file>',
     '  node app.ts verify --requests <file> --config <file>',
-    '  node app.ts replay --requests <file> --port <port> --timeout <ms>',
+    '  node app.ts replay --requests <file> --port <port> --timeout <ms> [--strategy <file>]',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
@@ -3925,9 +4276,13 @@ function helpText(): string {
     '  -r, --requests <file> GET /__contractlab/requests 的完整 JSON 快照文件（必填）',
     '  -p, --port <number>   目标端口：127.0.0.1 上的有效非零端口（必填）',
     '  -t, --timeout <ms>    每条请求的总超时（正整数毫秒，自开始连接覆盖完整收发）',
+    '  -s, --strategy <file> 可选：JSON 语义比较策略文件，按“方法 + 字面路径”',
+    '                        选择改用 JSON 语义比较正文的接口（可附 RFC 6901 忽略',
+    '                        指针，忽略排版、键顺序与指定动态字段）；其余接口仍按',
+    '                        字节比较；不提供时全部按字节比较',
     '                        本机重放快照中的请求（仅 GET/POST，禁止管理入口路径）：',
     '                        按输入顺序逐条发送，每条只尝试一次、不跟随重定向；',
-    '                        仅比较响应状态码与正文原始字节和记录中的计划响应；',
+    '                        状态码始终精确比较，不比较响应头；',
     '                        不监听、不修改文件；报告以 JSON 写往 stdout：',
     '                        空快照或全部相同退出 0，存在差异或通信失败退出 1，',
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr，stdout 为空）',
@@ -4172,12 +4527,14 @@ interface ReplayOptions {
   requests: string;
   port: number;
   timeoutMs: number;
+  strategy?: string;
 }
 
 function parseReplayArgv(argv: readonly string[]): ReplayOptions {
   let requests: string | undefined;
   let port: number | undefined;
   let timeoutMs: number | undefined;
+  let strategy: string | undefined;
 
   const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
     if (inline !== undefined) {
@@ -4227,6 +4584,8 @@ function parseReplayArgv(argv: readonly string[]): ReplayOptions {
       if (timeoutMs < 1) {
         cliFail(`replay: 总超时必须是正整数毫秒数，收到 ${timeoutMs}`);
       }
+    } else if (flag === '--strategy' || flag === '-s') {
+      [strategy, i] = readValue(flag, inline, i);
     } else {
       cliFail(`replay: 不支持的命令行参数: ${token}`);
     }
@@ -4241,7 +4600,7 @@ function parseReplayArgv(argv: readonly string[]): ReplayOptions {
   if (timeoutMs === undefined) {
     cliFail('replay: 缺少必填参数 --timeout <ms>');
   }
-  return { requests, port, timeoutMs };
+  return { requests, port, timeoutMs, strategy };
 }
 
 function main(): void {
@@ -4294,10 +4653,12 @@ function main(): void {
 
   if (argv[0] === 'replay') {
     const options = parseReplayArgv(argv.slice(1));
-    runReplay(options.requests, options.port, options.timeoutMs).catch((e: unknown) => {
-      process.stderr.write(`${APP_NAME}: replay 失败：${describeError(e)}\n`);
-      process.exit(2);
-    });
+    runReplay(options.requests, options.port, options.timeoutMs, options.strategy).catch(
+      (e: unknown) => {
+        process.stderr.write(`${APP_NAME}: replay 失败：${describeError(e)}\n`);
+        process.exit(2);
+      },
+    );
     return;
   }
 
