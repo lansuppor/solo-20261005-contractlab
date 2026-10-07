@@ -3262,14 +3262,41 @@ async function loadReplaySnapshotFromFile(snapshotPath: string): Promise<ReplayR
 // 标量不转换类型，数字按解析数值比较（0 与 -0 等价），缺失与 null 不同。
 // 状态码始终精确比较，不比较响应头。
 
+// 一个数组对齐位置：RFC 6901 指针（定位到数组，根为 ""）+ 元素自有键字段名。
+// 各位置互不嵌套（相等视为重复）。
+interface KeyedArraySpec {
+  // 规范化后的指针文本（根为 ""）
+  readonly pointer: string;
+  // 指针段（用于在 JSON 值上遍历）
+  readonly segments: readonly string[];
+  // 元素自有的业务键字段名（允许空名与 "__proto__"）
+  readonly key: string;
+}
+
 // 一个接口的 JSON 语义比较策略
 interface JsonCompareEndpoint {
   // 规范化后的忽略指针集合（RFC 6901，根为 ""）；重复与父子重叠不影响结果
   readonly ignore: ReadonlySet<string>;
+  // 业务键对齐数组位置：规范化指针文本 -> 规格（各位置互不嵌套）
+  readonly keyedArrays: ReadonlyMap<string, KeyedArraySpec>;
 }
 
 // 比较策略：键为 "METHOD /literal/path"（路径不含查询串）
 type JsonCompareStrategy = ReadonlyMap<string, JsonCompareEndpoint>;
+
+// segments 的 strictPrefix 长度前缀是否完全相等（相等也算）：
+// 用于拒绝重复位置与互相嵌套（含祖先/后代）的对齐位置。
+function segmentsSameOrPrefix(prefix: readonly string[], segments: readonly string[]): boolean {
+  if (prefix.length > segments.length) {
+    return false;
+  }
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (prefix[i] !== segments[i]) {
+      return false;
+    }
+  }
+  return true;
+}
 
 // 由解析出的指针段构造规范化指针文本（根为 ""），用于忽略集合的去重与查找
 function canonicalPointer(segments: readonly string[]): string {
@@ -3287,11 +3314,11 @@ function parseStrategyEndpoint(
     throw new ConfigError(`${where} 必须是对象`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== 'method' && key !== 'path' && key !== 'ignore') {
+    if (key !== 'method' && key !== 'path' && key !== 'ignore' && key !== 'keyedArrays') {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
-  const { method, path: routePath, ignore } = raw;
+  const { method, path: routePath, ignore, keyedArrays } = raw;
   if (method !== 'GET' && method !== 'POST') {
     throw new ConfigError(
       `${where}.method 必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`,
@@ -3315,12 +3342,52 @@ function parseStrategyEndpoint(
     });
   }
 
+  // 业务键对齐数组位置：每项 { pointer, key }；位置须为 RFC 6901 指针，
+  // key 为元素自有的字段名（允许空名与 "__proto__"）。重复位置或位置互相
+  // 嵌套（含祖先/后代）整份拒绝。
+  const keyedMap = new Map<string, KeyedArraySpec>();
+  if (keyedArrays !== undefined) {
+    if (!Array.isArray(keyedArrays)) {
+      throw new ConfigError(`${where}.keyedArrays 必须是数组（每项含 pointer 与 key）`);
+    }
+    const accepted: { readonly pointer: string; readonly segments: readonly string[] }[] = [];
+    keyedArrays.forEach((item, j) => {
+      const itemWhere = `${where}.keyedArrays[${j}]`;
+      if (!isPlainObject(item)) {
+        throw new ConfigError(`${itemWhere} 必须是对象（含 pointer 与 key 两个字符串字段）`);
+      }
+      for (const f of Object.keys(item)) {
+        if (f !== 'pointer' && f !== 'key') {
+          throw new ConfigError(`${itemWhere} 含未知字段 "${f}"`);
+        }
+      }
+      const { pointer: rawPointer, key: keyName } = item;
+      // pointer 与 key 都必须是字符串（key 允许空字符串）
+      const segments = parseJsonPointer(rawPointer, itemWhere, '对齐数组位置');
+      if (typeof keyName !== 'string') {
+        throw new ConfigError(
+          `${itemWhere}.key 必须是元素自有的字段名字符串（允许空名），收到 ${JSON.stringify(keyName)}`,
+        );
+      }
+      const pointerText = canonicalPointer(segments);
+      for (const prev of accepted) {
+        if (segmentsSameOrPrefix(prev.segments, segments) || segmentsSameOrPrefix(segments, prev.segments)) {
+          throw new ConfigError(
+            `${itemWhere} 的对齐位置 ${JSON.stringify(pointerText)} 与位置 ${JSON.stringify(prev.pointer)} 重复或互相嵌套：对齐数组位置必须互不嵌套`,
+          );
+        }
+      }
+      accepted.push({ pointer: pointerText, segments });
+      keyedMap.set(pointerText, { pointer: pointerText, segments, key: keyName });
+    });
+  }
+
   const key = `${method as string} ${routePath}`;
   if (seen.has(key)) {
     throw new ConfigError(`${where} 与其他接口重复（方法 + 路径必须唯一）：${key}`);
   }
   seen.add(key);
-  endpoints.set(key, { ignore: ignoreSet });
+  endpoints.set(key, { ignore: ignoreSet, keyedArrays: keyedMap });
 }
 
 function parseCompareStrategy(raw: unknown): JsonCompareStrategy {
@@ -3388,32 +3455,266 @@ function decodeUtf8Strict(body: Buffer): { readonly ok: true; readonly text: str
   }
 }
 
-// 正文差异中“该侧不存在此节点”的标记（缺失与 null 不同）
+// 正文差异中“该侧不存在此节点”的标记（缺失与 null 不同，也与字符串 "missing" 配套
+// 存在性布尔标记一并使用，不得混淆）
 const MISSING_NODE = 'missing';
 
 interface BodyDifference {
-  // RFC 6901 位置（根为 ""）
+  // RFC 6901 位置（根为 ""）。单侧元素差异时取“存在侧”在原始正文中的位置；
+  // 配对元素内部差异取实际元素所在的位置
   readonly pointer: string;
   // 计划值 / 实际值（JSON 原值）；该侧不存在时为 "missing"
   readonly planned: unknown;
   readonly actual: unknown;
+  // 仅业务键对齐数组中“只在一侧出现”的整元素差异携带：业务键（字段名 + 值）
+  readonly key?: { readonly field: string; readonly value: string | number | boolean };
+  // 双方各自是否独立存在该元素（缺失与 null / "missing" 字符串不得混淆）
+  readonly plannedExists?: boolean;
+  readonly actualExists?: boolean;
 }
 
-// 递归列出全部未忽略的独立正文差异：节点缺失或类型不同只报该节点，不再深入
+// 实际侧某个对齐数组非法（不是数组 / 元素非对象 / 键缺失或类型非法 / 键重复）
+interface ActualAlignmentError {
+  // 对齐数组在实际正文中的 RFC 6901 位置（根为 ""）
+  readonly pointer: string;
+  readonly reason: string;
+}
+
+// 忽略指针的成员判定：普通场景直接用 Set；配对元素场景用“计划下标 -> 实际下标”
+// 的映射判定（见 remapIgnoreForPair）。
+interface PointerMembership {
+  has(pointer: string): boolean;
+}
+
+// 已通过连接前校验、计划正文里确实存在的对齐数组
+interface PlannedKeyedArray {
+  readonly spec: KeyedArraySpec;
+}
+
+// 业务键值的内部配对标识：严格按类型配对，加类型前缀避免任何跨类型碰撞；
+// 数字按数值序列化（0 与 -0 都序列化为 "0"）。
+function businessKeyToken(value: unknown): string {
+  if (typeof value === 'string') {
+    return `s:${value}`;
+  }
+  if (typeof value === 'number') {
+    return `n:${String(value)}`;
+  }
+  if (typeof value === 'boolean') {
+    return `b:${value}`;
+  }
+  throw new Error(`内部错误：不是合法业务键类型 ${jsonTypeOf(value)}`);
+}
+
+// 校验一个数组元素可作业务键载体：必须是对象，且含自有的键字段，值为字符串、
+// 有限数字或布尔。null、对象、数组、缺失或 NaN/Infinity 均非法。
+// 返回 null 表示合法；否则返回不含位置前缀的原因（调用方补下标/位置）。
+function elementKeyError(element: unknown, keyField: string): string | null {
+  if (!isPlainObject(element)) {
+    return `元素不是 JSON 对象（实际是 ${jsonTypeOf(element)}），无法按自有字段 ${JSON.stringify(keyField)} 取业务键`;
+  }
+  if (!Object.prototype.hasOwnProperty.call(element, keyField)) {
+    return `元素缺少业务键字段 ${JSON.stringify(keyField)}`;
+  }
+  const value = (element as Record<string, unknown>)[keyField];
+  if (value === null) {
+    return `业务键字段 ${JSON.stringify(keyField)} 的值是 null，null 不能作业务键`;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      return `业务键字段 ${JSON.stringify(keyField)} 的值不是有限数字`;
+    }
+    return null;
+  }
+  if (typeof value === 'string' || typeof value === 'boolean') {
+    return null;
+  }
+  return `业务键字段 ${JSON.stringify(keyField)} 的值类型是 ${jsonTypeOf(value)}，必须是字符串、有限数字或布尔`;
+}
+
+// 在计划正文上校验全部对齐数组位置（连接前）：位置不存在允许；存在时必须是数组，
+// 元素必须是对象，键字段存在且为字符串/有限数字/布尔，同数组内唯一。
+// 忽略指针不豁免本校验。返回存在的对齐位置映射；失败给出指针与原因。
+function validatePlannedKeyedArrays(
+  planned: unknown,
+  keyedArrays: ReadonlyMap<string, KeyedArraySpec>,
+):
+  | { readonly ok: true; readonly arrays: ReadonlyMap<string, PlannedKeyedArray> }
+  | { readonly ok: false; readonly pointer: string; readonly reason: string } {
+  const arrays = new Map<string, PlannedKeyedArray>();
+  for (const spec of keyedArrays.values()) {
+    const node = resolvePointer(planned, spec.segments);
+    if (node === undefined) {
+      continue; // 位置不存在（含无法遍历）允许
+    }
+    if (!Array.isArray(node)) {
+      return {
+        ok: false,
+        pointer: spec.pointer,
+        reason: `对齐位置必须是数组，计划正文此处是 ${jsonTypeOf(node)}`,
+      };
+    }
+    const seen = new Set<string>();
+    for (let i = 0; i < node.length; i += 1) {
+      const err = elementKeyError(node[i], spec.key);
+      if (err !== null) {
+        return { ok: false, pointer: spec.pointer, reason: `下标 ${i}：${err}` };
+      }
+      const keyValue = (node[i] as Record<string, unknown>)[spec.key] as string | number | boolean;
+      const token = businessKeyToken(keyValue);
+      if (seen.has(token)) {
+        return {
+          ok: false,
+          pointer: spec.pointer,
+          reason: `下标 ${i}：业务键 ${JSON.stringify(keyValue)} 在同一数组内不唯一`,
+        };
+      }
+      seen.add(token);
+    }
+    arrays.set(spec.pointer, { spec });
+  }
+  return { ok: true, arrays };
+}
+
+// 在实际正文上独立校验计划侧存在的对齐位置（不受 ignore 影响）：实际位置缺失或
+// 无法遍历不在此报错（按普通节点差异处理）；存在但不是数组、元素或键非法、键
+// 重复则记录位置与原因。每个对齐数组至多记录一条（首个非法元素）。
+function validateActualKeyedArrays(
+  actual: unknown,
+  plannedKeyed: ReadonlyMap<string, PlannedKeyedArray>,
+): ActualAlignmentError[] {
+  const errors: ActualAlignmentError[] = [];
+  for (const [pointerText, ka] of plannedKeyed) {
+    const node = resolvePointer(actual, ka.spec.segments);
+    if (node === undefined) {
+      continue; // 实际侧缺失/无法遍历：交由普通节点差异处理
+    }
+    if (!Array.isArray(node)) {
+      errors.push({
+        pointer: pointerText,
+        reason: `实际响应对齐位置不是数组（实际是 ${jsonTypeOf(node)}）`,
+      });
+      continue;
+    }
+    const seen = new Map<string, number>();
+    for (let j = 0; j < node.length; j += 1) {
+      const err = elementKeyError(node[j], ka.spec.key);
+      if (err !== null) {
+        errors.push({ pointer: pointerText, reason: `下标 ${j}：${err}` });
+        break;
+      }
+      const keyValue = (node[j] as Record<string, unknown>)[ka.spec.key] as
+        | string
+        | number
+        | boolean;
+      const token = businessKeyToken(keyValue);
+      const prev = seen.get(token);
+      if (prev !== undefined) {
+        errors.push({
+          pointer: pointerText,
+          reason: `下标 ${j}：业务键 ${JSON.stringify(keyValue)} 与下标 ${prev} 重复，同一数组内必须唯一`,
+        });
+        break;
+      }
+      seen.set(token, j);
+    }
+  }
+  return errors;
+}
+
+// 路径本身或任一祖先被忽略（对齐数组里按“计划下标”定位的忽略项用它判定）
+function pathIgnored(ignore: PointerMembership, segments: readonly string[]): boolean {
+  for (let len = 0; len <= segments.length; len += 1) {
+    if (ignore.has(canonicalPointer(segments.slice(0, len)))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 为一对同键配对元素构造忽略判定：对齐数组内的忽略指针以**计划原下标**定位，
+// 比较实际元素时映射到该配对元素的实际下标；整数组/祖先的忽略仍直接生效。
+//
+// 关键：进入配对元素后路径以“实际下标”书写，而忽略集合里的 /list/1 指的是
+// **计划**下标 1；不能仅凭文本命中（否则实际下标 1 的另一元素会被误忽略）。
+// 因此对配对元素自身及其子路径，一律先映射回计划下标再逐级判定；数组本身及
+// 其祖先、数组之外的路径按原忽略集合判定（整数组/祖先生效时本就不会递归到此）。
+function remapIgnoreForPair(
+  ignore: PointerMembership,
+  arrayPointer: string,
+  plannedIndex: number,
+  actualIndex: number,
+): PointerMembership {
+  const plannedPrefix = arrayPointer === '' ? `/${plannedIndex}` : `${arrayPointer}/${plannedIndex}`;
+  const actualPrefix = arrayPointer === '' ? `/${actualIndex}` : `${arrayPointer}/${actualIndex}`;
+  return {
+    has(pointer: string): boolean {
+      if (pointer === actualPrefix || pointer.startsWith(`${actualPrefix}/`)) {
+        // 映射回计划元素路径，逐级（元素自身 -> 各子孙）检查忽略
+        const tail = pointer.slice(actualPrefix.length); // "" 或 "/..."
+        let plannedPath = plannedPrefix;
+        if (ignore.has(plannedPath)) {
+          return true;
+        }
+        if (tail !== '') {
+          // 规范指针中 "/" 只作分隔符（字段名内的 / 已转义为 ~1），可安全切分
+          for (const seg of tail.slice(1).split('/')) {
+            plannedPath += `/${seg}`;
+            if (ignore.has(plannedPath)) {
+              return true;
+            }
+          }
+        }
+        return false;
+      }
+      // 对齐数组本身、其祖先或数组之外：按原忽略集合判定
+      return ignore.has(pointer);
+    },
+  };
+}
+
+interface DiffContext {
+  readonly ignore: PointerMembership;
+  // 计划侧存在且已校验的对齐数组（规范化指针文本 -> 规格）
+  readonly keyed: ReadonlyMap<string, PlannedKeyedArray>;
+  // 实际侧校验失败的对齐位置集合
+  readonly actualInvalid: ReadonlySet<string>;
+}
+
+// 递归列出全部未忽略的独立正文差异：节点缺失或类型不同只报该节点，不再深入。
+// 对齐数组位置按键配对（见 diffAlignedArray）；其余数组按下标。
 function diffJsonValues(
   planned: unknown,
   actual: unknown,
-  ignore: ReadonlySet<string>,
+  ctx: DiffContext,
   path: readonly string[],
   out: BodyDifference[],
 ): void {
-  if (ignore.has(canonicalPointer(path))) {
+  const here = canonicalPointer(path);
+  if (ctx.ignore.has(here)) {
     return; // 忽略指针处的值、存在性与子树
+  }
+  if (ctx.keyed.has(here)) {
+    // 计划侧此位置一定是数组（连接前已校验）。实际侧通常经由父级对象/数组的
+    // “字段/下标缺失”分支直接报节点差异而不会递归到这里；若确实以缺失进入，
+    // 按原节点差异处理（数组本身缺失）。
+    if (actual === undefined) {
+      out.push({ pointer: here, planned, actual: MISSING_NODE });
+      return;
+    }
+    // 实际侧存在但不是数组，或元素/键非法、键重复：仅由 bodyAlignmentErrors
+    // 给出位置与原因，这里不再重复整节点差异，也不配对深入；正文其余位置照常
+    // 比较。
+    if (!Array.isArray(actual) || ctx.actualInvalid.has(here)) {
+      return;
+    }
+    diffAlignedArray(ctx.keyed.get(here) as PlannedKeyedArray, planned as unknown[], actual, ctx, path, out);
+    return;
   }
   const plannedType = jsonTypeOf(planned);
   const actualType = jsonTypeOf(actual);
   if (plannedType !== actualType) {
-    out.push({ pointer: canonicalPointer(path), planned, actual });
+    out.push({ pointer: here, planned, actual });
     return;
   }
   if (plannedType === 'object') {
@@ -3423,15 +3724,15 @@ function diffJsonValues(
     for (const key of Object.keys(p)) {
       const childPath = [...path, key];
       if (Object.prototype.hasOwnProperty.call(a, key)) {
-        diffJsonValues(p[key], a[key], ignore, childPath, out);
-      } else if (!ignore.has(canonicalPointer(childPath))) {
+        diffJsonValues(p[key], a[key], ctx, childPath, out);
+      } else if (!ctx.ignore.has(canonicalPointer(childPath))) {
         out.push({ pointer: canonicalPointer(childPath), planned: p[key], actual: MISSING_NODE });
       }
     }
     for (const key of Object.keys(a)) {
       if (!Object.prototype.hasOwnProperty.call(p, key)) {
         const childPath = [...path, key];
-        if (!ignore.has(canonicalPointer(childPath))) {
+        if (!ctx.ignore.has(canonicalPointer(childPath))) {
           out.push({ pointer: canonicalPointer(childPath), planned: MISSING_NODE, actual: a[key] });
         }
       }
@@ -3439,14 +3740,14 @@ function diffJsonValues(
     return;
   }
   if (plannedType === 'array') {
-    // 按原下标比较：顺序有意义；多出或缺失的元素在其下标报告，不另报长度；
-    // 被忽略的下标不参与比较，但不删除数组项、不移动其余下标
+    // 非对齐数组按原下标比较：顺序有意义；多出或缺失的元素在其下标报告，不另报
+    // 长度；被忽略的下标不参与比较，但不删除数组项、不移动其余下标
     const p = planned as unknown[];
     const a = actual as unknown[];
     const n = Math.max(p.length, a.length);
     for (let i = 0; i < n; i += 1) {
       const childPath = [...path, String(i)];
-      if (ignore.has(canonicalPointer(childPath))) {
+      if (ctx.ignore.has(canonicalPointer(childPath))) {
         continue;
       }
       if (i >= p.length) {
@@ -3454,15 +3755,91 @@ function diffJsonValues(
       } else if (i >= a.length) {
         out.push({ pointer: canonicalPointer(childPath), planned: p[i], actual: MISSING_NODE });
       } else {
-        diffJsonValues(p[i], a[i], ignore, childPath, out);
+        diffJsonValues(p[i], a[i], ctx, childPath, out);
       }
     }
     return;
   }
   // 标量不转换类型；数字按解析数值比较（0 与 -0 等价）
   if (planned !== actual) {
-    out.push({ pointer: canonicalPointer(path), planned, actual });
+    out.push({ pointer: here, planned, actual });
   }
+}
+
+// 业务键对齐数组的比较：两侧元素（均已校验为含唯一合法键的对象）按键配对，
+// 顺序不影响结论。同键元素递归比较全部未忽略差异；只在一侧出现的键报告整个
+// 元素（不深入），携带业务键、存在侧原始位置与双方独立存在性标记。
+function diffAlignedArray(
+  ka: PlannedKeyedArray,
+  plannedArr: readonly unknown[],
+  actualArr: readonly unknown[],
+  ctx: DiffContext,
+  path: readonly string[],
+  out: BodyDifference[],
+): void {
+  const here = canonicalPointer(path);
+  const { key: keyField } = ka.spec;
+
+  // 业务键 -> 各自下标（两侧键均唯一）
+  const planByKey = new Map<string, number>();
+  plannedArr.forEach((element, i) => {
+    planByKey.set(businessKeyToken((element as Record<string, unknown>)[keyField]), i);
+  });
+  const actualByKey = new Map<string, number>();
+  actualArr.forEach((element, j) => {
+    actualByKey.set(businessKeyToken((element as Record<string, unknown>)[keyField]), j);
+  });
+
+  // 先按计划下标顺序：配对元素递归；计划独有的整元素报告（可被其计划下标处的
+  // 忽略项或祖先忽略抑制）
+  plannedArr.forEach((plannedElement, i) => {
+    const keyValue = (plannedElement as Record<string, unknown>)[keyField] as
+      | string
+      | number
+      | boolean;
+    const token = businessKeyToken(keyValue);
+    const j = actualByKey.get(token);
+    if (j === undefined) {
+      // 仅计划侧存在：位置取存在侧（计划）原始下标
+      const plannedPath = [...path, String(i)];
+      if (pathIgnored(ctx.ignore, plannedPath)) {
+        return; // 忽略项作用于缺失元素
+      }
+      out.push({
+        pointer: canonicalPointer(plannedPath),
+        planned: plannedElement,
+        actual: MISSING_NODE,
+        key: { field: keyField, value: keyValue },
+        plannedExists: true,
+        actualExists: false,
+      });
+      return;
+    }
+    // 同键配对：忽略以计划原下标定位，再映射到配对元素的实际下标；
+    // 不改变配对身份（键完整性与唯一性已在比较前独立校验）。
+    const pairIgnore = remapIgnoreForPair(ctx.ignore, here, i, j);
+    const pairCtx: DiffContext = { ...ctx, ignore: pairIgnore };
+    diffJsonValues(plannedElement, actualArr[j], pairCtx, [...path, String(j)], out);
+  });
+
+  // 实际独有的键（新增键）：位置取存在侧（实际）原始下标。其他下标的忽略项
+  // 不得遮蔽新增键；整数组/祖先若被忽略，根本不会进入本函数。
+  actualArr.forEach((actualElement, j) => {
+    const keyValue = (actualElement as Record<string, unknown>)[keyField] as
+      | string
+      | number
+      | boolean;
+    if (!planByKey.has(businessKeyToken(keyValue))) {
+      out.push({
+        pointer: canonicalPointer([...path, String(j)]),
+        planned: MISSING_NODE,
+        actual: actualElement,
+        key: { field: keyField, value: keyValue },
+        plannedExists: false,
+        actualExists: true,
+      });
+    }
+  });
 }
 
 interface ReplayResponse {
@@ -3563,6 +3940,8 @@ type ReplayResultEntry =
       readonly bodyDifferences?: readonly BodyDifference[];
       // 仅 JSON 语义比较模式：实际响应正文非 UTF-8 或非 JSON 时的原因
       readonly bodyError?: string;
+      // 仅业务键对齐模式：实际响应中类型/元素/键非法的对齐数组（位置 + 原因）
+      readonly bodyAlignmentErrors?: readonly ActualAlignmentError[];
       readonly planned: ReturnType<typeof replayResponseJson>;
       readonly response: ReturnType<typeof replayResponseJson>;
     }
@@ -3609,24 +3988,43 @@ async function runReplay(
   }
 
   // 策略选中的记录：计划正文须为 UTF-8 JSON（仅可剥离单个开头 BOM，空正文
-  // 非法），忽略规则不豁免解析；与策略、快照一起全部校验通过后才连接
-  const jsonPlans: ({ readonly ignore: ReadonlySet<string>; readonly planned: unknown } | null)[] =
-    requests.map((request, i) => {
-      const endpoint = strategy?.get(`${request.method} ${request.path}`);
-      if (endpoint === undefined) {
-        return null;
+  // 非法），忽略规则不豁免解析；配置了业务键对齐数组时，计划正文里存在的对齐
+  // 位置还须满足数组/元素对象/键类型与唯一性约束（忽略不豁免）。全部与策略、
+  // 快照一起校验通过后才连接。
+  const jsonPlans: (
+    | {
+        readonly ignore: ReadonlySet<string>;
+        readonly keyed: ReadonlyMap<string, PlannedKeyedArray>;
+        readonly planned: unknown;
       }
-      const parsed = parseSemanticJson(request.plannedBody);
-      if (!parsed.ok) {
-        process.stderr.write(
-          `${APP_NAME}: replay 请求快照：请求记录快照文件 ${requestsFile} 校验失败：` +
-            `records[${i}].plannedResponse.body ${parsed.reason}` +
-            `（策略为 ${request.method} ${request.path} 选择 JSON 语义比较）\n`,
-        );
-        process.exit(2);
-      }
-      return { ignore: endpoint.ignore, planned: parsed.value };
-    });
+    | null
+  )[] = requests.map((request, i) => {
+    const endpoint = strategy?.get(`${request.method} ${request.path}`);
+    if (endpoint === undefined) {
+      return null;
+    }
+    const parsed = parseSemanticJson(request.plannedBody);
+    if (!parsed.ok) {
+      process.stderr.write(
+        `${APP_NAME}: replay 请求快照：请求记录快照文件 ${requestsFile} 校验失败：` +
+          `records[${i}].plannedResponse.body ${parsed.reason}` +
+          `（策略为 ${request.method} ${request.path} 选择 JSON 语义比较）\n`,
+      );
+      process.exit(2);
+    }
+    // 连接前校验计划正文的对齐数组：位置不存在允许；存在即须合法且键唯一。
+    // 定位到记录与正文位置（RFC 6901 指针）。
+    const plannedKeyed = validatePlannedKeyedArrays(parsed.value, endpoint.keyedArrays);
+    if (!plannedKeyed.ok) {
+      process.stderr.write(
+        `${APP_NAME}: replay 请求快照：请求记录快照文件 ${requestsFile} 校验失败：` +
+          `records[${i}].plannedResponse.body 位置 ${JSON.stringify(plannedKeyed.pointer)} 的业务键对齐数组非法：` +
+          `${plannedKeyed.reason}（策略为 ${request.method} ${request.path} 选择 JSON 语义比较）\n`,
+      );
+      process.exit(2);
+    }
+    return { ignore: endpoint.ignore, keyed: plannedKeyed.arrays, planned: parsed.value };
+  });
 
   // 按输入顺序保留原编号逐条重放：前一条结束才发下一条
   const results: ReplayResultEntry[] = [];
@@ -3661,21 +4059,42 @@ async function runReplay(
     }
 
     // JSON 语义比较：不依赖媒体类型；实际完整响应非 UTF-8 或非 JSON 记正文
-    // 差异（说明原因）并继续后续记录
+    // 差异（说明原因）并继续后续记录。业务键对齐数组在实际侧的类型/元素/键非法
+    // 同样记正文差异（bodyAlignmentErrors 给出位置与原因）并继续，不算通信失败。
     let bodyDiff: boolean;
     let bodyDifferences: BodyDifference[] | undefined;
     let bodyError: string | undefined;
+    let bodyAlignmentErrors: ActualAlignmentError[] | undefined;
     const decoded = decodeUtf8Strict(response.body);
     const actual = decoded.ok ? parseSemanticJson(decoded.text) : decoded;
     if (!actual.ok) {
       bodyDiff = true;
       bodyError = `实际响应正文${actual.reason}，无法进行 JSON 语义比较`;
     } else {
+      // 实际侧独立校验对齐数组：忽略整数组/祖先时不校验（忽略仍生效）；
+      // 数组内按下标的忽略项不豁免整组的元素/键校验。
+      const effectiveKeyed = new Map<string, PlannedKeyedArray>();
+      for (const [pointerText, ka] of plan.keyed) {
+        if (!pathIgnored(plan.ignore, ka.spec.segments)) {
+          effectiveKeyed.set(pointerText, ka);
+        }
+      }
+      const alignmentErrors = validateActualKeyedArrays(actual.value, effectiveKeyed);
+      const invalidActual = new Set(alignmentErrors.map((e) => e.pointer));
       const diffs: BodyDifference[] = [];
-      diffJsonValues(plan.planned, actual.value, plan.ignore, [], diffs);
-      bodyDiff = diffs.length > 0;
-      if (bodyDiff) {
+      diffJsonValues(
+        plan.planned,
+        actual.value,
+        { ignore: plan.ignore, keyed: effectiveKeyed, actualInvalid: invalidActual },
+        [],
+        diffs,
+      );
+      bodyDiff = diffs.length > 0 || alignmentErrors.length > 0;
+      if (diffs.length > 0) {
         bodyDifferences = diffs;
+      }
+      if (alignmentErrors.length > 0) {
+        bodyAlignmentErrors = alignmentErrors;
       }
     }
     if (!statusDiff && !bodyDiff) {
@@ -3688,6 +4107,7 @@ async function runReplay(
         // 差异项保留计划与实际正文的无损表示
         ...(bodyDifferences === undefined ? {} : { bodyDifferences }),
         ...(bodyError === undefined ? {} : { bodyError }),
+        ...(bodyAlignmentErrors === undefined ? {} : { bodyAlignmentErrors }),
         planned: {
           status: request.plannedStatus,
           body: { encoding: 'utf-8', content: request.plannedBody },
@@ -4826,7 +5246,9 @@ function helpText(): string {
     '  -p, --port <number>   目标端口：127.0.0.1 上的有效非零端口（必填）',
     '  -t, --timeout <ms>    每条请求的总超时（正整数毫秒，自开始连接覆盖完整收发）',
     '  -s, --strategy <file> 可选比较策略：按“方法 + 字面路径”为接口选择',
-    '                        响应正文 JSON 语义比较（可附 RFC 6901 忽略指针）；',
+    '                        响应正文 JSON 语义比较（可附 RFC 6901 忽略指针，',
+    '                        并用 keyedArrays 为互不嵌套的数组位置指定元素自有',
+    '                        字段作业务键，按键配对、忽略列表排序差异）；',
     '                        不提供时全部接口按正文原始字节比较',
     '                        本机重放快照中的请求（仅 GET/POST，禁止管理入口路径）：',
     '                        按输入顺序逐条发送，每条只尝试一次、不跟随重定向；',
