@@ -3716,6 +3716,593 @@ async function runReplay(
 }
 
 // ---------------------------------------------------------------------------
+// 离线响应分支可达性诊断（reach 子命令）
+// ---------------------------------------------------------------------------
+//
+// 读取一份通过与 serve 完全相同严格校验的场景配置与一个 POST 接口的字面路径，
+// 离线诊断该接口 branches 中每一分支及兜底 responses 是否可达：
+//   reachable      —— 存在通过正文检查的请求正文，且该正文首先命中此支；
+//   covered        —— 存在满足此支条件的合格正文，但它们全部首先命中前序分支
+//                      （遮挡按前序分支的命中并集判定，不是单支包含，也不抽样）；
+//   contradictory  —— 条件与正文规则矛盾，不存在满足条件的合格正文。
+// 不监听、不发送请求、不修改任何文件。可达分支/兜底各给一份完整请求样例
+// （方法、路径、必要头、原始 JSON 正文，补全全部必填字段），样例须通过正文
+// 检查并实际选中所报分支或兜底。
+//
+// 诊断范围（超出即整份拒绝，退出 2）：
+// - 接口必须是 POST、声明了非空 branches；
+// - 根 requestBody 必须是 object（可附 nullable）；
+// - 每个 when 指针必须是**单段** RFC 6901 指针，指向根对象**已声明的标量字段**
+//   （根指针 ""、多段指针、未声明字段、object/array 字段均拒绝）；其余字段仍
+//   完全按现有递归规则参与“合格正文”的构造与判定。空字段名、__proto__、
+//   ~0/~1 转义按原语义处理。
+//
+// 判定精确依据现有 type/enum/nullable/必填可选/额外字段语义：缺失与 null 分开、
+// 0 与 -0 等价、不转换类型；根可空时 JSON null 也参与兜底可达性判断。
+
+class ReachError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReachError';
+  }
+}
+
+type BranchReachStatus = 'reachable' | 'covered' | 'contradictory';
+
+interface ReachExample {
+  readonly method: 'POST';
+  readonly path: string;
+  readonly headers: { readonly 'Content-Type': 'application/json' };
+  readonly body: string;
+}
+
+interface ReachReason {
+  readonly pointer: string;
+  readonly message: string;
+}
+
+interface BranchReach {
+  readonly id: string;
+  readonly status: BranchReachStatus;
+  readonly example?: ReachExample;
+  // covered：共同遮挡此支的前序分支标识（不必最小）
+  readonly coveredBy?: readonly string[];
+  readonly message?: string;
+  // contradictory：定位到具体条件指针的矛盾原因（可多条）
+  readonly reasons?: readonly ReachReason[];
+}
+
+interface FallbackReach {
+  readonly status: 'reachable' | 'covered';
+  readonly example?: ReachExample;
+  readonly coveredBy?: readonly string[];
+  readonly message?: string;
+}
+
+interface ReachReport {
+  readonly configFile: string;
+  readonly method: 'POST';
+  readonly path: string;
+  readonly branches: readonly BranchReach[];
+  readonly fallback: FallbackReach;
+  readonly unreachableBranches: number;
+}
+
+// 找不到见证正文的哨兵：不能用 null——根可空时 JSON null 本身就是合法见证
+const NO_WITNESS: unique symbol = Symbol('reach-no-witness');
+type Witness = unknown | typeof NO_WITNESS;
+
+// 标量条件的非 null 值是否满足字段标量规则的“类型”部分（不做类型转换）
+function scalarTypeConforms(
+  rule: Extract<BodyRule, { kind: ScalarKind }>,
+  value: string | number | boolean,
+): boolean {
+  switch (rule.kind) {
+    case 'string':
+      return typeof value === 'string';
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'integer':
+      return Number.isInteger(value);
+    case 'null':
+      return false;
+  }
+}
+
+// 条件值与标量字段规则的矛盾原因；无矛盾返回 null。
+// 严格按现有语义：类型不符只报类型；类型相符但不在枚举报枚举；
+// null 仅当规则接受 null（nullable 且枚举含 null，或 type:"null"）才可行。
+function scalarConditionConflict(
+  rule: Extract<BodyRule, { kind: ScalarKind }>,
+  value: BranchConditionValue,
+): { kind: 'type' | 'enum' | 'null' } | null {
+  if (value === null) {
+    return ruleAcceptsNullValue(rule) ? null : { kind: 'null' };
+  }
+  if (!scalarTypeConforms(rule, value)) {
+    return { kind: 'type' };
+  }
+  if (rule.enum !== undefined && !rule.enum.includes(value as EnumValue)) {
+    return { kind: 'enum' };
+  }
+  return null;
+}
+
+// 字段某一取值维度上的代表值。等值条件只能区分“指针处是否严格等于某常量”，
+// 故只需：各分支引用过的合格常量、null（若规则接受），以及一个与所有被引用
+// 常量都不同的合格“其余值”（枚举取未被引用的候选；无枚举时构造）。
+// 任意两个未被引用的合格值对全部条件不可区分，因此该有限域精确，不是抽样。
+function freshScalarValue(
+  rule: Extract<BodyRule, { kind: ScalarKind }>,
+  referenced: ReadonlySet<unknown>,
+): unknown {
+  if (rule.enum !== undefined) {
+    return rule.enum.find((candidate) => candidate !== null && !referenced.has(candidate));
+  }
+  if (rule.kind === 'boolean') {
+    return !referenced.has(false) ? false : !referenced.has(true) ? true : undefined;
+  }
+  if (rule.kind === 'null') {
+    return undefined;
+  }
+  if (rule.kind === 'string') {
+    for (let i = 0; ; i += 1) {
+      const candidate = i === 0 ? 'contractlab' : `contractlab_${i}`;
+      if (!referenced.has(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  // number / integer：取未被引用的最小非负整数（integer 合法；number 也合法）
+  for (let i = 0; ; i += 1) {
+    if (!referenced.has(i)) {
+      return i;
+    }
+  }
+}
+
+interface ReachDim {
+  readonly name: string;
+  // 该字段“存在”时的代表值（必非空：标量规则总有至少一个接受值）
+  readonly values: readonly unknown[];
+  // 规则未标必填时字段还可以缺失；缺失与显式 null 是不同的维度取值
+  readonly optional: boolean;
+}
+
+// 单支的条件分析：与字段规则一致时给出 字段名 -> 条件常量 的固定取值
+// （一支的全部条件都是“某标量字段等于某常量”）；矛盾时给出定位原因。
+interface BranchAnalysis {
+  readonly ok: boolean;
+  readonly pins?: ReadonlyMap<string, BranchConditionValue>;
+  readonly reasons?: readonly ReachReason[];
+}
+
+function analyzeBranchConditions(
+  branch: BranchSpec,
+  rootFields: ReadonlyMap<string, FieldRule>,
+): BranchAnalysis {
+  const pins = new Map<string, BranchConditionValue>();
+  const grouped = new Map<string, BranchConditionValue[]>();
+  for (const condition of branch.conditions) {
+    const name = condition.segments[0];
+    const list = grouped.get(name);
+    if (list === undefined) {
+      grouped.set(name, [condition.value]);
+    } else {
+      list.push(condition.value);
+    }
+  }
+
+  const reasons: ReachReason[] = [];
+  for (const [name, values] of grouped) {
+    const pointer = `/${escapePointerSegment(name)}`;
+    // 范围预检已保证字段存在且为标量规则
+    const scalarRule = (rootFields.get(name) as FieldRule).rule as Extract<BodyRule, { kind: ScalarKind }>;
+
+    // 同一指针上的多个常量必须两两严格相等（0 与 -0 视为相等）；
+    // null 与任何非 null 值互不相容。
+    const distinct: BranchConditionValue[] = [];
+    for (const v of values) {
+      if (!distinct.some((d) => d === v)) {
+        distinct.push(v);
+      }
+    }
+    if (distinct.length > 1) {
+      reasons.push({
+        pointer,
+        message: `同一指针上的等值条件值 ${JSON.stringify(distinct)} 互不相容（严格相等、不做类型转换），没有正文能同时满足`,
+      });
+      continue;
+    }
+
+    const value = distinct[0];
+    const conflict = scalarConditionConflict(scalarRule, value);
+    if (conflict === null) {
+      pins.set(name, value);
+      continue;
+    }
+    if (conflict.kind === 'type') {
+      reasons.push({
+        pointer,
+        message: `条件值 ${JSON.stringify(value)} 与该字段的 ${scalarRule.kind} 规则矛盾（不做类型转换），不存在在此指针处等于该值的合格正文`,
+      });
+    } else if (conflict.kind === 'enum') {
+      reasons.push({
+        pointer,
+        message: `条件值 ${JSON.stringify(value)} 不在该字段枚举 ${JSON.stringify(scalarRule.enum)} 之中，不存在在此指针处等于该值的合格正文`,
+      });
+    } else {
+      reasons.push({
+        pointer,
+        message: '条件要求该字段为 JSON null，但字段规则不接受 null；字段缺失也不等于显式 null，不存在满足该条件的合格正文',
+      });
+    }
+  }
+
+  return reasons.length === 0 ? { ok: true, pins } : { ok: false, reasons };
+}
+
+// 在根对象规则与全部分支条件之上做精确的有限域可达性求解。
+class ReachSolver {
+  private readonly dims: readonly ReachDim[];
+  private readonly rootRule: Extract<BodyRule, { kind: 'object' }>;
+  private readonly branches: readonly BranchSpec[];
+
+  constructor(
+    rootRule: Extract<BodyRule, { kind: 'object' }>,
+    branches: readonly BranchSpec[],
+  ) {
+    this.rootRule = rootRule;
+    this.branches = branches;
+    this.dims = this.buildDims();
+  }
+
+  private buildDims(): ReachDim[] {
+    // 字段首次被任何分支引用的顺序（配置顺序）
+    const names: string[] = [];
+    const referenced = new Map<string, Set<unknown>>();
+    for (const branch of this.branches) {
+      for (const condition of branch.conditions) {
+        const name = condition.segments[0];
+        if (!referenced.has(name)) {
+          referenced.set(name, new Set<unknown>());
+          names.push(name);
+        }
+      }
+    }
+
+    const dims: ReachDim[] = [];
+    for (const name of names) {
+      const field = this.rootRule.fields.get(name) as FieldRule;
+      const scalarRule = field.rule as Extract<BodyRule, { kind: ScalarKind }>;
+      const ref = referenced.get(name) as Set<unknown>;
+      const values: unknown[] = [];
+      const seen = new Set<unknown>();
+      const push = (v: unknown): void => {
+        if (v !== undefined && !seen.has(v)) {
+          seen.add(v);
+          values.push(v);
+        }
+      };
+      // 各分支引用过且合格的常量
+      for (const branch of this.branches) {
+        for (const condition of branch.conditions) {
+          if (condition.segments[0] !== name) {
+            continue;
+          }
+          if (scalarConditionConflict(scalarRule, condition.value) === null) {
+            push(condition.value);
+            ref.add(condition.value);
+          }
+        }
+      }
+      // null（与“缺失”不同的显式取值）
+      if (ruleAcceptsNullValue(scalarRule)) {
+        push(null);
+      }
+      // 一个与全部被引用常量都不同的合格值；没有时（如枚举候选已被全部引用）省略
+      push(freshScalarValue(scalarRule, ref));
+      dims.push({ name, values, optional: !field.required });
+    }
+    return dims;
+  }
+
+  // 一支条件是否被正文全部满足：取不到值（缺失/无法遍历）即不匹配；
+  // 严格相等、不做类型转换（resolvePointer 视空字段名与 __proto__ 为普通字段）
+  private satisfies(conditions: readonly BranchCondition[], value: unknown): boolean {
+    for (const condition of conditions) {
+      const actual = resolvePointer(value, condition.segments);
+      if (actual === undefined || actual !== condition.value) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private firstMatch(value: unknown): number | null {
+    for (let i = 0; i < this.branches.length; i += 1) {
+      if (this.satisfies(this.branches[i].conditions, value)) {
+        return i;
+      }
+    }
+    return null;
+  }
+
+  // 从必填字段最小样本开始构造根对象（字段名含空名/__proto__ 时用无原型对象）
+  private baseObject(): Record<string, unknown> {
+    const obj: Record<string, unknown> = Object.create(null);
+    for (const [name, field] of this.rootRule.fields) {
+      if (field.required) {
+        obj[name] = sampleValue(field.rule);
+      }
+    }
+    return obj;
+  }
+
+  // 按维度递归枚举合格正文，返回第一个让 predicate 成立的值；全部不成立返回 NO_WITNESS。
+  // pins 固定某些字段（某支的等值条件），其余维度取代表值——域对等值条件精确。
+  private findObject(
+    pins: ReadonlyMap<string, BranchConditionValue>,
+    predicate: (value: unknown) => boolean,
+  ): Record<string, unknown> | typeof NO_WITNESS {
+    const dims = this.dims.filter((dim) => !pins.has(dim.name));
+    const base = this.baseObject();
+    for (const [name, value] of pins) {
+      base[name] = value;
+    }
+
+    const problems: StructureProblem[] = [];
+    const visit = (index: number): Record<string, unknown> | typeof NO_WITNESS => {
+      if (index === dims.length) {
+        problems.length = 0;
+        checkRule(this.rootRule, base, '', problems);
+        if (problems.length === 0 && predicate(base)) {
+          return base;
+        }
+        return NO_WITNESS;
+      }
+      const dim = dims[index];
+      if (dim.optional) {
+        // 可选字段先尝试缺失（缺失与显式 null 分开）
+        delete base[dim.name];
+        const found = visit(index + 1);
+        if (found !== NO_WITNESS) {
+          return found;
+        }
+      }
+      for (const value of dim.values) {
+        base[dim.name] = value;
+        const found = visit(index + 1);
+        if (found !== NO_WITNESS) {
+          return found;
+        }
+      }
+      return NO_WITNESS;
+    };
+    return visit(0);
+  }
+
+  // 找一份合格正文：根可空时先尝试 JSON null（分支字段指针在 null 上取不到值，
+  // 任何分支都不命中 null），再在对象域上求解；pins 非空时只能是对象正文。
+  // 找到返回该 JSON 值（可能就是 null），找不到返回 NO_WITNESS。
+  findWitness(
+    pins: ReadonlyMap<string, BranchConditionValue>,
+    predicate: (value: unknown) => boolean,
+  ): Witness {
+    if (pins.size === 0 && ruleAcceptsNullValue(this.rootRule)) {
+      if (predicate(null)) {
+        return null;
+      }
+    }
+    const obj = this.findObject(pins, predicate);
+    return obj;
+  }
+
+  // 合并两支的固定取值；同名字段常量不同（严格相等）则不存在共同正文
+  private mergePins(
+    a: ReadonlyMap<string, BranchConditionValue>,
+    b: ReadonlyMap<string, BranchConditionValue>,
+  ): Map<string, BranchConditionValue> | null {
+    const merged = new Map(a);
+    for (const [name, value] of b) {
+      const existing = merged.get(name);
+      if (existing !== undefined && existing !== value) {
+        return null;
+      }
+      merged.set(name, value);
+    }
+    return merged;
+  }
+
+  private example(value: unknown, routePath: string): ReachExample {
+    return {
+      method: 'POST',
+      path: routePath,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(value),
+    };
+  }
+
+  solve(routePath: string): { branches: BranchReach[]; fallback: FallbackReach } {
+    const analyses = this.branches.map((branch) => analyzeBranchConditions(branch, this.rootRule.fields));
+
+    const branchResults: BranchReach[] = [];
+    for (let i = 0; i < this.branches.length; i += 1) {
+      const branch = this.branches[i];
+      const analysis = analyses[i];
+      if (!analysis.ok || analysis.pins === undefined) {
+        branchResults.push({ id: branch.id, status: 'contradictory', reasons: analysis.reasons });
+        continue;
+      }
+
+      // 存在合格正文首先命中此支？
+      const direct = this.findWitness(analysis.pins, (value) => this.firstMatch(value) === i);
+      if (direct !== NO_WITNESS) {
+        branchResults.push({ id: branch.id, status: 'reachable', example: this.example(direct, routePath) });
+        continue;
+      }
+
+      // 满足此支的合格正文必然首先命中某些前序分支——逐支给出共同遮挡者
+      const coveredBy: string[] = [];
+      for (let j = 0; j < i; j += 1) {
+        const prior = analyses[j];
+        if (!prior.ok || prior.pins === undefined) {
+          continue;
+        }
+        const merged = this.mergePins(analysis.pins, prior.pins);
+        if (merged === null) {
+          continue;
+        }
+        // 同时满足 i 与 j、且 j 之前所有分支都不命中的合格正文
+        const witness = this.findWitness(merged, (value) => this.firstMatch(value) === j);
+        if (witness !== NO_WITNESS) {
+          coveredBy.push(this.branches[j].id);
+        }
+      }
+      branchResults.push({
+        id: branch.id,
+        status: 'covered',
+        coveredBy,
+        message:
+          `存在满足本支全部条件的合格正文，但它们首先命中的都是前序分支；` +
+          `前序分支 ${JSON.stringify(coveredBy)} 的命中区域并集已覆盖本支，本支永远不会被首先选中`,
+      });
+    }
+
+    // 兜底：存在任何分支都不命中的合格正文（含根为 JSON null）即可达
+    const fallbackBody = this.findWitness(new Map(), (value) => this.firstMatch(value) === null);
+    let fallback: FallbackReach;
+    if (fallbackBody !== NO_WITNESS) {
+      fallback = { status: 'reachable', example: this.example(fallbackBody, routePath) };
+    } else {
+      const coveredBy = this.branches
+        .map((branch, j) => {
+          const analysis = analyses[j];
+          if (!analysis.ok || analysis.pins === undefined) {
+            return NO_WITNESS;
+          }
+          const witness = this.findWitness(analysis.pins, (value) => this.firstMatch(value) === j);
+          return witness !== NO_WITNESS ? branch.id : NO_WITNESS;
+        })
+        .filter((id): id is string => id !== NO_WITNESS);
+      fallback = {
+        status: 'covered',
+        coveredBy,
+        message:
+          `没有任何合格正文落到兜底：全部合格正文都被分支 ${JSON.stringify(coveredBy)} 的命中区域并集覆盖`,
+      };
+    }
+
+    return { branches: branchResults, fallback };
+  }
+}
+
+// 选择诊断目标接口并执行范围预检；任何不满足都抛 ReachError（退出 2）
+function selectReachEndpoint(
+  specs: readonly EndpointSpec[],
+  configFile: string,
+  routePath: string,
+): { endpoint: EndpointSpec; index: number } {
+  const postMatches = specs
+    .map((endpoint, index) => ({ endpoint, index }))
+    .filter((entry) => entry.endpoint.method === 'POST' && entry.endpoint.path === routePath);
+
+  if (postMatches.length === 0) {
+    const existing = specs.filter((ep) => ep.method === 'POST').map((ep) => `POST ${ep.path}`);
+    throw new ReachError(
+      `场景文件 ${configFile} 中不存在 POST 接口 ${JSON.stringify(routePath)}。` +
+        (existing.length > 0 ? `现有的 POST 接口：${existing.join('，')}` : '该配置没有 POST 接口'),
+    );
+  }
+
+  const { endpoint, index } = postMatches[0];
+  const where = `endpoints[${index}]`;
+  if (endpoint.branches.length === 0) {
+    throw new ReachError(
+      `${where}（POST ${routePath}）未声明 branches：reach 仅诊断声明了响应分支的接口`,
+    );
+  }
+  if (!endpoint.bodyRule || endpoint.bodyRule.kind !== 'object') {
+    throw new ReachError(
+      `${where}.requestBody ${endpoint.bodyRule ? `的类型为 "${endpoint.bodyRule.kind}"` : ''}：` +
+        'reach 仅支持根 requestBody 为 object（可附 nullable）的分支接口',
+    );
+  }
+
+  // when 指针范围预检：单段、指向根对象已声明的标量字段（其他字段仍按递归规则处理）
+  const rootFields = endpoint.bodyRule.fields;
+  for (let b = 0; b < endpoint.branches.length; b += 1) {
+    const branch = endpoint.branches[b];
+    for (const condition of branch.conditions) {
+      const condWhere = `${where}.branches[${b}].when[${JSON.stringify(condition.pointer)}]`;
+      if (condition.segments.length !== 1) {
+        throw new ReachError(
+          `${condWhere} 指针 ${JSON.stringify(condition.pointer)} 含 ${condition.segments.length} 段：` +
+            'reach 仅支持单段 RFC 6901 指针（指向根对象的已声明标量字段），根指针与深层指针超出诊断范围',
+        );
+      }
+      const name = condition.segments[0];
+      const field = rootFields.get(name);
+      if (!field) {
+        throw new ReachError(
+          `${condWhere} 指向根对象未声明字段 ${JSON.stringify(name)}：` +
+            'reach 仅诊断指向已声明字段的条件（未声明字段仍按 additionalProperties 等现有规则处理）',
+        );
+      }
+      if (field.rule.kind === 'object' || field.rule.kind === 'array') {
+        throw new ReachError(
+          `${condWhere} 指向字段 ${JSON.stringify(name)}，其规则类型为 "${field.rule.kind}"：` +
+            'reach 仅支持指向标量字段的条件，对象/数组字段超出诊断范围',
+        );
+      }
+    }
+  }
+
+  return { endpoint, index };
+}
+
+async function runReach(configArg: string, pathArg: string): Promise<never> {
+  const configFile = path.resolve(configArg);
+
+  let specs: EndpointSpec[];
+  try {
+    specs = await loadSpecsFromFile(configFile);
+  } catch (e) {
+    process.stderr.write(`${APP_NAME}: reach 场景配置：${describeError(e)}\n`);
+    process.exit(2);
+  }
+
+  let report: ReachReport;
+  try {
+    const { endpoint } = selectReachEndpoint(specs, configFile, pathArg);
+    const rootRule = endpoint.bodyRule as Extract<BodyRule, { kind: 'object' }>;
+    const result = new ReachSolver(rootRule, endpoint.branches).solve(endpoint.path);
+    const unreachableBranches = result.branches.filter((b) => b.status !== 'reachable').length;
+    report = {
+      configFile,
+      method: 'POST',
+      path: endpoint.path,
+      branches: result.branches,
+      fallback: result.fallback,
+      unreachableBranches,
+    };
+  } catch (e) {
+    if (e instanceof ReachError) {
+      process.stderr.write(`${APP_NAME}: reach: ${e.message}\n`);
+      process.exit(2);
+    }
+    process.stderr.write(`${APP_NAME}: reach 失败：${describeError(e)}\n`);
+    process.exit(2);
+  }
+
+  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+  // 有不可达分支退出 1；兜底不可达仅作信息，不改变退出码
+  process.exit(report.unreachableBranches > 0 ? 1 : 0);
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 服务
 // ---------------------------------------------------------------------------
 
@@ -4199,6 +4786,7 @@ function helpText(): string {
     '  node app.ts import --openapi <file> --config <file>',
     '  node app.ts verify --requests <file> --config <file>',
     '  node app.ts replay --requests <file> --port <port> --timeout <ms> [--strategy <file>]',
+    '  node app.ts reach --config <file> --path <literal-post-path>',
     '',
     'Options (serve):',
     '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
@@ -4246,6 +4834,15 @@ function helpText(): string {
     '                        不监听、不修改文件；报告以 JSON 写往 stdout：',
     '                        空快照或全部相同退出 0，存在差异或通信失败退出 1，',
     '                        参数/读取/解析/校验失败退出 2（错误写 stderr，stdout 为空）',
+    '',
+    'Options (reach):',
+    '  -c, --config <file>   场景配置文件（必填，按与 serve 相同的严格校验）',
+    '  -p, --path <path>     要诊断的 POST 接口字面路径（必填）',
+    '                        离线诊断响应分支可达性，发现永远不会被首先选中的分支：',
+    '                        不监听、不发送请求、不修改文件；报告以 JSON 写往 stdout：',
+    '                        分支全部可达退出 0，存在不可达分支退出 1，',
+    '                        参数/读取/解析/配置/接口选择或范围错误退出 2',
+    '                        （错误写 stderr 指明文件与位置，stdout 为空）',
     '',
     '管理入口（路径前缀 /__contractlab/ 为业务接口保留区之外的保留前缀）：',
     '  GET  /__contractlab/health          健康查询，返回当前配置版本',
@@ -4565,6 +5162,62 @@ function parseReplayArgv(argv: readonly string[]): ReplayOptions {
     : { requests, port, timeoutMs, strategy };
 }
 
+interface ReachOptions {
+  config: string;
+  path: string;
+}
+
+function parseReachArgv(argv: readonly string[]): ReachOptions {
+  let config: string | undefined;
+  let routePath: string | undefined;
+
+  const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
+    if (inline !== undefined) {
+      return [inline, index];
+    }
+    const value = argv[index + 1];
+    if (value === undefined) {
+      cliFail(`reach: 参数 ${flag} 缺少取值`);
+    }
+    return [value as string, index + 1];
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (token === '--help' || token === '-h') {
+      process.stdout.write(`${helpText()}\n`);
+      process.exit(0);
+    }
+
+    let flag = token;
+    let inline: string | undefined;
+    const eq = token.indexOf('=');
+    if (eq >= 0) {
+      flag = token.slice(0, eq);
+      inline = token.slice(eq + 1);
+    }
+
+    if (flag === '--config' || flag === '-c') {
+      [config, i] = readValue(flag, inline, i);
+    } else if (flag === '--path' || flag === '-p') {
+      [routePath, i] = readValue(flag, inline, i);
+    } else {
+      cliFail(`reach: 不支持的命令行参数: ${token}`);
+    }
+  }
+
+  if (config === undefined) {
+    cliFail('reach: 缺少必填参数 --config <file>');
+  }
+  if (routePath === undefined) {
+    cliFail('reach: 缺少必填参数 --path <literal-path>');
+  }
+  if (routePath.length === 0 || routePath[0] !== '/') {
+    cliFail(`reach: --path 必须是以 "/" 开头的接口字面路径，收到 ${JSON.stringify(routePath)}`);
+  }
+  return { config, path: routePath };
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
 
@@ -4617,6 +5270,15 @@ function main(): void {
     const options = parseReplayArgv(argv.slice(1));
     runReplay(options.requests, options.port, options.timeoutMs, options.strategy).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: replay 失败：${describeError(e)}\n`);
+      process.exit(2);
+    });
+    return;
+  }
+
+  if (argv[0] === 'reach') {
+    const options = parseReachArgv(argv.slice(1));
+    runReach(options.config, options.path).catch((e: unknown) => {
+      process.stderr.write(`${APP_NAME}: reach 失败：${describeError(e)}\n`);
       process.exit(2);
     });
     return;
