@@ -17,6 +17,12 @@
 //   true 在原接受集合上加入 null（必填字段仍不得缺失，空正文不等于 null）；
 //   标量节点可附非空 enum 候选数组：接受集合为“类型及可空集合”与枚举集合的
 //   交集（可空不越过枚举；object/array 节点禁止 enum）。
+// - 声明了 requestBody 的 POST 接口可附加 branches 有序分支：每支含接口内唯一
+//   非空标识、非空等值条件集合（RFC 6901 指针 + 字符串/有限数字/布尔/null）
+//   与非空响应序列；校验通过后按分支顺序逐一匹配，全部条件满足才命中，
+//   多支命中取第一支，无命中取原 responses 兜底。各分支与兜底独立计数，
+//   耗尽复用末项；取值不存在或无法遍历即不匹配（缺失不同于 null），
+//   不做类型转换，0 与 -0 相等。
 // - 管理入口 GET /__contractlab/requests 查询本次进程内的请求记录（一致快照、
 //   不推进序列），POST /__contractlab/requests/clear 清空记录；记录只存在内存中，
 //   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）的请求一律不记录。
@@ -120,18 +126,51 @@ interface ResponseSpec {
   readonly delay: number;
 }
 
+// ---------------------------------------------------------------------------
+// 响应分支（endpoints[].branches，仅声明了 requestBody 的 POST 接口）
+// ---------------------------------------------------------------------------
+//
+// 分支按配置顺序逐一匹配：每支的全部等值条件都满足才命中，多支命中取第一支，
+// 无命中取接口原 responses（兜底）。条件 = RFC 6901 JSON Pointer + 标量等值
+// 目标（字符串、有限数字、布尔或 null）：指针支持根（""）、对象自有字段与
+// 数组下标，空字段名、"__proto__" 与 ~0/~1 转义语义原样保留；取值不存在或
+// 无法遍历即不匹配（缺失不同于 null），不做类型转换，数字 0 与 -0 相等。
+
+// 分支等值条件：指针已解析为反转义后的段序列（根为空数组）
+interface BranchCondition {
+  readonly segments: readonly string[];
+  readonly value: EnumValue;
+}
+
+interface BranchSpec {
+  readonly id: string;
+  readonly conditions: readonly BranchCondition[];
+  readonly responses: readonly ResponseSpec[];
+}
+
 interface EndpointSpec {
   readonly method: HttpMethod;
   readonly path: string;
   readonly responses: readonly ResponseSpec[];
   readonly bodyRule: BodyRule | undefined;
+  readonly branches: readonly BranchSpec[] | undefined;
+}
+
+// 运行时的分支：独立响应序列与消费位置
+interface LiveBranch {
+  readonly id: string;
+  readonly conditions: readonly BranchCondition[];
+  readonly responses: readonly ResponseSpec[];
+  // 下一个待预留位置；到达末项后停在末项（持续复用）
+  cursor: number;
 }
 
 interface LiveEndpoint {
   readonly key: string;
   readonly responses: readonly ResponseSpec[];
   readonly bodyRule: BodyRule | undefined;
-  // 下一个待预留位置；到达末项后停在末项（持续复用）
+  readonly branches: readonly LiveBranch[];
+  // 兜底序列的下一个待预留位置；到达末项后停在末项（持续复用）
   cursor: number;
 }
 
@@ -404,6 +443,131 @@ function validateFieldRule(raw: unknown, where: string): FieldRule {
   return { rule: validateBodyRule(rest, where), required };
 }
 
+// ---------------------------------------------------------------------------
+// 分支配置校验（endpoints[].branches）
+// ---------------------------------------------------------------------------
+
+// RFC 6901 段反转义：~1 -> /，~0 -> ~；其余 "~" 用法非法
+function unescapeBranchPointerSegment(segment: string, where: string): string {
+  let out = '';
+  for (let i = 0; i < segment.length; i += 1) {
+    const ch = segment[i];
+    if (ch === '~') {
+      const next = segment[i + 1];
+      if (next === '0') {
+        out += '~';
+        i += 1;
+      } else if (next === '1') {
+        out += '/';
+        i += 1;
+      } else {
+        throw new ConfigError(`${where} 含非法的 "~" 转义（RFC 6901 仅支持 ~0 与 ~1）`);
+      }
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+// 解析并校验 RFC 6901 JSON Pointer：空字符串表示根，否则必须以 "/" 开头；
+// 空字段名（连续 "/"）与 "__proto__" 原样保留为段
+function parseBranchPointer(pointer: unknown, where: string): string[] {
+  if (typeof pointer !== 'string') {
+    throw new ConfigError(`${where} 必须是字符串（RFC 6901 JSON Pointer），收到 ${JSON.stringify(pointer)}`);
+  }
+  if (pointer === '') {
+    return [];
+  }
+  if (!pointer.startsWith('/')) {
+    throw new ConfigError(
+      `${where} 必须是 RFC 6901 JSON Pointer（空字符串表示根，否则以 "/" 开头），收到 ${JSON.stringify(pointer)}`,
+    );
+  }
+  return pointer
+    .slice(1)
+    .split('/')
+    .map((segment) => unescapeBranchPointerSegment(segment, where));
+}
+
+// 条件等值目标：字符串、有限数字、布尔或 null；不做类型转换，0 与 -0 相等
+function validateBranchConditionValue(value: unknown, where: string): EnumValue {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return value;
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+  throw new ConfigError(
+    `${where} 必须是字符串、有限数字、布尔值或 null（不做类型转换），收到 ${JSON.stringify(value)}`,
+  );
+}
+
+function validateBranchCondition(raw: unknown, where: string): BranchCondition {
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`${where} 必须是对象（含 "pointer" 与 "value" 字段）`);
+  }
+  for (const key of Object.keys(raw)) {
+    if (key !== 'pointer' && key !== 'value') {
+      throw new ConfigError(`${where} 含未知字段 "${key}"`);
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(raw, 'pointer')) {
+    throw new ConfigError(`${where} 缺少 "pointer" 字段`);
+  }
+  if (!Object.prototype.hasOwnProperty.call(raw, 'value')) {
+    throw new ConfigError(`${where} 缺少 "value" 字段（null 是合法取值，不同于缺失）`);
+  }
+  return {
+    segments: parseBranchPointer(raw.pointer, `${where}.pointer`),
+    value: validateBranchConditionValue(raw.value, `${where}.value`),
+  };
+}
+
+function validateBranch(raw: unknown, where: string, seenIds: Set<string>): BranchSpec {
+  if (!isPlainObject(raw)) {
+    throw new ConfigError(`${where} 必须是对象`);
+  }
+  for (const key of Object.keys(raw)) {
+    if (key !== 'id' && key !== 'when' && key !== 'responses') {
+      throw new ConfigError(`${where} 含未知字段 "${key}"`);
+    }
+  }
+
+  const { id, when, responses } = raw;
+  if (typeof id !== 'string' || id === '') {
+    throw new ConfigError(`${where}.id 必须是非空字符串，收到 ${JSON.stringify(id)}`);
+  }
+  if (seenIds.has(id)) {
+    throw new ConfigError(`${where}.id 与同一接口内其他分支重复：${JSON.stringify(id)}`);
+  }
+  seenIds.add(id);
+
+  if (!Array.isArray(when) || when.length === 0) {
+    throw new ConfigError(`${where}.when 必须是非空数组（至少一个等值条件）`);
+  }
+  const conditions = when.map((item, j) =>
+    validateBranchCondition(item, `${where}.when[${j}]`),
+  );
+
+  if (!Array.isArray(responses) || responses.length === 0) {
+    throw new ConfigError(`${where}.responses 必须是非空数组`);
+  }
+  const cleanResponses = responses.map((item, j) =>
+    validateResponse(item, `${where}.responses[${j}]`),
+  );
+
+  return { id, conditions, responses: cleanResponses };
+}
+
+function validateBranches(raw: unknown, where: string): BranchSpec[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new ConfigError(`${where} 必须是非空数组（至少一个分支）`);
+  }
+  const seenIds = new Set<string>();
+  return raw.map((item, i) => validateBranch(item, `${where}[${i}]`, seenIds));
+}
+
 function validateEndpoint(
   raw: unknown,
   index: number,
@@ -414,12 +578,18 @@ function validateEndpoint(
     throw new ConfigError(`${where} 必须是对象`);
   }
   for (const key of Object.keys(raw)) {
-    if (key !== 'method' && key !== 'path' && key !== 'responses' && key !== 'requestBody') {
+    if (
+      key !== 'method' &&
+      key !== 'path' &&
+      key !== 'responses' &&
+      key !== 'requestBody' &&
+      key !== 'branches'
+    ) {
       throw new ConfigError(`${where} 含未知字段 "${key}"`);
     }
   }
 
-  const { method, path: routePath, responses, requestBody } = raw;
+  const { method, path: routePath, responses, requestBody, branches } = raw;
 
   if (method !== 'GET' && method !== 'POST') {
     throw new ConfigError(`${where}.method 必须是 "GET" 或 "POST"，收到 ${JSON.stringify(method)}`);
@@ -456,7 +626,20 @@ function validateEndpoint(
     bodyRule = validateBodyRule(requestBody, `${where}.requestBody`);
   }
 
-  return { method, path: routePath, responses: cleanResponses, bodyRule };
+  let cleanBranches: BranchSpec[] | undefined;
+  if (branches !== undefined) {
+    if (method !== 'POST') {
+      throw new ConfigError(`${where}.branches 仅允许在 POST 接口上声明（GET 接口不允许携带分支）`);
+    }
+    if (bodyRule === undefined) {
+      throw new ConfigError(
+        `${where}.branches 要求该接口先声明 requestBody 正文规则（分支按正文值选择响应）`,
+      );
+    }
+    cleanBranches = validateBranches(branches, `${where}.branches`);
+  }
+
+  return { method, path: routePath, responses: cleanResponses, bodyRule, branches: cleanBranches };
 }
 
 function validateConfig(raw: unknown): EndpointSpec[] {
@@ -487,6 +670,12 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
       key: `${spec.method} ${spec.path}`,
       responses: spec.responses,
       bodyRule: spec.bodyRule,
+      branches: (spec.branches ?? []).map((branch) => ({
+        id: branch.id,
+        conditions: branch.conditions,
+        responses: branch.responses,
+        cursor: 0,
+      })),
       cursor: 0,
     });
   }
@@ -496,13 +685,62 @@ function buildState(version: number, specs: readonly EndpointSpec[]): LiveState 
 // 同步预留下一项；同一事件循环内按“完整接收”事件的先后串行调用，天然保序。
 // 末项之后持续返回末项，不跳项、不复用未到位置的项。
 // 返回本次消费位置（0 起）与该项；末项复用时位置停在 length-1。
-function reserveNext(endpoint: LiveEndpoint): { position: number; item: ResponseSpec } {
-  const last = endpoint.responses.length - 1;
-  const position = endpoint.cursor < last ? endpoint.cursor : last;
-  if (endpoint.cursor < last) {
-    endpoint.cursor += 1;
+// 兜底序列与各分支序列各自独立计数（各自的 cursor）。
+function reserveNext(sequence: {
+  readonly responses: readonly ResponseSpec[];
+  cursor: number;
+}): { position: number; item: ResponseSpec } {
+  const last = sequence.responses.length - 1;
+  const position = sequence.cursor < last ? sequence.cursor : last;
+  if (sequence.cursor < last) {
+    sequence.cursor += 1;
   }
-  return { position, item: endpoint.responses[position] };
+  return { position, item: sequence.responses[position] };
+}
+
+// 分支条件匹配：按已解析的指针段遍历解析后的请求正文。
+// 取值不存在或无法遍历（途经标量、数组下标非法/越界、字段缺失）即不匹配；
+// 缺失不同于 null（指针落空时不比较值）；不做类型转换，数字 0 与 -0 相等。
+function branchConditionMatches(condition: BranchCondition, root: unknown): boolean {
+  let current: unknown = root;
+  for (const segment of condition.segments) {
+    if (isPlainObject(current)) {
+      if (!Object.prototype.hasOwnProperty.call(current, segment)) {
+        return false;
+      }
+      current = current[segment];
+    } else if (Array.isArray(current)) {
+      if (!/^(0|[1-9]\d*)$/.test(segment)) {
+        return false;
+      }
+      const index = Number(segment);
+      if (index >= current.length) {
+        return false;
+      }
+      current = current[index];
+    } else {
+      return false;
+    }
+  }
+  // 标量等值：=== 对数字即数值相等（0 === -0），对字符串/布尔/null 为严格相等；
+  // 对象与数组永不相等（条件目标只能是标量）
+  return current === condition.value;
+}
+
+// 选择本次请求消费的序列：按分支顺序逐一匹配，全部条件满足的第一支命中；
+// 无命中（或未配置分支）取兜底 responses。各序列独立计数、耗尽复用末项。
+function selectSequence(
+  endpoint: LiveEndpoint,
+  parsedBody: unknown,
+): { position: number; item: ResponseSpec; branchId: string | null; length: number } {
+  for (const branch of endpoint.branches) {
+    if (branch.conditions.every((condition) => branchConditionMatches(condition, parsedBody))) {
+      const { position, item } = reserveNext(branch);
+      return { position, item, branchId: branch.id, length: branch.responses.length };
+    }
+  }
+  const { position, item } = reserveNext(endpoint);
+  return { position, item, branchId: null, length: endpoint.responses.length };
 }
 
 // ---------------------------------------------------------------------------
@@ -556,6 +794,11 @@ interface RequestRecord {
   // 场景请求在序列中的消费位置（0 起）；400/404 没有消费位置，记为 null
   sequencePosition: number | null;
   sequenceLength: number | null;
+  // 本次响应取自哪条序列：branch=命中分支（branch 字段给出分支标识）、
+  // fallback=兜底 responses（含未配置分支的接口）、none=未选择（400/404）
+  selection: 'branch' | 'fallback' | 'none';
+  // 命中的分支标识；selection 为 branch 时非空，否则为 null
+  branch: string | null;
   plannedResponse: PlannedResponseSnapshot | null;
   delivery: DeliveryStatus;
 }
@@ -595,6 +838,8 @@ class RequestLog {
       bodyRejection: null,
       sequencePosition: null,
       sequenceLength: null,
+      selection: 'none',
+      branch: null,
       plannedResponse: null,
       delivery: 'pending',
     };
@@ -786,7 +1031,12 @@ function checkRule(
   }
 }
 
-// 返回 null 表示校验通过；否则为可直接序列化的 400 差异报告。
+// 正文校验结果：通过时给出解析后的 JSON 值（供分支选择复用，不重复解析）；
+// 否则为可直接序列化的 400 差异报告。
+type BodyValidation =
+  | { readonly ok: true; readonly value: unknown }
+  | { readonly ok: false; readonly report: BodyReport };
+
 // contentType 为在线顺序第一项 Content-Type 头值（在线：Node 对重复
 // content-type 只保留首项；离线 verify：取 rawHeaders 中首个同名头）。
 // 正文解码与 JSON 解析不重写原文：BOM 与空白按 UTF-8 解码的默认规则处理，
@@ -795,46 +1045,52 @@ function validateBodyWithContentType(
   contentType: string | undefined,
   body: Buffer,
   rule: BodyRule,
-): BodyReport | null {
+): BodyValidation {
   const mediaType =
     typeof contentType === 'string' ? contentType.split(';', 1)[0].trim().toLowerCase() : '';
   if (mediaType !== 'application/json') {
-    return parseFailure(
-      typeof contentType === 'string'
-        ? `媒体类型不符：期望 application/json（可带参数、忽略大小写），收到 "${contentType}"`
-        : '缺少 Content-Type 头：期望 application/json（可带参数、忽略大小写）',
-    );
+    return {
+      ok: false,
+      report: parseFailure(
+        typeof contentType === 'string'
+          ? `媒体类型不符：期望 application/json（可带参数、忽略大小写），收到 "${contentType}"`
+          : '缺少 Content-Type 头：期望 application/json（可带参数、忽略大小写）',
+      ),
+    };
   }
 
   if (body.length === 0) {
-    return parseFailure('请求正文为空，无法解析为 JSON');
+    return { ok: false, report: parseFailure('请求正文为空，无法解析为 JSON') };
   }
 
   let text: string;
   try {
     text = new TextDecoder('utf-8', { fatal: true }).decode(body);
   } catch {
-    return parseFailure('请求正文不是合法的 UTF-8 编码');
+    return { ok: false, report: parseFailure('请求正文不是合法的 UTF-8 编码') };
   }
 
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (e) {
-    return parseFailure(`请求正文不是合法 JSON：${describeError(e)}`);
+    return { ok: false, report: parseFailure(`请求正文不是合法 JSON：${describeError(e)}`) };
   }
 
   const problems: StructureProblem[] = [];
   checkRule(rule, parsed, '', problems);
   if (problems.length > 0) {
     return {
-      error: 'invalid_request_body',
-      stage: 'structure',
-      message: `请求正文与接口约定存在 ${problems.length} 处差异`,
-      problems,
+      ok: false,
+      report: {
+        error: 'invalid_request_body',
+        stage: 'structure',
+        message: `请求正文与接口约定存在 ${problems.length} 处差异`,
+        problems,
+      },
     };
   }
-  return null;
+  return { ok: true, value: parsed };
 }
 
 // ---------------------------------------------------------------------------
@@ -2292,7 +2548,9 @@ function importOperationBodyRule(
 
 // 为场景每个接口选择文档操作并转换；任一失败抛 ImportError，不产生部分输出。
 // 未被选中的操作与不可达定义不参与转换。
-function importEndpoints(sceneRaw: unknown, ctx: ImportCtx): unknown[] {
+// 分支（branches）与响应（responses）、接口顺序原样保留，仅替换 requestBody；
+// 若导入结果移除了接口的 requestBody 而接口配置了分支，分支前提失效，整份拒绝。
+function importEndpoints(sceneRaw: unknown, ctx: ImportCtx, configFile: string): unknown[] {
   const doc = ctx.doc;
   if (!isPlainObject(doc)) {
     importFail(ctx, '', '顶层必须是 JSON 对象');
@@ -2307,7 +2565,12 @@ function importEndpoints(sceneRaw: unknown, ctx: ImportCtx): unknown[] {
   }
   const endpoints = (sceneRaw as { endpoints: unknown[] }).endpoints;
   return endpoints.map((epRaw, index) => {
-    const ep = epRaw as { method: HttpMethod; path: string; responses: unknown };
+    const ep = epRaw as {
+      method: HttpMethod;
+      path: string;
+      responses: unknown;
+      branches?: unknown;
+    };
     const label = `场景接口 endpoints[${index}]（${ep.method} ${ep.path}）`;
     if (!hasOwnKey(paths, ep.path)) {
       importFail(ctx, 'paths', `${label} 缺少对应操作：路径 ${JSON.stringify(ep.path)} 不存在`);
@@ -2327,14 +2590,31 @@ function importEndpoints(sceneRaw: unknown, ctx: ImportCtx): unknown[] {
       importFail(ctx, opWhere, '必须是对象');
     }
     const rule = importOperationBodyRule(operation, ep.method, ctx, opWhere);
-    // 仅替换 requestBody：保留接口顺序与 responses 原文
-    const out: { method: string; path: string; requestBody?: unknown; responses: unknown } = {
+    if (rule === undefined && ep.branches !== undefined) {
+      // POST 操作未声明 requestBody -> 移除接口旧规则；但分支以 requestBody 为前提
+      throw new ImportError(
+        `场景配置文件 ${configFile} 的 endpoints[${index}].branches：` +
+          '导入结果移除了该接口的 requestBody 正文规则，分支（branches）失去前提' +
+          '（分支要求接口声明 requestBody），整份拒绝',
+      );
+    }
+    // 仅替换 requestBody：保留接口顺序、responses 与 branches 原文
+    const out: {
+      method: string;
+      path: string;
+      requestBody?: unknown;
+      branches?: unknown;
+      responses: unknown;
+    } = {
       method: ep.method,
       path: ep.path,
       responses: ep.responses,
     };
     if (rule !== undefined) {
       out.requestBody = rule;
+    }
+    if (ep.branches !== undefined) {
+      out.branches = ep.branches;
     }
     return out;
   });
@@ -2365,7 +2645,7 @@ async function runImport(openapiArg: string, configArg: string): Promise<never> 
       throw new ImportError(`场景配置文件 ${configFile} 校验失败：${describeError(e)}`);
     }
     const doc = await readImportInput(openapiFile, 'OpenAPI 文件');
-    const endpoints = importEndpoints(sceneRaw, { doc, file: openapiFile });
+    const endpoints = importEndpoints(sceneRaw, { doc, file: openapiFile }, configFile);
     // 全部输入与所选可达定义有效后才输出
     process.stdout.write(`${JSON.stringify({ endpoints }, null, 2)}\n`);
     process.exit(0);
@@ -2645,9 +2925,9 @@ function verifyRequests(
     }
     const key = `${endpoint.method} ${endpoint.path}`;
     if (endpoint.bodyRule) {
-      const rejection = validateBodyWithContentType(req.contentType, req.body, endpoint.bodyRule);
-      if (rejection) {
-        return { id: req.id, outcome: 'rejected', endpoint: key, rejection };
+      const result = validateBodyWithContentType(req.contentType, req.body, endpoint.bodyRule);
+      if (!result.ok) {
+        return { id: req.id, outcome: 'rejected', endpoint: key, rejection: result.report };
       }
       return { id: req.id, outcome: 'passed', endpoint: key };
     }
@@ -3372,19 +3652,20 @@ async function dispatch(
 
   // 正文结构规则（如有）：校验失败返回 400 差异报告，不发送场景响应、不消费序列。
   // 规则、序列与版本均取自上面同一快照 state。
+  let parsedBody: unknown;
   if (endpoint.bodyRule) {
-    const report = validateBodyWithContentType(
+    const result = validateBodyWithContentType(
       req.headers['content-type'],
       body,
       endpoint.bodyRule,
     );
-    if (report) {
+    if (!result.ok) {
       record.bodyValidationPassed = false;
-      record.bodyRejection = report;
+      record.bodyRejection = result.report;
       const planned = buildFrameworkPlanned(
         400,
         state.version,
-        `${JSON.stringify(report)}\n`,
+        `${JSON.stringify(result.report)}\n`,
         'application/json; charset=utf-8',
       );
       record.plannedResponse = planned;
@@ -3392,15 +3673,20 @@ async function dispatch(
       return;
     }
     record.bodyValidationPassed = true;
+    parsedBody = result.value;
   }
 
-  // 校验通过（或无规则）：立即预留，并把消费位置与场景计划响应记入同一条记录
-  const { position, item } = reserveNext(endpoint);
-  record.sequencePosition = position;
-  record.sequenceLength = endpoint.responses.length;
-  const planned = buildScenePlanned(item, state.version);
+  // 校验通过（或无规则）：立即预留，并把消费位置与场景计划响应记入同一条记录。
+  // 配置了分支时按解析后的正文值选择分支序列（全部条件满足的第一支），
+  // 无命中取兜底 responses；各序列独立计数，选择不修改请求字节。
+  const selected = selectSequence(endpoint, parsedBody);
+  record.sequencePosition = selected.position;
+  record.sequenceLength = selected.length;
+  record.selection = selected.branchId === null ? 'fallback' : 'branch';
+  record.branch = selected.branchId;
+  const planned = buildScenePlanned(selected.item, state.version);
   record.plannedResponse = planned;
-  schedulePlannedResponse(res, planned, item.delay, record.id);
+  schedulePlannedResponse(res, planned, selected.item.delay, record.id);
 }
 
 // ---------------------------------------------------------------------------
