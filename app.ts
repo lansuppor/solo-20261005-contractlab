@@ -64,6 +64,13 @@ const HEALTH_PATH = '/__contractlab/health';
 const RELOAD_PATH = '/__contractlab/reload';
 const REQUESTS_PATH = '/__contractlab/requests';
 const REQUESTS_CLEAR_PATH = '/__contractlab/requests/clear';
+// 仅供本机自动化回归的落盘受控入口（仅在 --requests-file 持久模式下有效，内存模式 404）：
+// 暂停/恢复写盘、令下一次写盘失败一次、查询在途保存状态。它们不改变正常可见性语义。
+const SAVES_PAUSE_PATH = '/__contractlab/saves/pause';
+const SAVES_RESUME_PATH = '/__contractlab/saves/resume';
+const SAVES_STEP_PATH = '/__contractlab/saves/step';
+const SAVES_FAIL_NEXT_PATH = '/__contractlab/saves/fail-next';
+const SAVES_STATE_PATH = '/__contractlab/saves/state';
 
 // 每个业务响应都携带当前配置版本
 const VERSION_HEADER = 'X-Contractlab-Version';
@@ -788,8 +795,10 @@ function reserveForBody(endpoint: LiveEndpoint, parsedBody: unknown): ReservedRe
 // - 文件不存在时建立空记录库；存在时在监听前完整恢复。恢复保留原编号、接收顺序、
 //   原始请求头、无损正文、接收时版本、校验与分支结论、消费位置及计划响应，
 //   不按当前配置重判；恢复不重发历史请求或响应，不恢复业务序列与配置版本。
-// - 落盘为整库原子替换（同目录临时文件 + rename）；新增、状态更新与清空交错时
-//   按调用顺序串行落盘，每次写出落盘时刻的最新整库，较晚的保存不会用旧状态覆盖。
+// - 落盘为整库原子替换（同目录临时文件 + rename），严格 FIFO 串行。每次保存都在
+//   入队时把当时整库固化为不可变内容，写盘期间不再读取内存最新状态：保存等待期间
+//   的新增/状态更新/清空只进入之后的保存。查询只返回“最近一次成功保存”的整库，
+//   不等待在途保存；保存成功后整体切换为该次实际写入的内容，失败则不发布任何变更。
 // - 恢复时上次未确认完成（pending）的记录一律标记为 interrupted：该状态只表示
 //   服务器未确认完成写出，不能证明客户端未收到响应；已确认的 sent 不回退。
 
@@ -1176,36 +1185,41 @@ async function readRequestStore(file: string): Promise<{ nextId: number; records
   return { nextId: root.nextId as number, records };
 }
 
-// 持久记录库：整库原子落盘（同目录临时文件 + rename），串行排队。
-// 每次落盘都在执行时刻序列化最新整库，因此新增/状态更新/清空交错时，
-// 较晚完成的保存不会用旧状态覆盖新状态。
+// 持久记录库：整库原子落盘（同目录临时文件 + rename），严格 FIFO 串行写盘。
+//
+// 关键不变量——每次保存只发布它在**入队时**就已固化的整库字节：save() 接收的是
+// 调用方当时序列化好的完整载荷字符串，落盘期间不再回头读取内存最新状态。因此保存
+// 等待期间发生的新增、状态更新或清空只会进入**之后**入队的保存；FIFO 保证较早入队
+// 的保存先成功，故它绝不会提前发布更晚的变更，多个保存阶段的数据也不会被混写进同
+// 一个文件。每个成功保存发布的内容与实际写入的字节逐字节一致。
 class PersistedRequestStore {
   private chain: Promise<void> = Promise.resolve();
   private readonly file: string;
-  private readonly nextIdOf: () => number;
-  private readonly recordsOf: () => readonly RequestRecord[];
+  private tmpSeq = 0;
 
-  private constructor(
-    file: string,
-    nextIdOf: () => number,
-    recordsOf: () => readonly RequestRecord[],
-  ) {
+  // 受控暂停 / 故障注入（仅供自动化回归，正常运行永不触发）：
+  private paused = false;
+  private failNext = false;
+  // 已入队但尚未写盘结束的保存数
+  private queued = 0;
+  // 已到达写盘闸门前、正在等待放行的保存数（= waiters 长度）
+  private waiting = 0;
+  // 暂停期间在写盘闸门前排队等待放行的保存（FIFO）
+  private waiters: Array<() => void> = [];
+
+  private constructor(file: string) {
     this.file = file;
-    this.nextIdOf = nextIdOf;
-    this.recordsOf = recordsOf;
   }
 
   // 打开记录库：文件不存在时建立空记录库（先落盘空库）；存在时完整恢复。
   // 恢复时把上次未确认完成的 pending 记录标记为 interrupted（sent 不回退）。
   static async open(
     file: string,
-    nextIdOf: () => number,
-    recordsOf: () => readonly RequestRecord[],
   ): Promise<{ store: PersistedRequestStore; nextId: number; records: RequestRecord[] }> {
-    const store = new PersistedRequestStore(file, nextIdOf, recordsOf);
+    const store = new PersistedRequestStore(file);
     const loaded = await readRequestStore(file);
     if (loaded === null) {
-      await store.persist(); // 建立空记录库；建立失败同样阻止监听
+      await store.writeNow(store.serialize(1, [])); // 建立空记录库；建立失败同样阻止监听
       return { store, nextId: 1, records: [] };
     }
     for (const record of loaded.records) {
@@ -1216,9 +1230,41 @@ class PersistedRequestStore {
     return { store, nextId: loaded.nextId, records: loaded.records };
   }
 
-  // 排队一次落盘；返回本次落盘结果（调用方据此决定发送/成功与否）
-  persist(): Promise<void> {
-    const run = this.chain.then(() => this.flush());
+  private serialize(nextId: number, records: readonly RequestRecord[]): string {
+    return `${JSON.stringify(
+      { format: REQUEST_STORE_FORMAT, version: REQUEST_STORE_VERSION, nextId, records },
+      null,
+      2,
+    )}\n`;
+  }
+
+  // 排队一次“内容已固化”的保存。payload 在入队前就已序列化，之后内存如何变化都不
+  // 影响这次写出的字节；返回的 promise 在这次保存真正写盘成功后才 resolve。
+  save(payload: string): Promise<void> {
+    this.queued += 1;
+    const run = this.chain.then(async () => {
+      if (this.paused) {
+        // 在写盘闸门前排队等待：resume 全部放行，stepOne 只放行一个（FIFO）。
+        await new Promise<void>((resolve) => {
+          this.waiting += 1;
+          this.waiters.push(() => {
+            this.waiting -= 1;
+            resolve();
+          });
+        });
+      }
+      if (this.failNext) {
+        this.failNext = false;
+        throw new RequestStoreError(
+          `请求记录文件 ${this.file} 保存失败：受控故障注入（fail-next-save，本次未写入）`,
+        );
+      }
+      await this.writeNow(payload);
+    });
+    const settle = (): void => {
+      this.queued -= 1;
+    };
+    run.then(settle, settle);
     // 单次失败不打断排队链（致命失败由调用方触发关闭，进程随即退出）
     this.chain = run.then(
       () => undefined,
@@ -1227,36 +1273,79 @@ class PersistedRequestStore {
     return run;
   }
 
-  private async flush(): Promise<void> {
-    const payload = {
-      format: REQUEST_STORE_FORMAT,
-      version: REQUEST_STORE_VERSION,
-      nextId: this.nextIdOf(),
-      records: this.recordsOf(),
-    };
-    const data = `${JSON.stringify(payload, null, 2)}\n`;
-    const tmp = `${this.file}.tmp-${process.pid}`;
+  private async writeNow(data: string): Promise<void> {
+    this.tmpSeq += 1;
+    const tmp = `${this.file}.tmp-${process.pid}-${this.tmpSeq}`;
     await writeFile(tmp, data, { encoding: 'utf8' });
     await rename(tmp, this.file);
+  }
+
+  // ---- 仅供回归测试的受控钩子（不改变正常语义）----
+
+  // 暂停后，每个保存到达真正写盘前都在闸门前排队，直到被放行。
+  pauseSaves(): void {
+    this.paused = true;
+  }
+
+  // 放行当前在闸门前等待的全部保存，并解除暂停（之后新保存不再等待）。
+  resumeSaves(): void {
+    this.paused = false;
+    const waiters = this.waiters;
+    this.waiters = [];
+    for (const release of waiters) {
+      release();
+    }
+  }
+
+  // 保持暂停，仅放行闸门前的第一个保存（FIFO）；无等待者时为空操作。
+  // 串行队列保证它写盘结束前下一个保存仍在闸门后等待，从而可精确核对“较早保存只
+  // 发布其固化内容”。
+  stepOne(): void {
+    const release = this.waiters.shift();
+    if (release) {
+      release();
+    }
+  }
+
+  // 让下一次到达写盘点的保存失败一次（不写入）；用于确定性地制造一次保存失败。
+  failNextSave(): void {
+    this.failNext = true;
+  }
+
+  saveState(): {
+    readonly paused: boolean;
+    readonly failNext: boolean;
+    readonly queued: number;
+    readonly waiting: number;
+  } {
+    return {
+      paused: this.paused,
+      failNext: this.failNext,
+      queued: this.queued,
+      waiting: this.waiting,
+    };
   }
 }
 
 // 已清空记录的投递回调落到空集合上：不取消响应，旧请求之后完成也不得重新出现。
 // 未配置记录文件时退化为纯进程内记录（create/mark/clear 均无落盘等待）。
+//
+// 持久模式的可见性模型——“最近一次成功保存”基线：
+// - working（this.records/live/nextId）是接收与状态更新实时写入的工作集；
+// - published 是最近一次**真正写盘成功**的整库内容（独立对象），查询只返回它；
+// - 每次保存都在入队前把 working 整库序列化成不可变载荷（深固化），保存成功后才把
+//   published 整体切换为该载荷。故保存等待期间 working 的任何变化都不影响在途保存，
+//   查询也不等待保存、始终返回此前的 published；保存失败绝不切换 published。
 class RequestLog {
   private records: RequestRecord[] = [];
-  // 仍可能被投递事件更新的记录 id 集合（清空后旧 id 不在其中）
+  // 仍可能被投递事件更新的记录 id（清空后旧 id 不在其中）
   private readonly live = new Map<number, RequestRecord>();
-  // 已完成完整判定并获准落盘的记录 id（总是 records 的一个前缀，但清空后重置）。
-  // flush 只序列化这些记录：create 了但尚未完成判定的在途请求不会写成半条记录，
-  // 清空后旧 id 也不会被晚到的保存重新写回。
-  private readonly ready = new Set<number>();
-  // 已成功落盘（对查询可见）的记录 id。持久模式下查询只展示这些已保存的完整
-  // 记录及状态；发送闸门在其落盘完成后才放行，故延迟期间可见的 pending 必已保存。
-  private readonly committed = new Set<number>();
   private nextId = 1;
   private store: PersistedRequestStore | null = null;
   private onStoreError: (error: unknown) => void = () => {};
+  // 最近一次成功保存的整库内容（持久模式）；初始为监听前恢复出的内容。
+  private publishedRecords: RequestRecord[] = [];
+  private publishedNextId = 1;
 
   configurePersistence(store: PersistedRequestStore, onStoreError: (error: unknown) => void): void {
     this.store = store;
@@ -1267,24 +1356,18 @@ class RequestLog {
     return this.nextId;
   }
 
-  // 落盘用记录：当前存活且已完整判定（已提交）的记录，按接收顺序
-  persistableRecords(): readonly RequestRecord[] {
-    return this.records.filter((record) => this.ready.has(record.id));
-  }
-
   // 监听前完整恢复：恢复编号进度与全部记录（pending 已由恢复流程改为 interrupted）。
-  // 恢复出的记录本就是完整且已保存的记录，一律视为就绪且对查询可见。
+  // 恢复出的记录本就是完整且已保存的记录：working 与 published 都初始化为它，
+  // published 使用独立拷贝，之后 working 的状态更新不会改动已发布基线。
   restore(nextId: number, records: readonly RequestRecord[]): void {
     this.nextId = nextId;
     this.records = [...records];
     this.live.clear();
-    this.ready.clear();
-    this.committed.clear();
     for (const record of records) {
       this.live.set(record.id, record);
-      this.ready.add(record.id);
-      this.committed.add(record.id);
     }
+    this.publishedNextId = nextId;
+    this.publishedRecords = records.map((record) => cloneRecord(record));
   }
 
   create(entry: {
@@ -1324,70 +1407,90 @@ class RequestLog {
     return record;
   }
 
+  // 把当前 working 整库固化为不可变文件载荷（入队后 working 再变也与本次保存无关）。
+  private freezeFile(): string {
+    return `${JSON.stringify(
+      {
+        format: REQUEST_STORE_FORMAT,
+        version: REQUEST_STORE_VERSION,
+        nextId: this.nextId,
+        records: this.records,
+      },
+      null,
+      2,
+    )}\n`;
+  }
+
+  // 一次保存成功后：published 整体切换为该次实际写入的内容（独立对象）。
+  private publishFile(payload: string): void {
+    const parsed = JSON.parse(payload) as { nextId: number; records: RequestRecord[] };
+    this.publishedNextId = parsed.nextId;
+    this.publishedRecords = parsed.records;
+  }
+
   // 新记录的完整判定与计划响应落盘后才允许发送对应响应；内存模式立即通过。
-  // 先标记就绪再排队落盘（flush 只序列化就绪记录），落盘成功后才对查询可见。
-  // 落盘失败时回滚就绪标记并抛出，调用方不得发送，并触发致命关闭。
+  // 载荷在 await 之前固化（只含到此为止的整库）；落盘失败不发布、抛出，调用方不得
+  // 发送并触发致命关闭。
   async commitNew(record: RequestRecord): Promise<void> {
     if (this.store === null) {
-      this.committed.add(record.id);
       return;
     }
-    this.ready.add(record.id);
-    try {
-      await this.store.persist();
-    } catch (e) {
-      this.ready.delete(record.id);
-      throw e;
-    }
-    this.committed.add(record.id);
+    const payload = this.freezeFile();
+    await this.store.save(payload);
+    this.publishFile(payload);
   }
 
   // 写出完成；对已清空（不再存活）的记录是 no-op。
-  // 持久模式下状态更新排队落盘；落盘失败交致命处理（已写出的响应不回滚）。
+  // 持久模式下状态更新先改 working、固化载荷再排队落盘；只有该保存成功后查询才切换
+  // 为新状态，在此之前查询仍显示此前保存的状态。落盘失败交致命处理（响应不回滚）。
   markDelivered(id: number, status: DeliveryStatus): void {
     const record = this.live.get(id);
     if (!record) {
       return;
     }
     // 一旦完成写出即为终态：之后的连接正常关闭不得回退为 interrupted
-    if (record.delivery === 'sent') {
-      return;
-    }
-    if (record.delivery === status) {
+    if (record.delivery === 'sent' || record.delivery === status) {
       return;
     }
     record.delivery = status;
     if (this.store !== null) {
-      this.store.persist().catch((error: unknown) => this.onStoreError(error));
+      const payload = this.freezeFile();
+      this.store.save(payload).then(
+        () => this.publishFile(payload),
+        (error: unknown) => this.onStoreError(error),
+      );
     }
   }
 
-  // 调用时一致快照：拷贝当前对查询可见的存活记录，不推进任何序列。
-  // 持久模式下只含已成功落盘的完整记录（在落盘窗口内尚未保存的记录不展示）。
+  // 调用时一致快照，不推进任何序列。
+  // 持久模式下返回最近一次成功保存的整库（独立发布基线）：不等待任何在途保存，
+  // 尚未保存成功的新记录/状态/清空都不可见。
   snapshot(): readonly RequestRecord[] {
     if (this.store === null) {
       return [...this.records];
     }
-    return this.records.filter((record) => this.committed.has(record.id));
+    return this.publishedRecords.map((record) => cloneRecord(record));
   }
 
-  // 清空一次移除当时全部记录（含待发送项）；不取消响应、不改配置/版本/序列。
-  // 清空前已完整接收的请求随后完成或失败都不再出现。持久模式下只有保存了
-  // 删除结果（整库不含任何旧记录）才返回成功。
+  // 清空开始处理时已完整接收（即当时 working 中）的全部记录；不取消响应、不改配置/
+  // 版本/序列，保留编号进度。同步把旧记录移出 working 与 live，故旧请求迟到的完成/
+  // 断开都是 no-op、不会复现；其后才完整接收的新记录进入新的 working，不被本次清空
+  // 删掉并正常续号。持久模式下 published 在删除结果保存成功前保持不变（查询仍见旧
+  // 记录、绝不提前返回空集合），只有保存成功后才整体切换为空库。
   async clear(): Promise<number> {
     const removed = this.records.length;
     this.records = [];
     this.live.clear();
-    this.ready.clear();
-    this.committed.clear();
     if (this.store !== null) {
-      await this.store.persist();
+      const payload = this.freezeFile(); // 编号进度保留、记录为空；此后新记录不影响本载荷
+      await this.store.save(payload);
+      this.publishFile(payload);
     }
     return removed;
   }
 
   // 正常信号关闭：把仍存活的 pending 记为 interrupted（定时器已取消、连接已关闭，
-  // 这些响应不会再被发送；该状态不证明客户端未收到），并等待最终状态落盘。
+  // 这些响应不会再被发送；该状态不证明客户端未收到），固化最终状态并等待落盘成功。
   async finalizeForShutdown(): Promise<void> {
     for (const record of this.records) {
       if (record.delivery === 'pending') {
@@ -1395,9 +1498,56 @@ class RequestLog {
       }
     }
     if (this.store !== null) {
-      await this.store.persist();
+      // 放行可能存在的受控暂停闸门（仅回归会设置），确保最终保存不被挂住。
+      this.store.resumeSaves();
+      const payload = this.freezeFile();
+      await this.store.save(payload);
+      this.publishFile(payload);
     }
   }
+
+  // ---- 仅供回归测试的受控落盘钩子（仅持久模式可用）----
+
+  pauseSaves(): boolean {
+    if (this.store === null) {
+      return false;
+    }
+    this.store.pauseSaves();
+    return true;
+  }
+
+  resumeSaves(): boolean {
+    if (this.store === null) {
+      return false;
+    }
+    this.store.resumeSaves();
+    return true;
+  }
+
+  stepSave(): boolean {
+    if (this.store === null) {
+      return false;
+    }
+    this.store.stepOne();
+    return true;
+  }
+
+  failNextSave(): boolean {
+    if (this.store === null) {
+      return false;
+    }
+    this.store.failNextSave();
+    return true;
+  }
+
+  saveState(): { paused: boolean; failNext: boolean; queued: number; waiting: number } | null {
+    return this.store === null ? null : this.store.saveState();
+  }
+}
+
+// 记录的结构化深拷贝：记录均为可 JSON 序列化的纯数据，拷贝后与原对象互不影响。
+function cloneRecord(record: RequestRecord): RequestRecord {
+  return JSON.parse(JSON.stringify(record)) as RequestRecord;
 }
 
 // 原始正文字节的无损文本表示：先尝试严格 UTF-8；失败则用 base64 承载任意字节。
@@ -5831,10 +5981,15 @@ function requestsUsageNote(): string {
     requestStoreFile === ''
       ? '默认仅保存在本次服务进程内存中，进程退出即消失'
       : `已持久化到本地记录文件 ${requestStoreFile}，服务重启后仍可查询并用于 verify/replay`;
+  const persistVisibility =
+    requestStoreFile === ''
+      ? ''
+      : '持久模式下查询只返回最近一次成功保存的完整整库：不等待在途保存，尚未保存成功的新记录、sent/interrupted 状态更新或清空都不可见，清空删除保存成功前仍返回此前记录；count 与 records 始终一致。';
   return (
     `contractlab 请求记录（${storage}）：` +
     'GET /__contractlab/requests 查询一致快照（不推进序列，可保存后交给 verify、replay）；' +
-    'POST /__contractlab/requests/clear 清空当时全部记录（持久模式仅移除记录、保留编号进度；不取消响应、不改配置/版本/序列）。' +
+    persistVisibility +
+    'POST /__contractlab/requests/clear 清空开始处理时已完整接收的全部记录（持久模式仅移除记录、保留编号进度；不取消响应、不改配置/版本/序列，删除结果保存成功后才返回成功）。' +
     'delivery=pending 表示计划响应待发送，sent 表示服务器已完成写出（不代表客户端已收到），' +
     'interrupted 表示写出完成前连接断开、发送失败，或重启恢复时上次未确认完成（不代表客户端未收到）。'
   );
@@ -5896,6 +6051,43 @@ async function handleAdmin(method: string, pathname: string, res: http.ServerRes
     return;
   }
 
+  // 落盘受控入口：仅供本机自动化回归，仅持久模式有效（内存模式一律 404）。
+  if (
+    pathname === SAVES_PAUSE_PATH ||
+    pathname === SAVES_RESUME_PATH ||
+    pathname === SAVES_STEP_PATH ||
+    pathname === SAVES_FAIL_NEXT_PATH ||
+    pathname === SAVES_STATE_PATH
+  ) {
+    if (requestStoreFile === '') {
+      sendNotFound(res);
+      return;
+    }
+    if (pathname === SAVES_STATE_PATH) {
+      if (method !== 'GET') {
+        sendNotFound(res);
+        return;
+      }
+      sendJson(res, 200, { ok: true, saves: requestLog.saveState() }, activeState.version);
+      return;
+    }
+    if (method !== 'POST') {
+      sendNotFound(res);
+      return;
+    }
+    if (pathname === SAVES_PAUSE_PATH) {
+      requestLog.pauseSaves();
+    } else if (pathname === SAVES_RESUME_PATH) {
+      requestLog.resumeSaves();
+    } else if (pathname === SAVES_STEP_PATH) {
+      requestLog.stepSave();
+    } else {
+      requestLog.failNextSave();
+    }
+    sendJson(res, 200, { ok: true, saves: requestLog.saveState() }, activeState.version);
+    return;
+  }
+
   // 管理范围内的未知路径：仍是管理请求，不记录、不消费
   sendNotFound(res);
 }
@@ -5954,11 +6146,7 @@ async function startServer(options: ServeRuntimeOptions): Promise<void> {
   let restoredCount = 0;
   if (options.requestsFile !== undefined) {
     requestStoreFile = path.resolve(options.requestsFile);
-    const opened = await PersistedRequestStore.open(
-      requestStoreFile,
-      () => requestLog.getNextId(),
-      () => requestLog.persistableRecords(),
-    );
+    const opened = await PersistedRequestStore.open(requestStoreFile);
     requestLog.configurePersistence(opened.store, handleStoreFailure);
     requestLog.restore(opened.nextId, opened.records);
     restoredCount = opened.records.length;
