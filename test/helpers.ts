@@ -72,13 +72,32 @@ export interface RunningServer {
 }
 
 export async function startServer(configPath: string, timeoutMs = 20_000): Promise<RunningServer> {
-  const child = spawn(process.execPath, [APP_PATH, 'serve', '--config', configPath, '--port', '0'], {
+  return spawnServerWith(['serve', '--config', configPath, '--port', '0'], timeoutMs);
+}
+
+// 更底层的服务启动：自定义 serve 参数（如 --requests-file），并暴露子进程句柄，
+// 便于测试主动发信号（SIGTERM/SIGKILL）、等待退出与读取退出码。
+// 未在超时内输出监听地址（例如启动前拒绝启动）时 reject。
+export interface SpawnedServer extends RunningServer {
+  readonly pid: number | undefined;
+  stdout(): string;
+  send(signal: NodeJS.Signals): void;
+  waitExit(): Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null }>;
+}
+
+export async function spawnServerWith(
+  args: readonly string[],
+  timeoutMs = 20_000,
+): Promise<SpawnedServer> {
+  const child = spawn(process.execPath, [APP_PATH, ...args], {
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
   child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
+
+  const exitPromise = once(child, 'exit') as Promise<[number | null, NodeJS.Signals | null]>;
 
   const port = await new Promise<number>((resolve, reject) => {
     let settled = false;
@@ -105,8 +124,8 @@ export async function startServer(configPath: string, timeoutMs = 20_000): Promi
         resolve(Number(m[1]));
       }
     });
-    child.on('exit', (code) => {
-      fail(new Error(`服务在监听前退出（code=${code}）\nstdout:\n${stdout}\nstderr:\n${stderr}`));
+    child.on('exit', (code, signal) => {
+      fail(new Error(`服务在监听前退出（code=${code} signal=${signal}）\nstdout:\n${stdout}\nstderr:\n${stderr}`));
     });
   });
 
@@ -116,11 +135,34 @@ export async function startServer(configPath: string, timeoutMs = 20_000): Promi
     }
     child.kill('SIGTERM');
     const force = setTimeout(() => child.kill('SIGKILL'), 5_000);
-    await once(child, 'exit').catch(() => undefined);
+    await exitPromise.catch(() => undefined);
     clearTimeout(force);
   };
 
-  return { port, stderr: () => stderr, close };
+  return {
+    port,
+    pid: child.pid,
+    stdout: () => stdout,
+    stderr: () => stderr,
+    send: (signal) => child.kill(signal),
+    waitExit: async () => {
+      const [code, signal] = await exitPromise;
+      return { code, signal };
+    },
+    close,
+  };
+}
+
+// 带持久记录文件的服务：等价于 serve --config <cfg> --port 0 --requests-file <file>
+export function startPersistentServer(
+  configPath: string,
+  requestsFile: string,
+  timeoutMs = 20_000,
+): Promise<SpawnedServer> {
+  return spawnServerWith(
+    ['serve', '--config', configPath, '--port', '0', '--requests-file', requestsFile],
+    timeoutMs,
+  );
 }
 
 // ---------------------------------------------------------------------------
