@@ -67,14 +67,27 @@ export function runCompare(oldFile: string, newFile: string, timeoutMs = 20_000)
 
 export interface RunningServer {
   readonly port: number;
+  readonly pid: number | undefined;
   readonly stderr: () => string;
-  readonly close: () => Promise<void>;
+  readonly stdout: () => string;
+  // 以指定信号关闭（默认 SIGTERM）；返回退出码（被信号杀死时为 null）
+  readonly close: (signal?: NodeJS.Signals) => Promise<number | null>;
+  // 等待进程自行退出（如保存失败后的致命关闭）；返回退出码
+  readonly waitExit: (timeoutMs?: number) => Promise<number | null>;
 }
 
-export async function startServer(configPath: string, timeoutMs = 20_000): Promise<RunningServer> {
-  const child = spawn(process.execPath, [APP_PATH, 'serve', '--config', configPath, '--port', '0'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+export async function startServer(
+  configPath: string,
+  timeoutMs = 20_000,
+  extraArgs: readonly string[] = [],
+): Promise<RunningServer> {
+  const child = spawn(
+    process.execPath,
+    [APP_PATH, 'serve', '--config', configPath, '--port', '0', ...extraArgs],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
   let stdout = '';
   let stderr = '';
   child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
@@ -110,17 +123,61 @@ export async function startServer(configPath: string, timeoutMs = 20_000): Promi
     });
   });
 
-  const close = async (): Promise<void> => {
+  const close = async (signal?: NodeJS.Signals): Promise<number | null> => {
+    // t.after(server.close) 会把 TestContext 作为首个参数传入：非字符串一律视为默认信号
+    const sig: NodeJS.Signals = typeof signal === 'string' ? signal : 'SIGTERM';
     if (child.exitCode !== null || child.signalCode !== null) {
-      return;
+      return child.exitCode;
     }
-    child.kill('SIGTERM');
-    const force = setTimeout(() => child.kill('SIGKILL'), 5_000);
-    await once(child, 'exit').catch(() => undefined);
-    clearTimeout(force);
+    child.kill(sig);
+    if (sig !== 'SIGKILL') {
+      const force = setTimeout(() => child.kill('SIGKILL'), 5_000);
+      const [code] = (await once(child, 'exit')) as [number | null, string | null];
+      clearTimeout(force);
+      return code;
+    }
+    const [code] = (await once(child, 'exit')) as [number | null, string | null];
+    return code;
   };
 
-  return { port, stderr: () => stderr, close };
+  const waitExit = (timeoutMs = 10_000): Promise<number | null> =>
+    new Promise((resolve, reject) => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        resolve(child.exitCode);
+        return;
+      }
+      const timer = setTimeout(() => {
+        child.kill('SIGKILL');
+        reject(new Error(`服务未在 ${timeoutMs}ms 内自行退出`));
+      }, timeoutMs);
+      child.once('exit', (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+
+  return { port, pid: child.pid, stderr: () => stderr, stdout: () => stdout, close, waitExit };
+}
+
+// 启动一个预期会失败的 serve（如记录文件损坏）：返回退出码与输出，不建立监听。
+export async function startServerExpectFailure(
+  configPath: string,
+  extraArgs: readonly string[],
+  timeoutMs = 20_000,
+): Promise<CliResult> {
+  const child = spawn(
+    process.execPath,
+    [APP_PATH, 'serve', '--config', configPath, '--port', '0', ...extraArgs],
+    { stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8').on('data', (d: string) => (stdout += d));
+  child.stderr.setEncoding('utf8').on('data', (d: string) => (stderr += d));
+  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
+  const [code] = (await once(child, 'exit')) as [number | null, string | null];
+  clearTimeout(timer);
+  return { code: code ?? -1, stdout, stderr };
 }
 
 // ---------------------------------------------------------------------------

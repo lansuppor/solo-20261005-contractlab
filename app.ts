@@ -24,8 +24,13 @@
 //   请求通过全部正文校验后按同一配置快照选择：指针取值不存在或无法遍历即不命中
 //   （缺失不同于 null、不做类型转换、0 与 -0 相等），全部条件满足才命中该支；
 //   多支命中取第一支，无命中取兜底。各分支与兜底独立计数，不改写请求字节。
-// - 管理入口 GET /__contractlab/requests 查询本次进程内的请求记录（一致快照、
-//   不推进序列），POST /__contractlab/requests/clear 清空记录；记录只存在内存中，
+// - 管理入口 GET /__contractlab/requests 查询请求记录（一致快照、不推进序列），
+//   POST /__contractlab/requests/clear 清空记录；未启用 --requests-file 时记录
+//   只存在进程内存中；启用后持久化到独立本地 JSON 文件：文件不存在时建立空
+//   记录库，存在时在监听前完整恢复（恢复不重发历史请求/响应、不恢复业务序列
+//   与配置版本；未确认完成的 pending 恢复为 interrupted）；编号在同一记录库中
+//   持续递增，清空后重启也不复用。完整判定与计划响应落盘成功后才发送对应响应；
+//   运行中保存失败致命退出（非零），正常信号关闭先保存最终状态再退出 0。
 //   管理范围（/__contractlab 本身及 /__contractlab/ 前缀）的请求一律不记录。
 // - compare 子命令：离线比较旧、新两份场景文件，判断沿用旧接口约定的客户端
 //   是否仍能调用新版；报告写 stdout，不启动监听、不修改文件。
@@ -47,7 +52,13 @@
 //   报告写 stdout，不监听、不修改文件。
 
 import http from 'node:http';
-import { readFile } from 'node:fs/promises';
+import {
+  readFile,
+  writeFile,
+  rename,
+  access,
+  constants as fsConstants,
+} from 'node:fs/promises';
 import path from 'node:path';
 
 const APP_NAME = 'contractlab';
@@ -775,8 +786,10 @@ function reserveForBody(endpoint: LiveEndpoint, parsedBody: unknown): ReservedRe
 //
 // 仅记录管理范围之外、完整接收且未超过正文上限的请求（场景响应、400、404）。
 // 未收完整即断开或超出上限不创建记录、不消费序列。
-// 编号按“完整接收”顺序在进程内单调递增，与接口消费位置是两回事；
-// 清空与成功/失败重载都保留编号序列，编号不复用。记录只存在内存中，不写文件。
+// 编号按“完整接收”顺序单调递增，与接口消费位置是两回事；
+// 清空与成功/失败重载都保留编号序列，编号不复用。未启用持久化时记录只存在
+// 内存中；启用 --requests-file 后，完整判定与计划响应落盘成功才发送对应响应，
+// 发送完成/中断、清空等状态变化也都持久化（见 RequestLog）。
 
 // 写出生命周期（仅指服务器侧写出，不表示客户端已收到）：
 //   pending     —— 已完整接收、计划响应待发送（延迟期间即可查到）
@@ -831,12 +844,41 @@ interface RequestRecord {
   delivery: DeliveryStatus;
 }
 
+// 持久化失败：运行中任一次落盘失败都视为致命错误（不允许“内存里有、文件里没有”
+// 地继续冒充持久模式）。
+class PersistError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PersistError';
+  }
+}
+
 // 已清空记录的投递回调落到空集合上：不取消响应，旧请求之后完成也不得重新出现。
+//
+// 未启用持久化（storeFile 为 undefined）时行为与纯进程内记录完全一致：
+// create / markDelivered / clear 只改内存。启用后：
+// - 一条记录在“完整判定与计划响应都已写入记录对象”后由 dispatch 调 commit()
+//   等待落盘，落盘成功前不得发送其计划响应；
+// - markDelivered（sent/interrupted）后也落盘最终状态；
+// - clearPersist() 只有在“删除结果”落盘成功后才返回；
+// - 所有落盘经同一串行链合并：写期间发生的新改动置 dirty，写完一轮后按最新
+//   内存状态再写，较晚完成的保存不可能覆盖更新后的状态。
 class RequestLog {
   private records: RequestRecord[] = [];
   // 仍可能被投递事件更新的记录 id 集合（清空后旧 id 不在其中）
   private readonly live = new Map<number, RequestRecord>();
   private nextId = 1;
+
+  // 启用持久化后的记录文件；undefined 表示纯进程内模式
+  private storeFile: string | undefined;
+  // 串行落盘链：任何时刻至多一个文件写在进行
+  private chain: Promise<void> = Promise.resolve();
+  // 链上是否积压了尚未落盘的最新状态
+  private dirty = false;
+  // 首次落盘失败后的固定错误；之后的一切等待都拒绝，服务进入致命关闭
+  private failure: PersistError | undefined;
+  // 首次失败的通知回调（由服务层注入：stderr 定位 + 非零退出）
+  private onFailure: ((error: PersistError) => void) | undefined;
 
   create(entry: {
     method: string;
@@ -872,10 +914,32 @@ class RequestLog {
     };
     this.records.push(record);
     this.live.set(id, record);
+    // 注意：create 不落盘——记录必须等判定结论与计划响应齐备后由 commit 一次性
+    // 持久化，磁盘上从不出现“没有计划响应的半截记录”。
     return record;
   }
 
-  // 写出完成；对已清空（不再存活）的记录是 no-op
+  enablePersistence(storeFile: string, onFailure: (error: PersistError) => void): void {
+    this.storeFile = storeFile;
+    this.onFailure = onFailure;
+  }
+
+  get persisted(): boolean {
+    return this.storeFile !== undefined;
+  }
+
+  // 恢复：以文件中的完整状态替换内存（编号进度一并恢复）。仅启动时、监听前调用。
+  restore(state: { nextId: number; records: RequestRecord[] }): void {
+    this.records = [...state.records];
+    this.live.clear();
+    for (const record of this.records) {
+      this.live.set(record.id, record);
+    }
+    this.nextId = state.nextId;
+  }
+
+  // 写出完成；对已清空（不再存活）的记录是 no-op。
+  // 持久模式下状态更新也落盘；失败通知致命回调（已写出的响应不回滚）。
   markDelivered(id: number, status: DeliveryStatus): void {
     const record = this.live.get(id);
     if (!record) {
@@ -885,7 +949,26 @@ class RequestLog {
     if (record.delivery === 'sent') {
       return;
     }
+    if (record.delivery === status) {
+      return;
+    }
     record.delivery = status;
+    if (this.storeFile !== undefined) {
+      // 失败已由 drain 统一通知 onFailure；这里是状态更新的附带落盘，不能让
+      // 拒绝变成未处理 rejection。
+      this.requestFlush().catch(() => undefined);
+    }
+  }
+
+  // 正常关闭时把仍未完成的记录钉为 interrupted（定时器已取消、连接已断开，
+  // 不会再有 sent）；sent 不回退。
+  markRemainingPendingInterrupted(): void {
+    for (const record of this.records) {
+      if (record.delivery === 'pending') {
+        record.delivery = 'interrupted';
+      }
+    }
+    this.dirty = this.storeFile !== undefined;
   }
 
   // 调用时一致快照：拷贝当前存活记录，不推进任何序列
@@ -894,13 +977,468 @@ class RequestLog {
   }
 
   // 清空一次移除当时全部记录（含待发送项）；不取消响应、不改配置/版本/序列。
-  // 清空前已完整接收的请求随后完成或失败都不再出现。
+  // 清空前已完整接收的请求随后完成或失败都不再出现。纯进程内模式直接返回。
   clear(): number {
     const removed = this.records.length;
     this.records = [];
     this.live.clear();
     return removed;
   }
+
+  // 持久模式的清空：只有“删除结果”成功落盘后才 resolve；失败时清空仍已发生在
+  // 内存中，但拒绝返回（调用方不得报成功），服务随后致命退出。
+  async clearPersist(): Promise<number> {
+    const removed = this.clear();
+    if (this.storeFile === undefined) {
+      return removed;
+    }
+    await this.requestFlush();
+    return removed;
+  }
+
+  // 判定与计划响应已齐备：发送前等待记录完整落盘。失败即拒绝，调用方不得发送
+  // 计划响应（随后服务致命关闭）。
+  async commit(): Promise<void> {
+    if (this.storeFile === undefined) {
+      return;
+    }
+    await this.requestFlush();
+  }
+
+  // 正常关闭时的最终落盘：把内存中的最终状态完整写一次。
+  async flushFinal(): Promise<void> {
+    if (this.storeFile === undefined) {
+      return;
+    }
+    await this.requestFlush();
+  }
+
+  // 启动恢复后把规范化状态（pending -> interrupted）落盘一次，使恢复结论在
+  // 磁盘上也固定下来（之后再次强制终止也仍是 interrupted，而非旧 pending）。
+  async persistRestored(): Promise<void> {
+    if (this.storeFile === undefined) {
+      return;
+    }
+    // 恢复已改写内存中的 delivery 但 dirty 初值为 false，这里强制一轮完整写。
+    this.dirty = true;
+    await this.requestFlush();
+  }
+
+  // 登记一次落盘请求并返回“与本次及此前全部改动一致”的落盘承诺。
+  private requestFlush(): Promise<void> {
+    if (this.storeFile === undefined) {
+      return Promise.resolve();
+    }
+    if (this.failure !== undefined) {
+      return Promise.reject(this.failure);
+    }
+    this.dirty = true;
+    const job = this.chain.then(() => this.drain());
+    // 单个等待者的 rejection 不会打断链，也不会冒出 unhandled rejection：
+    // drain 内部已通知 onFailure 并把错误固定到 this.failure。
+    this.chain = job.then(
+      () => undefined,
+      () => undefined,
+    );
+    return job;
+  }
+
+  // 串行落盘循环：一轮写入期间又有新改动（dirty 再次置位）时按最新内存重写，
+  // 直到磁盘与内存一致。rename 原子替换：写临时文件失败时原文件不动。
+  private async drain(): Promise<void> {
+    if (this.failure !== undefined) {
+      throw this.failure;
+    }
+    const file = this.storeFile as string;
+    while (this.dirty) {
+      this.dirty = false;
+      const payload = serializeRequestStore(this.nextId, this.records);
+      try {
+        await writeRequestStoreAtomic(file, payload);
+      } catch (e) {
+        const error = new PersistError(
+          `请求记录文件 ${file} 保存失败：${describePersistError(e)}（此前已成功保存的状态保留在原文件中）`,
+        );
+        this.failure = error;
+        this.dirty = false;
+        this.onFailure?.(error);
+        throw error;
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 请求记录文件：格式、原子写入与启动恢复校验
+// ---------------------------------------------------------------------------
+//
+// 文件为 UTF-8 JSON，单个服务独占一个文件：
+//   { "kind": "contractlab-requests", "version": 1,
+//     "nextId": <下一个编号>, "records": [ <与查询快照同构的完整记录> ] }
+// nextId 独立持久化：编号在同一记录库中持续递增，清空后重启也不复用——
+// 不能只依据剩余记录的最大编号续号。
+// 恢复只恢复记录本身：不重发历史请求或响应，不恢复业务序列与配置版本，
+// 新服务总是从版本 1、各序列首项开始。
+
+const REQUEST_STORE_KIND = 'contractlab-requests';
+const REQUEST_STORE_VERSION = 1;
+
+class RequestStoreError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RequestStoreError';
+  }
+}
+
+function storeFail(file: string, where: string, message: string): never {
+  throw new RequestStoreError(
+    `请求记录文件 ${file} 校验失败：${where === '' ? message : `${where} ${message}`}（文件未被修改，服务未启动监听）`,
+  );
+}
+
+function serializeRequestStore(nextId: number, records: readonly RequestRecord[]): string {
+  // 磁盘上只保存完整记录：create 与“判定/计划响应齐备”之间不跨 await，正常不会
+  // 有半截记录进入序列化；这里再做一道防御，保证文件任何时刻都可完整恢复。
+  const complete = records.filter((record) => record.plannedResponse !== null);
+  return `${JSON.stringify(
+    { kind: REQUEST_STORE_KIND, version: REQUEST_STORE_VERSION, nextId, records: complete },
+    null,
+    2,
+  )}\n`;
+}
+
+// 临时文件与目标文件同目录，rename 才是原子替换
+function requestStoreTempPath(file: string): string {
+  return `${file}.tmp`;
+}
+
+async function writeRequestStoreAtomic(file: string, payload: string): Promise<void> {
+  const tmp = requestStoreTempPath(file);
+  await writeFile(tmp, payload, { encoding: 'utf8', flag: 'w' });
+  await rename(tmp, file);
+}
+
+async function requestStoreExists(file: string): Promise<boolean> {
+  try {
+    await access(file, fsConstants.F_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 文件不存在：建立空记录库（原子写出）。父目录不存在等错误直接抛出拒绝启动。
+async function ensureRequestStore(file: string): Promise<void> {
+  if (await requestStoreExists(file)) {
+    return;
+  }
+  await writeRequestStoreAtomic(file, serializeRequestStore(1, []));
+}
+
+function isRecordObject(value: unknown): value is Record<string, unknown> {
+  return isPlainObject(value);
+}
+
+function expectString(value: unknown, file: string, where: string): string {
+  if (typeof value !== 'string') {
+    storeFail(file, where, `必须是字符串，收到 ${JSON.stringify(value)}`);
+  }
+  return value as string;
+}
+
+function expectBoolean(value: unknown, file: string, where: string): boolean {
+  if (typeof value !== 'boolean') {
+    storeFail(file, where, `必须是布尔值，收到 ${JSON.stringify(value)}`);
+  }
+  return value as boolean;
+}
+
+function expectPositiveInt(value: unknown, file: string, where: string): number {
+  if (!Number.isInteger(value) || (value as number) < 1) {
+    storeFail(file, where, `必须是正整数，收到 ${JSON.stringify(value)}`);
+  }
+  return value as number;
+}
+
+function expectIntOrNull(value: unknown, file: string, where: string): number | null {
+  if (value === null) {
+    return null;
+  }
+  if (!Number.isInteger(value) || (value as number) < 0) {
+    storeFail(file, where, `必须是非负整数或 null，收到 ${JSON.stringify(value)}`);
+  }
+  return value as number;
+}
+
+function expectStringOrNull(value: unknown, file: string, where: string): string | null {
+  return value === null ? null : expectString(value, file, where);
+}
+
+function expectBooleanOrNull(value: unknown, file: string, where: string): boolean | null {
+  if (value === null) {
+    return null;
+  }
+  return expectBoolean(value, file, where);
+}
+
+// 校验并还原一条已持久化记录。要求字段与进程内写出的完整记录同构——
+// 查询只展示已保存的完整记录，半截记录（缺计划响应等）一律拒绝整个文件。
+function restoreRecord(raw: unknown, index: number, file: string): RequestRecord {
+  const where = `records[${index}]`;
+  if (!isRecordObject(raw)) {
+    storeFail(file, where, '必须是对象');
+  }
+
+  const id = expectPositiveInt(raw.id, file, `${where}.id`);
+  const receivedAt = expectString(raw.receivedAt, file, `${where}.receivedAt`);
+  if (receivedAt === '') {
+    storeFail(file, `${where}.receivedAt`, '不得为空字符串');
+  }
+
+  const reqWhere = `${where}.request`;
+  if (!isRecordObject(raw.request)) {
+    storeFail(file, reqWhere, '必须是对象');
+  }
+  const request = raw.request;
+  const method = expectString(request.method, file, `${reqWhere}.method`);
+  const target = expectString(request.target, file, `${reqWhere}.target`);
+  const recordPath = expectString(request.path, file, `${reqWhere}.path`);
+  if (target.split('?')[0] !== recordPath) {
+    storeFail(
+      file,
+      `${reqWhere}.path`,
+      `与 target 去掉查询串后的路径不符：path=${JSON.stringify(recordPath)}，target=${JSON.stringify(target)}`,
+    );
+  }
+  if (!Array.isArray(request.rawHeaders)) {
+    storeFail(file, `${reqWhere}.rawHeaders`, '必须是按在线顺序成对排列的字符串数组');
+  }
+  if (request.rawHeaders.length % 2 !== 0) {
+    storeFail(file, `${reqWhere}.rawHeaders`, `必须成对（名称、值交替），当前长度为 ${request.rawHeaders.length}`);
+  }
+  request.rawHeaders.forEach((value: unknown, j: number) => {
+    if (typeof value !== 'string') {
+      storeFail(file, `${reqWhere}.rawHeaders[${j}]`, '必须是字符串');
+    }
+  });
+  if (!Number.isInteger(request.bodyBytes) || (request.bodyBytes as number) < 0) {
+    storeFail(file, `${reqWhere}.bodyBytes`, `必须是非负整数，收到 ${JSON.stringify(request.bodyBytes)}`);
+  }
+  const bodyBytes = request.bodyBytes as number;
+  const bodyWhere = `${reqWhere}.body`;
+  if (!isRecordObject(request.body)) {
+    storeFail(file, bodyWhere, '必须是对象（含 encoding 与 content）');
+  }
+  const encoding = request.body.encoding;
+  if (encoding !== 'utf-8' && encoding !== 'base64') {
+    storeFail(file, `${bodyWhere}.encoding`, `必须是 "utf-8" 或 "base64"，收到 ${JSON.stringify(encoding)}`);
+  }
+  const content = expectString(request.body.content, file, `${bodyWhere}.content`);
+  let body: { encoding: 'utf-8' | 'base64'; content: string };
+  if (encoding === 'utf-8') {
+    if (hasLoneSurrogate(content)) {
+      storeFail(file, `${bodyWhere}.content`, '含孤立代理项，无法无损还原原始字节');
+    }
+    body = { encoding: 'utf-8', content };
+  } else {
+    if (!BASE64_RE.test(content)) {
+      storeFail(file, `${bodyWhere}.content`, '不是合法的 base64 编码');
+    }
+    body = { encoding: 'base64', content };
+  }
+  const restoredBytes =
+    encoding === 'utf-8' ? Buffer.from(content, 'utf8') : Buffer.from(content, 'base64');
+  if (restoredBytes.byteLength !== bodyBytes) {
+    storeFail(
+      file,
+      bodyWhere,
+      `还原为 ${restoredBytes.byteLength} 字节，与 bodyBytes=${bodyBytes} 不符`,
+    );
+  }
+
+  const configVersion = expectPositiveInt(raw.configVersion, file, `${where}.configVersion`);
+  const matched = expectBoolean(raw.matched, file, `${where}.matched`);
+  const endpoint = expectStringOrNull(raw.endpoint, file, `${where}.endpoint`);
+  const bodyValidationPassed = expectBooleanOrNull(
+    raw.bodyValidationPassed,
+    file,
+    `${where}.bodyValidationPassed`,
+  );
+
+  // bodyRejection：null 或与 400 差异报告同构
+  let bodyRejection: BodyReport | null = null;
+  if (raw.bodyRejection !== null) {
+    const rjWhere = `${where}.bodyRejection`;
+    if (!isRecordObject(raw.bodyRejection)) {
+      storeFail(file, rjWhere, '必须是对象或 null');
+    }
+    const rejection = raw.bodyRejection;
+    if (rejection.error !== 'invalid_request_body') {
+      storeFail(file, `${rjWhere}.error`, `必须是 "invalid_request_body"，收到 ${JSON.stringify(rejection.error)}`);
+    }
+    if (rejection.stage !== 'parse' && rejection.stage !== 'structure') {
+      storeFail(file, `${rjWhere}.stage`, `必须是 "parse" 或 "structure"，收到 ${JSON.stringify(rejection.stage)}`);
+    }
+    expectString(rejection.message, file, `${rjWhere}.message`);
+    if (!Array.isArray(rejection.problems)) {
+      storeFail(file, `${rjWhere}.problems`, '必须是数组');
+    }
+    rejection.problems.forEach((problem: unknown, j: number) => {
+      const pWhere = `${rjWhere}.problems[${j}]`;
+      if (!isRecordObject(problem)) {
+        storeFail(file, pWhere, '必须是对象');
+      }
+      expectString(problem.pointer, file, `${pWhere}.pointer`);
+      expectString(problem.expected, file, `${pWhere}.expected`);
+      expectString(problem.actual, file, `${pWhere}.actual`);
+    });
+    bodyRejection = rejection as unknown as BodyReport;
+  }
+
+  // branchSelection：null / {kind:'fallback'} / {kind:'branch', id:非空字符串}
+  let branchSelection: RequestRecord['branchSelection'] = null;
+  if (raw.branchSelection !== null) {
+    const bsWhere = `${where}.branchSelection`;
+    if (!isRecordObject(raw.branchSelection)) {
+      storeFail(file, bsWhere, '必须是对象或 null');
+    }
+    if (raw.branchSelection.kind === 'fallback') {
+      branchSelection = { kind: 'fallback' };
+    } else if (raw.branchSelection.kind === 'branch') {
+      const branchId = expectString(raw.branchSelection.id, file, `${bsWhere}.id`);
+      if (branchId === '') {
+        storeFail(file, `${bsWhere}.id`, '不得为空字符串');
+      }
+      branchSelection = { kind: 'branch', id: branchId };
+    } else {
+      storeFail(file, `${bsWhere}.kind`, `必须是 "fallback" 或 "branch"，收到 ${JSON.stringify(raw.branchSelection.kind)}`);
+    }
+  }
+
+  const sequencePosition = expectIntOrNull(raw.sequencePosition, file, `${where}.sequencePosition`);
+  const sequenceLength = expectIntOrNull(raw.sequenceLength, file, `${where}.sequenceLength`);
+  if (
+    (sequencePosition === null) !== (sequenceLength === null) ||
+    (sequencePosition !== null && sequenceLength !== null && sequencePosition >= sequenceLength)
+  ) {
+    storeFail(
+      file,
+      where,
+      `sequencePosition=${JSON.stringify(sequencePosition)} 与 sequenceLength=${JSON.stringify(sequenceLength)} 必须同时为 null，或位置小于序列长度`,
+    );
+  }
+
+  // plannedResponse：完整记录必须带计划响应（落盘只发生在判定与计划齐备之后）
+  const prWhere = `${where}.plannedResponse`;
+  if (!isRecordObject(raw.plannedResponse)) {
+    storeFail(file, prWhere, '必须是对象（完整记录必须含计划响应）');
+  }
+  const plannedRaw = raw.plannedResponse;
+  if (plannedRaw.kind !== 'scene' && plannedRaw.kind !== 'framework') {
+    storeFail(file, `${prWhere}.kind`, `必须是 "scene" 或 "framework"，收到 ${JSON.stringify(plannedRaw.kind)}`);
+  }
+  const status = plannedRaw.status;
+  if (!Number.isInteger(status) || (status as number) < 200 || (status as number) > 599) {
+    storeFail(file, `${prWhere}.status`, `必须是 200 至 599 之间的整数，收到 ${JSON.stringify(status)}`);
+  }
+  if (!isRecordObject(plannedRaw.headers)) {
+    storeFail(file, `${prWhere}.headers`, '必须是字符串键值对象');
+  }
+  for (const [name, value] of Object.entries(plannedRaw.headers)) {
+    if (typeof value !== 'string') {
+      storeFail(file, `${prWhere}.headers[${JSON.stringify(name)}]`, '值必须是字符串');
+    }
+  }
+  const plannedBody = expectString(plannedRaw.body, file, `${prWhere}.body`);
+  const plannedResponse: PlannedResponseSnapshot = {
+    kind: plannedRaw.kind as 'scene' | 'framework',
+    status: status as number,
+    headers: { ...(plannedRaw.headers as { [name: string]: string }) },
+    body: plannedBody,
+  };
+
+  const delivery = raw.delivery;
+  if (delivery !== 'pending' && delivery !== 'sent' && delivery !== 'interrupted') {
+    storeFail(file, `${where}.delivery`, `必须是 "pending" / "sent" / "interrupted"，收到 ${JSON.stringify(delivery)}`);
+  }
+
+  return {
+    id,
+    receivedAt,
+    request: {
+      method,
+      target,
+      path: recordPath,
+      rawHeaders: [...(request.rawHeaders as string[])],
+      bodyBytes: request.bodyBytes as number,
+      body,
+    },
+    configVersion,
+    matched,
+    endpoint,
+    bodyValidationPassed,
+    bodyRejection,
+    branchSelection,
+    sequencePosition,
+    sequenceLength,
+    plannedResponse,
+    // 恢复时把尚未确认完成的 pending 一律标为 interrupted：
+    // 进程已不在，无人能证明响应已送达，也不会在重启后补发；sent 不回退。
+    delivery: delivery === 'pending' ? 'interrupted' : (delivery as DeliveryStatus),
+  };
+}
+
+// 读取并完整校验记录文件；任何一步失败都抛 RequestStoreError（不改原文件）。
+// 返回可直接装入 RequestLog 的状态（pending 已按恢复规则改为 interrupted）。
+async function loadRequestStore(file: string): Promise<{ nextId: number; records: RequestRecord[] }> {
+  let text: string;
+  try {
+    text = await readFile(file, 'utf8');
+  } catch (e) {
+    throw new RequestStoreError(`读取请求记录文件 ${file} 失败：${describePersistError(e)}`);
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new RequestStoreError(`请求记录文件 ${file} 不是合法 JSON：${describePersistError(e)}`);
+  }
+  if (!isPlainObject(raw)) {
+    storeFail(file, '', '顶层必须是 JSON 对象');
+  }
+  for (const key of Object.keys(raw)) {
+    if (key !== 'kind' && key !== 'version' && key !== 'nextId' && key !== 'records') {
+      storeFail(file, '', `含未知顶层字段 "${key}"`);
+    }
+  }
+  if (raw.kind !== REQUEST_STORE_KIND) {
+    storeFail(file, 'kind', `必须是 "${REQUEST_STORE_KIND}"，收到 ${JSON.stringify(raw.kind)}（该文件不是 contractlab 请求记录文件？）`);
+  }
+  if (raw.version !== REQUEST_STORE_VERSION) {
+    storeFail(file, 'version', `仅支持版本 ${REQUEST_STORE_VERSION}，收到 ${JSON.stringify(raw.version)}`);
+  }
+  const nextId = expectPositiveInt(raw.nextId, file, 'nextId');
+  if (!Array.isArray(raw.records)) {
+    storeFail(file, 'records', '必须是数组');
+  }
+  let previousId = 0;
+  const records: RequestRecord[] = [];
+  raw.records.forEach((entry: unknown, i: number) => {
+    const record = restoreRecord(entry, i, file);
+    if (record.id <= previousId) {
+      storeFail(file, `records[${i}].id`, `编号必须严格递增且不重复：${record.id} 排在 ${previousId} 之后`);
+    }
+    if (record.id >= nextId) {
+      storeFail(file, `records[${i}].id`, `编号 ${record.id} 必须小于 nextId=${nextId}`);
+    }
+    previousId = record.id;
+    records.push(record);
+  });
+  return { nextId, records };
+}
+
+function describePersistError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 // 原始正文字节的无损文本表示：先尝试严格 UTF-8；失败则用 base64 承载任意字节。
@@ -4929,15 +5467,42 @@ async function runReach(configArg: string, pathArg: string): Promise<never> {
 
 // 模块级运行时句柄（启动后赋值）
 let activeState: LiveState;
-let server: http.Server;
+let server: http.Server | undefined;
 let configFile = '';
+// 启用请求记录持久化时的记录文件（供查询说明等引用）
+let requestStoreFile: string | undefined;
 let shuttingDown = false;
+let fatalShutdownStarted = false;
 
 // 进程内请求记录：与配置版本、序列相互独立，reload 与清空都不影响编号单调
 const requestLog = new RequestLog();
 
 // 尚未发出的延迟响应定时器，关闭时统一取消
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+// 仍可能产生投递状态事件的在途请求：每项在终态（markDelivered 已调用）后结束。
+// 正常关闭时先等它们全部落定，确保“最终状态落盘”不遗漏连接关闭引发的 interrupted。
+interface InflightDelivery {
+  readonly done: Promise<void>;
+  finish(): void;
+}
+const pendingDelivery = new Set<InflightDelivery>();
+
+function registerInflight(): InflightDelivery {
+  let resolveDone: () => void = () => undefined;
+  const inflight: InflightDelivery = {
+    done: new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    }),
+    finish() {
+      if (pendingDelivery.delete(inflight)) {
+        resolveDone();
+      }
+    },
+  };
+  pendingDelivery.add(inflight);
+  return inflight;
+}
 
 // 重载按“触发顺序”串行处理：后一个 reload 必定在前一个落定后才读文件
 let reloadChain: Promise<unknown> = Promise.resolve();
@@ -5088,7 +5653,9 @@ function writePlanned(
 
 // 挂载一次写出生命周期跟踪。每个被记录的请求恰好回复一次，故在接收完成后立即挂载：
 // 延迟期间断开也能标为中断；'sent' 为终态，随后连接正常关闭不回退。
-function attachDeliveryTracking(res: http.ServerResponse, recordId: number): void {
+// 终态（markDelivered 已调用）后登记项才结束，供正常关闭时等待最终状态齐备。
+function attachDeliveryTracking(res: http.ServerResponse, recordId: number): InflightDelivery {
+  const inflight = registerInflight();
   let settled = false;
   const settle = (status: DeliveryStatus): void => {
     if (settled) {
@@ -5096,10 +5663,12 @@ function attachDeliveryTracking(res: http.ServerResponse, recordId: number): voi
     }
     settled = true;
     requestLog.markDelivered(recordId, status);
+    inflight.finish();
   };
   res.once('finish', () => settle('sent'));
   res.once('close', () => settle(res.writableFinished ? 'sent' : 'interrupted'));
   res.once('error', () => settle('interrupted'));
+  return inflight;
 }
 
 // 延迟结束才按接收时的计划快照发送；即便客户端提前断开也继续计时（消费在预留时已成立）
@@ -5217,6 +5786,11 @@ async function dispatch(
       'text/plain; charset=utf-8',
     );
     record.plannedResponse = planned;
+    // 持久模式：完整判定与计划响应落盘成功后才发送；失败则不发送（致命关闭已触发）
+    await requestLog.commit();
+    if (shuttingDown) {
+      return;
+    }
     writePlanned(res, planned, record.id);
     return;
   }
@@ -5238,6 +5812,10 @@ async function dispatch(
         'application/json; charset=utf-8',
       );
       record.plannedResponse = planned;
+      await requestLog.commit();
+      if (shuttingDown) {
+        return;
+      }
       writePlanned(res, planned, record.id);
       return;
     }
@@ -5260,6 +5838,12 @@ async function dispatch(
   record.sequenceLength = reserved.sequence.length;
   const planned = buildScenePlanned(reserved.item, state.version);
   record.plannedResponse = planned;
+  // 持久模式：完整判定与计划响应落盘成功后才把该记录对应的响应排上发送队列；
+  // 落盘等待或之后的 reload 都不改变已选版本与响应项（快照已在上方固定）。
+  await requestLog.commit();
+  if (shuttingDown) {
+    return;
+  }
   schedulePlannedResponse(res, planned, reserved.item.delay, record.id);
 }
 
@@ -5268,12 +5852,16 @@ async function dispatch(
 // ---------------------------------------------------------------------------
 
 function requestsUsageNote(): string {
+  const storage = requestLog.persisted
+    ? `持久化在本地文件 ${requestStoreFile} 中，服务退出后仍可查询并用于 verify、replay；`
+    : '仅保存在本次服务进程内存中，不写文件，进程退出即消失；';
   return (
-    'contractlab 请求记录（仅保存在本次服务进程内存中，不写文件）：' +
-    'GET /__contractlab/requests 查询一致快照（不推进序列）；' +
-    'POST /__contractlab/requests/clear 清空当时全部记录（不取消响应、不改配置/版本/序列）。' +
+    'contractlab 请求记录（' + storage +
+    'GET /__contractlab/requests 查询一致快照（不推进序列，可保存后交给 verify、replay）；' +
+    'POST /__contractlab/requests/clear 清空当时全部记录（持久模式下仅在删除结果落盘成功后返回成功；' +
+    '不取消在途响应、不改配置/版本/序列）。' +
     'delivery=pending 表示计划响应待发送，sent 表示服务器已完成写出（不代表客户端已收到），' +
-    'interrupted 表示写出完成前连接断开或发送失败。'
+    'interrupted 表示写出完成前连接断开、发送失败，或上次进程退出时仍待发送（不能证明客户端未收到）。'
   );
 }
 
@@ -5314,13 +5902,25 @@ async function handleAdmin(method: string, pathname: string, res: http.ServerRes
 
   if (pathname === REQUESTS_CLEAR_PATH) {
     if (method === 'POST') {
-      const removed = requestLog.clear();
-      sendJson(
-        res,
-        200,
-        { ok: true, removed, note: requestsUsageNote() },
-        activeState.version,
-      );
+      try {
+        // 持久模式下只有删除结果成功落盘才返回成功；失败（服务随即致命关闭）
+        // 不得报成功。
+        const removed = await requestLog.clearPersist();
+        sendJson(
+          res,
+          200,
+          { ok: true, removed, note: requestsUsageNote() },
+          activeState.version,
+        );
+      } catch {
+        // 致命关闭流程已在进行（stderr 已定位文件与原因）；尽力给出 500
+        sendJson(
+          res,
+          500,
+          { ok: false, error: '请求记录删除结果未能保存，服务正在关闭' },
+          activeState.version,
+        );
+      }
     } else {
       sendNotFound(res);
     }
@@ -5335,31 +5935,131 @@ async function handleAdmin(method: string, pathname: string, res: http.ServerRes
 // 启动、信号处理
 // ---------------------------------------------------------------------------
 
+// 持久化落盘失败的统一处理：stderr 定位文件与原因，随后关闭服务并以非零退出。
+// 已写出的响应不回滚；尚未成功保存的新记录从未发送计划响应（dispatch 在 commit
+// 失败时直接放弃），此前已成功保存的状态保留在原文件中。
+function handlePersistFailure(error: PersistError): void {
+  if (shuttingDown) {
+    // 正常关闭中的最终落盘失败由关闭流程报告并非零退出，这里不再重复收口
+    return;
+  }
+  if (server === undefined) {
+    // 启动阶段（监听前）失败：交由 startServer 的调用方统一报告
+    terminateAfterPersistFailure();
+    return;
+  }
+  process.stderr.write(`${APP_NAME}: ${error.message}\n`);
+  terminateAfterPersistFailure();
+}
+
+function terminateAfterPersistFailure(): void {
+  if (fatalShutdownStarted) {
+    return;
+  }
+  fatalShutdownStarted = true;
+  shuttingDown = true;
+  // 启动阶段（监听尚未建立）发生的写入失败：交由 startServer 的调用方拒绝启动
+  if (server === undefined) {
+    return;
+  }
+  // 取消尚未发出的延迟响应：它们对应的记录尚未（且不会）被确认保存，不得再发送
+  for (const timer of pendingTimers) {
+    clearTimeout(timer);
+  }
+  pendingTimers.clear();
+  try {
+    server.closeAllConnections();
+  } catch {
+    // 套接字可能已关闭
+  }
+  try {
+    server.close(() => process.exit(1));
+  } catch {
+    process.exit(1);
+  }
+  setTimeout(() => process.exit(1), 2000).unref();
+}
+
+// 正常信号关闭：停止接收 → 取消未发出的延迟响应、断开连接 → 等全部投递终态
+// （连接 close 引发的 interrupted/sent）落定 → 把尚存记录的最终状态落盘后退出 0。
+// 不留待发送项供重启补发；最终落盘失败则非零退出。
 function shutdown(): void {
   if (shuttingDown) {
     return;
   }
   shuttingDown = true;
+  void doGracefulShutdown();
+}
+
+async function doGracefulShutdown(): Promise<void> {
+  if (server === undefined) {
+    process.exit(0);
+  }
   // 取消所有尚未发出的延迟响应
   for (const timer of pendingTimers) {
     clearTimeout(timer);
   }
   pendingTimers.clear();
-  // 关闭监听并断开空闲/在途连接，随后正常退出（退出码 0）
+
+  const liveServer = server;
+
+  // 断开空闲/在途连接：在途 dispatch 的接收随即 aborted；已创建记录的响应对象
+  // 因连接关闭 settle 为 interrupted（已完成写出的为 sent，不回退）
   try {
-    server.closeAllConnections();
+    liveServer.closeAllConnections();
   } catch {
-    // 旧版本兜底：忽略，下面的 close/超时仍会结束进程
+    // 旧版本兜底
   }
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
+  await new Promise<void>((resolve) => {
+    try {
+      liveServer.close(() => resolve());
+    } catch {
+      resolve();
+    }
+  });
+
+  // 等待全部投递跟踪终态；正常情况下 closeAllConnections 后即刻落定。3 秒超时
+  // 兜底不无限等待（残留 pending 会在下方统一钉为 interrupted）。
+  if (pendingDelivery.size > 0) {
+    await Promise.race([
+      Promise.all([...pendingDelivery].map((x) => x.done)),
+      new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+    ]);
+  }
+
+  // 仍为 pending 的记录钉为 interrupted，并把尚存记录的最终状态完整落盘
+  requestLog.markRemainingPendingInterrupted();
+  try {
+    await requestLog.flushFinal();
+  } catch (e) {
+    process.stderr.write(`${APP_NAME}: ${describeError(e)}\n`);
+    process.exit(1);
+  }
+  process.exit(0);
 }
 
-async function startServer(configArg: string, port: number): Promise<void> {
+async function startServer(
+  configArg: string,
+  port: number,
+  requestsFileArg: string | undefined,
+): Promise<void> {
   configFile = path.resolve(configArg);
 
   // 先读配置：配置无效时根本不会创建监听
   activeState = await loadStateFromFile(configFile, 1);
+
+  // 请求记录持久化（可选）：文件不存在则建立空记录库；存在则在监听前完整
+  // 恢复——读、解析或恢复校验失败都拒绝启动，不改原文件。
+  if (requestsFileArg !== undefined) {
+    const storeFile = path.resolve(requestsFileArg);
+    requestStoreFile = storeFile;
+    await ensureRequestStore(storeFile);
+    const restored = await loadRequestStore(storeFile);
+    requestLog.restore(restored);
+    requestLog.enablePersistence(storeFile, handlePersistFailure);
+    // 把恢复后的规范化状态（pending 已改 interrupted）落盘固定
+    await requestLog.persistRestored();
+  }
 
   server = http.createServer((req, res) => {
     dispatch(req, res).catch(() => {
@@ -5381,7 +6081,10 @@ async function startServer(configArg: string, port: number): Promise<void> {
   const actualPort = typeof address === 'object' && address ? address.port : port;
   process.stdout.write(
     `${APP_NAME}: listening on http://127.0.0.1:${actualPort}\n` +
-      `${APP_NAME}: config ${configFile} (version 1, ${activeState.endpoints.size} endpoints)\n`,
+      `${APP_NAME}: config ${configFile} (version 1, ${activeState.endpoints.size} endpoints)\n` +
+      (requestStoreFile === undefined
+        ? ''
+        : `${APP_NAME}: request records ${requestStoreFile} (${requestLog.snapshot().length} restored)\n`),
   );
 
   const onSignal = (): void => shutdown();
@@ -5402,7 +6105,7 @@ function helpText(): string {
     '',
     'Usage:',
     '  node app.ts [--help]',
-    '  node app.ts serve --config <file> --port <port>',
+    '  node app.ts serve --config <file> --port <port> [--requests-file <file>]',
     '  node app.ts compare --old <file> --new <file>',
     '  node app.ts import --openapi <file> --config <file>',
     '  node app.ts verify --requests <file> --config <file>',
@@ -5410,10 +6113,14 @@ function helpText(): string {
     '  node app.ts reach --config <file> --path <literal-post-path>',
     '',
     'Options (serve):',
-    '  -c, --config <file>   本地 JSON 场景配置文件（必填）',
-    '  -p, --port <number>   监听端口，0 表示由操作系统分配（必填）',
-    '                        服务仅监听 127.0.0.1',
-    '  -h, --help            显示本帮助',
+    '  -c, --config <file>          本地 JSON 场景配置文件（必填）',
+    '  -p, --port <number>          监听端口，0 表示由操作系统分配（必填）',
+    '                             服务仅监听 127.0.0.1',
+    '  -r, --requests-file <file>  可选：把请求记录持久化到本地 JSON 文件',
+    '                             文件不存在时建立空记录库；存在时在监听前完整恢复',
+    '                             （未持久确认完成的 pending 恢复为 interrupted）。',
+    '                             单个服务使用独立记录文件；不提供时记录只存在进程内存中',
+    '  -h, --help                   显示本帮助',
     '',
     'Options (compare):',
     '  -o, --old <file>      旧版场景配置文件（必填）',
@@ -5485,11 +6192,13 @@ function cliFail(message: string): never {
 interface ServeOptions {
   config: string;
   port: number;
+  requestsFile?: string;
 }
 
 function parseServeArgv(argv: readonly string[]): ServeOptions {
   let config: string | undefined;
   let port: number | undefined;
+  let requestsFile: string | undefined;
 
   const readValue = (flag: string, inline: string | undefined, index: number): [string, number] => {
     if (inline !== undefined) {
@@ -5529,6 +6238,8 @@ function parseServeArgv(argv: readonly string[]): ServeOptions {
       if (port < 0 || port > 65535) {
         cliFail(`serve: 端口必须在 0 至 65535 之间，收到 ${port}`);
       }
+    } else if (flag === '--requests-file' || flag === '-r') {
+      [requestsFile, i] = readValue(flag, inline, i);
     } else {
       cliFail(`serve: 不支持的命令行参数: ${token}`);
     }
@@ -5540,7 +6251,7 @@ function parseServeArgv(argv: readonly string[]): ServeOptions {
   if (port === undefined) {
     cliFail('serve: 缺少必填参数 --port <port>');
   }
-  return { config, port };
+  return requestsFile === undefined ? { config, port } : { config, port, requestsFile };
 }
 
 interface CompareOptions {
@@ -5854,7 +6565,7 @@ function main(): void {
 
   if (argv[0] === 'serve') {
     const options = parseServeArgv(argv.slice(1));
-    startServer(options.config, options.port).catch((e: unknown) => {
+    startServer(options.config, options.port, options.requestsFile).catch((e: unknown) => {
       process.stderr.write(`${APP_NAME}: 启动失败：${describeError(e)}\n`);
       process.exit(1);
     });
