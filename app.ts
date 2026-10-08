@@ -53,6 +53,7 @@
 
 import http from 'node:http';
 import { readFile, writeFile, rename } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 
 const APP_NAME = 'contractlab';
@@ -1176,49 +1177,93 @@ async function readRequestStore(file: string): Promise<{ nextId: number; records
   return { nextId: root.nextId as number, records };
 }
 
-// 持久记录库：整库原子落盘（同目录临时文件 + rename），串行排队。
-// 每次落盘都在执行时刻序列化最新整库，因此新增/状态更新/清空交错时，
-// 较晚完成的保存不会用旧状态覆盖新状态。
+// 一次落盘发布的不可变整库快照。每次保存都在入队的同步段冻结当时的完整内容，
+// flush 只序列化这份冻结数据：保存等待期间到达的任何更新都不会混进本次保存，
+// 也不会因较早的保存成功而提前可见。保存成功后该快照才整体切换为查询内容。
+interface StoreSnapshot {
+  readonly nextId: number;
+  readonly records: readonly RequestRecord[];
+}
+
+// ---------------------------------------------------------------------------
+// 仅供自动化回归使用的故障/暂停注入（无外部依赖、默认完全不生效）：
+// - CONTRACTLAB_TEST_SAVE_GATE_DIR 指向一个目录：
+//     每次 flush 在开始物理写入前，若目录中存在名为 hold 或 hold-<序号> 的文件，
+//     就在该处暂停，并创建 <序号>-started 标记；测试删除 hold 文件（并等待
+//     started 出现）后，flush 创建 <序号>-finished 标记并继续，直到 hold 文件
+//     不存在为止。序号从 1 起，按 flush 实际开始顺序递增。
+// - CONTRACTLAB_TEST_SAVE_FAIL_ON_FLUSH 给出一个正整数 N：第 N 次 flush 的物理
+//     写入直接失败一次（不触碰真实记录文件），用于核对“失败不发布”。
+// 这些变量只由测试设置；正常使用（不设置）时没有任何额外文件操作或行为变化。
+// ---------------------------------------------------------------------------
+interface SaveFaultInjection {
+  readonly gateDir: string;
+  readonly failFlush: number;
+}
+
+function readSaveFaultInjection(): SaveFaultInjection | null {
+  const gateDir = process.env['CONTRACTLAB_TEST_SAVE_GATE_DIR'];
+  const failRaw = process.env['CONTRACTLAB_TEST_SAVE_FAIL_ON_FLUSH'];
+  let failFlush = 0;
+  if (failRaw !== undefined && failRaw !== '') {
+    if (!/^\d+$/.test(failRaw)) {
+      return null;
+    }
+    failFlush = Number(failRaw);
+  }
+  if ((gateDir === undefined || gateDir === '') && failFlush < 1) {
+    return null;
+  }
+  return { gateDir: gateDir ?? '', failFlush };
+}
+
 class PersistedRequestStore {
   private chain: Promise<void> = Promise.resolve();
   private readonly file: string;
-  private readonly nextIdOf: () => number;
-  private readonly recordsOf: () => readonly RequestRecord[];
+  // 最近一次成功保存发布的不可变快照；null 表示尚无成功保存（open 阶段会先落一次）
+  private published: StoreSnapshot | null = null;
+  private flushSeq = 0;
+  private readonly fault: SaveFaultInjection | null;
 
-  private constructor(
-    file: string,
-    nextIdOf: () => number,
-    recordsOf: () => readonly RequestRecord[],
-  ) {
+  private constructor(file: string) {
     this.file = file;
-    this.nextIdOf = nextIdOf;
-    this.recordsOf = recordsOf;
+    this.fault = readSaveFaultInjection();
   }
 
   // 打开记录库：文件不存在时建立空记录库（先落盘空库）；存在时完整恢复。
   // 恢复时把上次未确认完成的 pending 记录标记为 interrupted（sent 不回退）。
   static async open(
     file: string,
-    nextIdOf: () => number,
-    recordsOf: () => readonly RequestRecord[],
+    initial: StoreSnapshot,
   ): Promise<{ store: PersistedRequestStore; nextId: number; records: RequestRecord[] }> {
-    const store = new PersistedRequestStore(file, nextIdOf, recordsOf);
+    const store = new PersistedRequestStore(file);
     const loaded = await readRequestStore(file);
     if (loaded === null) {
-      await store.persist(); // 建立空记录库；建立失败同样阻止监听
-      return { store, nextId: 1, records: [] };
+      // 文件不存在：建立空记录库并发布空快照；建立失败同样阻止监听
+      await store.enqueue(initial);
+      return { store, nextId: initial.nextId, records: [...initial.records] };
     }
     for (const record of loaded.records) {
       if (record.delivery === 'pending') {
         record.delivery = 'interrupted';
       }
     }
+    // 文件已存在且校验通过：以文件内容作为最近一次成功保存的快照（恢复即该状态转换）
+    store.published = { nextId: loaded.nextId, records: loaded.records.map((r) => ({ ...r })) };
     return { store, nextId: loaded.nextId, records: loaded.records };
   }
 
-  // 排队一次落盘；返回本次落盘结果（调用方据此决定发送/成功与否）
-  persist(): Promise<void> {
-    const run = this.chain.then(() => this.flush());
+  // 最近一次成功保存发布的快照；尚无成功保存时为 null（启动建立空库后不会为 null）
+  currentSnapshot(): StoreSnapshot | null {
+    return this.published;
+  }
+
+  // 排队一次“冻结快照”的原子落盘。快照必须在入队前于同步段冻结：flush 只写
+  // 这份数据，保存等待期间的新变化进入后续保存，绝不混入本次、也不提前可见。
+  // 成功后整体发布该快照；失败不改变已发布快照（不发布失败变更）。
+  enqueue(snapshot: StoreSnapshot): Promise<void> {
+    const frozen: StoreSnapshot = { nextId: snapshot.nextId, records: snapshot.records.map((r) => ({ ...r })) };
+    const run = this.chain.then(() => this.flush(frozen));
     // 单次失败不打断排队链（致命失败由调用方触发关闭，进程随即退出）
     this.chain = run.then(
       () => undefined,
@@ -1227,17 +1272,55 @@ class PersistedRequestStore {
     return run;
   }
 
-  private async flush(): Promise<void> {
+  private async flush(snapshot: StoreSnapshot): Promise<void> {
+    this.flushSeq += 1;
+    const seq = this.flushSeq;
+
+    // 回归注入：失败一次（在任何物理写入之前），不触碰真实记录文件
+    if (this.fault !== null && this.fault.failFlush === seq) {
+      throw new RequestStoreError(`测试注入：第 ${seq} 次保存被强制失败一次`);
+    }
+
+    // 回归注入：在开始物理写入前暂停，直到 hold 文件被移除（可重复多轮）
+    if (this.fault !== null && this.fault.gateDir !== '') {
+      const dir = this.fault.gateDir;
+      let announced = false;
+      for (;;) {
+        const held = existsSync(path.join(dir, 'hold')) || existsSync(path.join(dir, `hold-${seq}`));
+        if (!held) {
+          break;
+        }
+        if (!announced) {
+          announced = true;
+          try {
+            await writeFile(path.join(dir, `${seq}-started`), 'started\n', 'utf8');
+          } catch {
+            // 标记写不出来不影响产品逻辑
+          }
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+    }
+
     const payload = {
       format: REQUEST_STORE_FORMAT,
       version: REQUEST_STORE_VERSION,
-      nextId: this.nextIdOf(),
-      records: this.recordsOf(),
+      nextId: snapshot.nextId,
+      records: snapshot.records,
     };
     const data = `${JSON.stringify(payload, null, 2)}\n`;
     const tmp = `${this.file}.tmp-${process.pid}`;
     await writeFile(tmp, data, { encoding: 'utf8' });
     await rename(tmp, this.file);
+    // 物理写入成功后才整体发布这次实际写入的冻结快照
+    this.published = snapshot;
+    if (this.fault !== null && this.fault.gateDir !== '') {
+      try {
+        await writeFile(path.join(this.fault.gateDir, `${seq}-finished`), 'finished\n', 'utf8');
+      } catch {
+        // 标记写不出来不影响产品逻辑
+      }
+    }
   }
 }
 
@@ -1247,13 +1330,6 @@ class RequestLog {
   private records: RequestRecord[] = [];
   // 仍可能被投递事件更新的记录 id 集合（清空后旧 id 不在其中）
   private readonly live = new Map<number, RequestRecord>();
-  // 已完成完整判定并获准落盘的记录 id（总是 records 的一个前缀，但清空后重置）。
-  // flush 只序列化这些记录：create 了但尚未完成判定的在途请求不会写成半条记录，
-  // 清空后旧 id 也不会被晚到的保存重新写回。
-  private readonly ready = new Set<number>();
-  // 已成功落盘（对查询可见）的记录 id。持久模式下查询只展示这些已保存的完整
-  // 记录及状态；发送闸门在其落盘完成后才放行，故延迟期间可见的 pending 必已保存。
-  private readonly committed = new Set<number>();
   private nextId = 1;
   private store: PersistedRequestStore | null = null;
   private onStoreError: (error: unknown) => void = () => {};
@@ -1267,23 +1343,25 @@ class RequestLog {
     return this.nextId;
   }
 
-  // 落盘用记录：当前存活且已完整判定（已提交）的记录，按接收顺序
-  persistableRecords(): readonly RequestRecord[] {
-    return this.records.filter((record) => this.ready.has(record.id));
+  // 冻结当前整库为不可变快照（深拷贝每条记录）。必须在触发一次保存的同步段调用：
+  // 一旦冻结，之后到达的任何变化都不会进入这次保存，只能进入下一次。
+  private freeze(): StoreSnapshot {
+    return { nextId: this.nextId, records: this.records.map((record) => ({ ...record })) };
+  }
+
+  // 排队一次“冻结快照”落盘；快照在入队前冻结，flush 只写这份数据。
+  private save(): Promise<void> {
+    return (this.store as PersistedRequestStore).enqueue(this.freeze());
   }
 
   // 监听前完整恢复：恢复编号进度与全部记录（pending 已由恢复流程改为 interrupted）。
-  // 恢复出的记录本就是完整且已保存的记录，一律视为就绪且对查询可见。
+  // 恢复出的记录本就是完整且已保存的记录；持久模式下查询以 store 已发布的恢复快照为准。
   restore(nextId: number, records: readonly RequestRecord[]): void {
     this.nextId = nextId;
     this.records = [...records];
     this.live.clear();
-    this.ready.clear();
-    this.committed.clear();
     for (const record of records) {
       this.live.set(record.id, record);
-      this.ready.add(record.id);
-      this.committed.add(record.id);
     }
   }
 
@@ -1325,25 +1403,20 @@ class RequestLog {
   }
 
   // 新记录的完整判定与计划响应落盘后才允许发送对应响应；内存模式立即通过。
-  // 先标记就绪再排队落盘（flush 只序列化就绪记录），落盘成功后才对查询可见。
-  // 落盘失败时回滚就绪标记并抛出，调用方不得发送，并触发致命关闭。
+  // 本次保存冻结于判定完成时刻：只含当时整库（含该条 pending），保存等待期间的
+  // 新请求/状态更新/清空都不混入；保存成功后查询才整体切换为这份实际写入的内容。
+  // 落盘失败时该快照从未发布，调用方不得发送，并触发致命关闭。
   async commitNew(record: RequestRecord): Promise<void> {
     if (this.store === null) {
-      this.committed.add(record.id);
       return;
     }
-    this.ready.add(record.id);
-    try {
-      await this.store.persist();
-    } catch (e) {
-      this.ready.delete(record.id);
-      throw e;
-    }
-    this.committed.add(record.id);
+    await this.save();
   }
 
-  // 写出完成；对已清空（不再存活）的记录是 no-op。
-  // 持久模式下状态更新排队落盘；落盘失败交致命处理（已写出的响应不回滚）。
+  // 写出完成；对已清空（不再存活）的记录是 no-op（旧回调不得让记录复现）。
+  // 持久模式下把新状态冻结进一次保存；落盘失败交致命处理（已写出的响应不回滚）。
+  // 关键：保存等待期间查询仍返回上一份已发布快照——旧状态（如 pending）继续显示，
+  // 直到这份 sent/interrupted 快照实际写入成功才整体切换。
   markDelivered(id: number, status: DeliveryStatus): void {
     const record = this.live.get(id);
     if (!record) {
@@ -1358,36 +1431,40 @@ class RequestLog {
     }
     record.delivery = status;
     if (this.store !== null) {
-      this.store.persist().catch((error: unknown) => this.onStoreError(error));
+      this.save().catch((error: unknown) => this.onStoreError(error));
     }
   }
 
-  // 调用时一致快照：拷贝当前对查询可见的存活记录，不推进任何序列。
-  // 持久模式下只含已成功落盘的完整记录（在落盘窗口内尚未保存的记录不展示）。
+  // 调用时一致快照，不推进任何序列。
+  // 持久模式：返回“最近一次成功保存”的不可变快照内容——不等待任何正在进行的保存。
+  // 新记录在其保存成功前不可见；sent/interrupted 尚未保存时仍显示此前保存的状态；
+  // 清空的删除结果保存成功前仍显示此前记录，绝不提前返回空集合。count 与 records 一致。
   snapshot(): readonly RequestRecord[] {
     if (this.store === null) {
       return [...this.records];
     }
-    return this.records.filter((record) => this.committed.has(record.id));
+    const published = this.store.currentSnapshot();
+    return published === null ? [] : published.records.map((record) => ({ ...record }));
   }
 
-  // 清空一次移除当时全部记录（含待发送项）；不取消响应、不改配置/版本/序列。
-  // 清空前已完整接收的请求随后完成或失败都不再出现。持久模式下只有保存了
-  // 删除结果（整库不含任何旧记录）才返回成功。
+  // 清空开始处理时已完整接收的全部记录（含待发送项）；不取消响应、不改配置/版本/
+  // 序列，仅移除记录并保留编号进度。清空前已完整接收的请求随后完成或失败都不再出现
+  // （live 已清空，旧回调为 no-op）；清空后才完整接收的请求正常续号记录、不被本次
+  // 清空删掉（它们进入后续保存，本次删除快照冻结时还不含它们）。持久模式下只有这份
+  // 删除结果保存成功后才整体切换为空集合并返回成功；保存成功前查询仍显示此前记录。
   async clear(): Promise<number> {
     const removed = this.records.length;
     this.records = [];
     this.live.clear();
-    this.ready.clear();
-    this.committed.clear();
     if (this.store !== null) {
-      await this.store.persist();
+      await this.save();
     }
     return removed;
   }
 
   // 正常信号关闭：把仍存活的 pending 记为 interrupted（定时器已取消、连接已关闭，
-  // 这些响应不会再被发送；该状态不证明客户端未收到），并等待最终状态落盘。
+  // 这些响应不会再被发送；该状态不证明客户端未收到），并冻结最终状态落盘一次。
+  // 已清空（不存活）的旧记录不在其中，不会因最终保存而复现。
   async finalizeForShutdown(): Promise<void> {
     for (const record of this.records) {
       if (record.delivery === 'pending') {
@@ -1395,7 +1472,7 @@ class RequestLog {
       }
     }
     if (this.store !== null) {
-      await this.store.persist();
+      await this.save();
     }
   }
 }
@@ -5831,10 +5908,16 @@ function requestsUsageNote(): string {
     requestStoreFile === ''
       ? '默认仅保存在本次服务进程内存中，进程退出即消失'
       : `已持久化到本地记录文件 ${requestStoreFile}，服务重启后仍可查询并用于 verify/replay`;
+  const persisted =
+    requestStoreFile === ''
+      ? ''
+      : '持久模式下本结果恒为最近一次成功保存整体写入的内容：不等待正在进行的保存，' +
+        '尚未保存成功的新记录/状态/清空不提前可见（清空保存成功前仍返回此前记录，不提前返回空集合），count 与 records 一致。';
   return (
     `contractlab 请求记录（${storage}）：` +
     'GET /__contractlab/requests 查询一致快照（不推进序列，可保存后交给 verify、replay）；' +
     'POST /__contractlab/requests/clear 清空当时全部记录（持久模式仅移除记录、保留编号进度；不取消响应、不改配置/版本/序列）。' +
+    persisted +
     'delivery=pending 表示计划响应待发送，sent 表示服务器已完成写出（不代表客户端已收到），' +
     'interrupted 表示写出完成前连接断开、发送失败，或重启恢复时上次未确认完成（不代表客户端未收到）。'
   );
@@ -5954,11 +6037,10 @@ async function startServer(options: ServeRuntimeOptions): Promise<void> {
   let restoredCount = 0;
   if (options.requestsFile !== undefined) {
     requestStoreFile = path.resolve(options.requestsFile);
-    const opened = await PersistedRequestStore.open(
-      requestStoreFile,
-      () => requestLog.getNextId(),
-      () => requestLog.persistableRecords(),
-    );
+    const opened = await PersistedRequestStore.open(requestStoreFile, {
+      nextId: requestLog.getNextId(),
+      records: [],
+    });
     requestLog.configurePersistence(opened.store, handleStoreFailure);
     requestLog.restore(opened.nextId, opened.records);
     restoredCount = opened.records.length;

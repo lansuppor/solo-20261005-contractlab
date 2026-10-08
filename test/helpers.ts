@@ -88,9 +88,11 @@ export interface SpawnedServer extends RunningServer {
 export async function spawnServerWith(
   args: readonly string[],
   timeoutMs = 20_000,
+  extraEnv: NodeJS.ProcessEnv = {},
 ): Promise<SpawnedServer> {
   const child = spawn(process.execPath, [APP_PATH, ...args], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, ...extraEnv },
   });
   let stdout = '';
   let stderr = '';
